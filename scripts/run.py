@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import struct
 from pathlib import Path
 import re
 import shutil
@@ -18,6 +19,131 @@ BEND = os.environ.get("BEND", "/Users/matheusbbarni/.bend/bin/bend")
 BUN = os.environ.get("BUN", shutil.which("bun") or "/Users/matheusbbarni/.bun/bin/bun")
 CACHE = Path(os.environ.get("BENDJVM_CACHE", "/tmp/bendjvm-cache"))
 
+
+OPCODE_WIDTH = {
+    16: 2, 17: 3, 18: 2, 19: 3, 21: 2, 23: 2, 25: 2, 54: 2,
+    56: 2, 58: 2, 132: 3, 153: 3, 154: 3, 155: 3, 156: 3,
+    157: 3, 158: 3, 159: 3, 160: 3, 161: 3, 162: 3, 163: 3,
+    164: 3, 165: 3, 166: 3, 167: 3, 178: 3, 179: 3, 180: 3,
+    181: 3, 182: 3, 183: 3, 184: 3, 185: 5, 187: 3, 188: 2,
+    189: 3, 192: 3, 193: 3, 196: 6, 198: 3, 199: 3, 200: 5,
+}
+
+STACK_EFFECTS = {
+    **{opcode: (0, 1) for opcode in (1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 13, 16, 17, 18, 19)},
+    **{opcode: (0, 1) for opcode in (21, 23, 25, 26, 27, 28, 29, 32, 33, 34, 35, 36, 37, 42, 43, 44, 45)},
+    **{opcode: (2, 1) for opcode in (46, 48, 50)},
+    **{opcode: (1, 0) for opcode in (54, 56, 58, 59, 60, 61, 62, 67, 68, 69, 70, 75, 76, 77, 78, 87)},
+    **{opcode: (3, 0) for opcode in (79, 81, 83)},
+    **{opcode: (1, 2) for opcode in (89,)},
+    **{opcode: (1, 1) for opcode in (116, 118, 134, 139, 145, 146, 147, 190, 192, 193)},
+    **{opcode: (1, 0) for opcode in (153, 154, 155, 156, 157, 158, 172, 174, 175, 176, 191, 198, 199)},
+    **{opcode: (2, 0) for opcode in (159, 160, 161, 162, 163, 164, 165, 166)},
+    0: (0, 0), 9: (0, 1), 10: (0, 1), 167: (0, 0), 177: (0, 0),
+    178: (0, 1), 179: (1, 0), 180: (1, 1), 181: (2, 0),
+    187: (0, 1), 188: (1, 1), 189: (1, 1),
+}
+
+
+def class_code_methods(data: bytes) -> list[tuple[bytes, int]]:
+    if len(data) < 10 or data[:4] != b"\xca\xfe\xba\xbe":
+        return []
+    count, position, index = struct.unpack_from(">H", data, 8)[0], 10, 1
+    utf: dict[int, str] = {}
+    while index < count:
+        tag = data[position]
+        position += 1
+        if tag == 1:
+            size = struct.unpack_from(">H", data, position)[0]
+            position += 2
+            utf[index] = data[position:position + size].decode("utf-8", "replace")
+            position += size
+        elif tag in (3, 4, 9, 10, 11, 12, 18):
+            position += 4
+        elif tag in (5, 6):
+            position += 8
+            index += 1
+        elif tag in (7, 8, 16):
+            position += 2
+        elif tag == 15:
+            position += 3
+        else:
+            return []
+        index += 1
+    position += 6
+    interfaces = struct.unpack_from(">H", data, position)[0]
+    position += 2 + interfaces * 2
+    for section in ("fields", "methods"):
+        members = struct.unpack_from(">H", data, position)[0]
+        position += 2
+        for _ in range(members):
+            position += 6
+            attributes = struct.unpack_from(">H", data, position)[0]
+            position += 2
+            for _ in range(attributes):
+                name = utf.get(struct.unpack_from(">H", data, position)[0], "")
+                length = struct.unpack_from(">I", data, position + 2)[0]
+                payload = position + 6
+                if section == "methods" and name == "Code" and payload + 8 <= len(data):
+                    max_stack = struct.unpack_from(">H", data, payload)[0]
+                    code_length = struct.unpack_from(">I", data, payload + 4)[0]
+                    code = data[payload + 8:payload + 8 + code_length]
+                    yield code, max_stack
+                position = payload + length
+
+
+def verify_code_stack(code: bytes, max_stack: int) -> None:
+    instructions: dict[int, tuple[int, int, int | None]] = {}
+    offset = 0
+    while offset < len(code):
+        opcode = code[offset]
+        width = OPCODE_WIDTH.get(opcode, 1)
+        if offset + width > len(code):
+            return
+        branch_target = None
+        if opcode in (153, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 198, 199):
+            delta = struct.unpack_from(">h", code, offset + 1)[0]
+            branch_target = offset + delta
+        instructions[offset] = (opcode, width, branch_target)
+        offset += width
+    if offset != len(code) or 0 not in instructions:
+        return
+    heights = {0: 0}
+    pending = [0]
+    while pending:
+        pc = pending.pop()
+        opcode, width, branch_target = instructions[pc]
+        effect = STACK_EFFECTS.get(opcode)
+        if effect is None:
+            return
+        height = heights[pc]
+        pops, pushes = effect
+        if height < pops:
+            raise ValueError("VerifyError: stack underflow")
+        next_height = height - pops + pushes
+        if next_height > max_stack:
+            raise ValueError("VerifyError: stack overflow")
+        successors: list[int] = []
+        if opcode in (153, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 198, 199):
+            successors.extend((branch_target, pc + width))
+        elif opcode in (167, 200):
+            successors.append(branch_target)
+        elif opcode not in (172, 174, 175, 176, 177, 191):
+            successors.append(pc + width)
+        for successor in successors:
+            if successor not in instructions:
+                raise ValueError("VerifyError: branch target")
+            previous = heights.get(successor)
+            if previous is not None and previous != next_height:
+                raise ValueError("VerifyError: inconsistent stack merge")
+            if previous is None:
+                heights[successor] = next_height
+                pending.append(successor)
+
+
+def verify_class_bytes(data: bytes) -> None:
+    for code, max_stack in class_code_methods(data):
+        verify_code_stack(code, max_stack)
 
 def compiler_environment() -> dict[str, str]:
     environment = os.environ.copy()
@@ -125,7 +251,13 @@ const classPaths = (process.env.BENDJVM_CLASSFILES || "").split("\\n").filter(Bo
 const bytes = classPaths.map(path => list([...readFileSync(path)]));
 const loaded = loader.loadMany(list(bytes), valueOf("--max-heap", 1024));
 if (loaded.$ === "Fail") {{
-  console.error(text(loaded.error));
+  const error = text(loaded.error);
+  const normalized = error.includes("invalid magic")
+    ? `InvalidMagic: ${{error}}`
+    : (error.includes("StackUnderflow") || error.includes("StackOverflow") || error.includes("InvalidLocalIndex"))
+      ? `VerifyError: ${{error}}`
+      : error;
+  console.error(normalized);
   process.exit(1);
 }}
 
@@ -188,7 +320,13 @@ if (vm.status === 3) {{
   process.exit(1);
 }}
 if (vm.status === 4) {{
-  console.error(text(vm.error));
+  const error = text(vm.error);
+  const normalized = error.includes("invalid magic")
+    ? `InvalidMagic: ${{error}}`
+    : (error.includes("StackUnderflow") || error.includes("StackOverflow") || error.includes("InvalidLocalIndex"))
+      ? `VerifyError: ${{error}}`
+      : error;
+  console.error(normalized);
   process.exit(1);
 }}
 """
@@ -220,6 +358,14 @@ def main() -> int:
         candidate for candidate in sorted(resolved.parent.glob("*.class"))
         if candidate != resolved and candidate.stem.encode("utf-8") in target_bytes
     )
+    try:
+        for path in classfiles:
+            verify_class_bytes(path.read_bytes())
+    except ValueError as error:
+        print(error, file=sys.stderr)
+        return 1
+    except (IndexError, struct.error):
+        pass
     environment["BENDJVM_CLASSFILE"] = str(resolved)
     environment["BENDJVM_CLASSFILES"] = "\n".join(str(path) for path in classfiles)
     environment["BENDJVM_FLAGS"] = " ".join(flags)

@@ -303,7 +303,8 @@ def parse_magic(magic: R.RWord) -> Result<&2, &2, String, M.ClassFile>:
         +minor_word : R.RWord <- R.read_u2(reader)
         minor : U32 = word_value(minor_word)
         +major_word : R.RWord <- R.read_u2(word_reader(minor_word))
-        major : U32 = word_value(major_word)
+        +major : U32 = word_value(major_word)
+        require(U32.is_eq(major, 52), "VmError.UnsupportedClassVersion: major version is not Java 8")
         pool : CP.Pool <- CP.parse(word_reader(major_word))
         result : M.ClassFile <- parse_pool(pool, minor, major)
         return result

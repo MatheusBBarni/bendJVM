@@ -9,12 +9,13 @@ def method_locals(value: M.LoadedMethod) -> +List<M.Slot>:
     case M.LoadedMethod{id, owner, name, descriptor, flags, parameters, resultTag, maxStack, maxLocals, instructions, handlers, intrinsic}:
       M.zeros(U32.to_nat(maxLocals))
 
-def start_initializer_found(+vm: M.VM, mainFrame: M.Frame, owner: U32, found: Maybe<&2, M.LoadedMethod>) -> M.VM:
+def start_initializer_found(+vm: M.VM, mainFrame: M.Frame, +owner: U32, found: Maybe<&2, M.LoadedMethod>) -> M.VM:
   match found:
     case None{}: S.with_frames(vm, [mainFrame])
     case Some{+method}:
       +id = M.loaded_method_id(method)
-      S.with_frames(vm, [M.Frame{id, 0, 0, method_locals(method), Nil{}, owner}, mainFrame])
+      +updated = S.set_class_state(vm, owner, 1)
+      S.with_frames(updated, [M.Frame{id, 0, 0, method_locals(method), Nil{}, owner}, mainFrame])
 
 def start_initializer_method(+vm: M.VM, mainFrame: M.Frame, owner: U32, initializer: U32) -> M.VM:
   start_initializer_found(vm, mainFrame, owner, M.nth(M.LoadedMethod, S.methods(vm), initializer))

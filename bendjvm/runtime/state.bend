@@ -97,6 +97,10 @@ def pc(frame: M.Frame) -> U32:
   M.Frame{method, pc0, invoke, ls, stk, init} = frame
   pc0
 
+def invoke_pc(frame: M.Frame) -> U32:
+  M.Frame{method, pc0, invoke, ls, stk, init} = frame
+  invoke
+
 def stack(frame: M.Frame) -> +List<M.Slot>:
   M.Frame{method, pc0, invoke, ls, stk, init} = frame
   stk

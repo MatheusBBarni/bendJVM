@@ -1,0 +1,25 @@
+# Bend and generated build output
+.bend/
+*.bendc
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Java build output
+*.class
+*.jar
+build/
+out/
+target/
+
+# Local caches and logs
+.cache/
+*.log
+
+# Editor and operating system files
+.DS_Store
+.idea/
+.vscode/

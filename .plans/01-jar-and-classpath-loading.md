@@ -1,6 +1,6 @@
 # Plan: JAR and classpath loading
 
-Status: planned; no runtime changes implemented.
+Status: implemented; milestone 1 verified by `scripts/test.py --full` and `bend PROOF.bend`.
 Source: `ROADMAP.md`, milestone 1.
 
 ## Goal
@@ -177,4 +177,4 @@ Extend the existing suite so `--full` includes the classpath/archive/manifest/re
 
 Completion requires all four roadmap rows, preserved standalone behavior, no accidental bootstrap replacement, deterministic precedence, correct selected entry/arguments, bounded archive reads, actual Java-visible resources, useful origin diagnostics, and updated documentation. Remove temporary experimental scripts and generated archives after verification; keep reusable fixture sources and harness packaging logic.
 
-Planning verification: grounded in current runner, loader, runtime entry, bootstrap/intrinsic, and harness sources. Runtime tests are intentionally not claimed or executed for this documentation-only change.
+Verification: `python3 scripts/run.py --prepare`, `python3 scripts/test.py --fast`, `python3 scripts/test.py --full`, and `bend PROOF.bend`.

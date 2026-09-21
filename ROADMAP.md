@@ -2,36 +2,39 @@
 
 ## Current position
 
-BendJVM currently runs standalone Java 8 `.class` files.
+Milestone 1 runs Java 8 applications from standalone classes, ordered directory
+classpaths, JARs, and ZIPs. It resolves the selected class's transitive
+application closure, reads dependency resources, and launches executable JARs
+through manifest metadata.
 
-The runner loads the target class and nearby companion `.class` files.
-
-It does not yet run full Java applications or resolve dependency classpaths.
+The host owns source indexing, bounded archive bytes, manifest expansion, and
+the structured launch request. Bend owns class parsing/linking, entry
+validation, argument-array allocation, resource lookup, stream state, and VM
+execution.
 
 ## Spring Boot target
 
-An actual Spring Boot application is not supported yet.
+An actual Spring Boot application is not supported yet. Milestone 1 supplies
+basic JAR/classpath/resource startup, but Spring Boot still requires:
 
-Spring Boot requires several capabilities outside the current V1 runtime:
-
-- JAR and dependency classpath loading.
 - Reflection and runtime annotations.
 - Dynamic proxies.
 - `invokedynamic`.
 - Threads and synchronization.
 - Native libraries, sockets, NIO, and TLS.
-- A much larger Java standard library.
+- A much larger Java standard library and nested-JAR launcher support.
 
-Without these features, a Spring Boot application would fail when it loads missing runtime classes or reaches unsupported bytecode.
+Without these features, a Spring Boot application would fail when it loads
+missing runtime classes or reaches unsupported bytecode.
 
 ## Roadmap
 
-### 1. JAR and classpath loading
+### 1. JAR and classpath loading — complete
 
-- Read classes from JAR and ZIP files.
-- Resolve application dependencies from a classpath.
-- Load resources from dependency archives.
-- Support manifest-based application startup.
+- Read classes from JAR and ZIP files with bounded stored/deflated reads.
+- Resolve application dependencies from ordered directories and archives.
+- Load resources from dependency archives through the MiniJRE stream slice.
+- Support manifest `Main-Class` startup and local transitive `Class-Path`.
 
 ### 2. Java runtime expansion
 

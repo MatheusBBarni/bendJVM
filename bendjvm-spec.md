@@ -84,8 +84,7 @@ Secondary goals:
 * JVM long support.
 * Performance benchmarking.
 * Runtime debugging/tracing.
-* Classpath support.
-
+* Ordered classpath, archive, manifest, and resource support.
 Long-term goals:
 
 * Larger Java bytecode coverage.
@@ -100,10 +99,9 @@ Long-term goals:
 
 # 3. Non-Goals for V1
 
-The first version will not support:
+The first version does not provide full OpenJDK compatibility. It intentionally
+does not support:
 
-* Full OpenJDK compatibility.
-* JAR/ZIP loading.
 * Java modules.
 * JNI.
 * Native libraries.
@@ -127,7 +125,11 @@ The first version will not support:
 * Java security manager.
 * JIT compilation.
 
-V1 operates on one or more `.class` files.
+V1 operates on standalone `.class` files or ordered directory/JAR/ZIP
+classpath sources. Manifest `Main-Class`, local manifest `Class-Path`, and
+classloader-relative resource streams are supported; nested JARs, wildcard
+classpath expansion, remote dependency fetching, and multi-release selection
+are not.
 
 ---
 
@@ -357,24 +359,15 @@ bendjvm/
 
 # 8. Class File Input
 
-BendJVM receives:
-
-```text
-Main.class
-```
-
-V1 invocation:
+The practical runner accepts a standalone `.class` file, an ordered classpath of
+directories/JARs/ZIPs, or `-jar` with manifest startup. Application class bytes
+are selected by the host; Bend parses identity and linking dependencies, then
+links only that closure with the bootstrap MiniJRE.
 
 ```bash
-bend main.bend -- Main.class
-```
-
-Future:
-
-```bash
-bend main.bend -- \
-  --classpath ./classes \
-  com.example.Main
+python3 scripts/run.py Main.class
+python3 scripts/run.py -cp ./classes:./lib.jar com.example.Main
+python3 scripts/run.py -jar app.jar
 ```
 
 ---
@@ -1687,29 +1680,16 @@ invokespecial <init>
 
 # 47. Class Loader
 
-V1:
+The host presents ordered directory, JAR, and ZIP sources to the Bend loading
+session. Lookup uses the exact internal path `com/example/Foo.class`; the
+first matching application source wins and bootstrap definitions cannot be
+replaced.
 
-```text
-single directory
-```
-
-Lookup:
-
-```text
-com/example/Foo
-
-→
-
-./classes/com/example/Foo.class
-```
-
-Later support:
-
-```text
-multiple classpath entries
-JARs
-bootstrap classes
-```
+The runner pins an explicitly selected `.class` file, then discovers only its
+transitive application closure before Bend links the selected bytes with the
+bootstrap MiniJRE. A malformed first match is an error, not permission to
+fall through. Archive entries are read without extraction and are bounded
+independently from the simulated heap.
 
 ---
 
@@ -2566,41 +2546,33 @@ Useful while implementing the class parser.
 
 # 88. CLI
 
-Initial:
+The practical runner accepts:
 
 ```bash
-bend bendjvm/main.bend -- Main.class
+python3 scripts/run.py [options] Main.class [application arguments...]
+python3 scripts/run.py [options] -cp <entries> com.example.Main [arguments...]
+python3 scripts/run.py [options] -jar app.jar [arguments...]
 ```
 
-Options:
+`-cp`, `-classpath`, and `--class-path` preserve left-to-right source order.
+Class-name mode uses explicit entries, then `CLASSPATH`, then the current
+directory. `.class` mode derives and validates the package root from the
+declared internal name. `-jar` ignores ordinary classpath settings and uses
+the archive manifest.
+
+Supported VM options:
 
 ```text
 --trace
-
 --disassemble
-
 --dump-class
-
 --fuel <n>
-
 --max-heap <n>
-
---entry <method>
-
---classpath <path>
 ```
 
-Future executable:
-
-```bash
-bend bendjvm/main.bend -o bendjvm
-```
-
-then:
-
-```bash
-./bendjvm Main.class
-```
+Usage errors exit 2. Loading and VM failures exit 1. Application arguments
+are transported as a structured request and allocated as a non-null Bend-owned
+`String[]`, preserving spaces and Unicode.
 
 ---
 
@@ -2618,9 +2590,9 @@ descriptor:
 ([Ljava/lang/String;)V
 ```
 
-The VM creates an empty String array for V1.
-
-Later command arguments may populate it.
+The loader validates that the selected entry class owns a public static method
+with this name and descriptor. The runtime allocates a non-null `String[]`;
+zero application arguments produce an empty array.
 
 ---
 
@@ -3085,31 +3057,42 @@ notify
 
 ---
 
-# 109. JAR Support
+# 109. JAR and ZIP Support
 
-Later:
+The milestone host source layer indexes local JAR and ZIP central directories
+with Python's standard-library `zipfile`. Stored and deflated entries are
+supported; unsafe names, duplicate names, encrypted entries, unsupported
+compression, and corrupt payloads fail with the physical archive origin.
 
-```text
-JAR
- ↓
-ZIP
- ↓
-class entries
-```
+Reads enforce a 64 MiB decompressed limit per entry and a 512 MiB limit per
+archive. These limits are separate from the simulated VM heap, and archives
+are closed on both success and failure. Entries are read without extraction.
 
-This requires:
-
-```text
-ZIP central directory
-
-DEFLATE
-```
-
-and is intentionally postponed.
+Archive manifests provide `Main-Class` for `-jar` and space-separated local
+`Class-Path` references. References are resolved relative to the declaring
+archive, percent-decoded, expanded transitively in declaration order, and
+deduplicated canonically. Remote URL schemes are rejected rather than
+fetched. Named manifest sections do not override main-section attributes.
 
 ---
+# 110. Java-visible Resources
 
-# 110. Java Library Strategy
+The supported resource slice is:
+
+```text
+ClassLoader.getSystemResourceAsStream(String)
+InputStream.read()
+InputStream.close()
+```
+
+Resource names are classpath-root-relative and case-sensitive. The first
+matching source wins; absence returns Java `null`, and an empty resource
+returns `-1` immediately. `read()` returns unsigned bytes `0..255` or `-1`.
+Each open has an independent position. Bend owns lookup, heap references,
+positions, and closed-stream behavior; the host supplies selected bytes only.
+
+
+# 111. Java Library Strategy
 
 Do not target OpenJDK library compatibility early.
 

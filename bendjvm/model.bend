@@ -106,20 +106,23 @@ def loaded_class_initializer(value: LoadedClass) -> U32:
   LoadedClass{id, name, parent, interfaces, fields, methods, initializer, state} = value
   initializer
 
-# kind: 0 object, 1 primitive array, 2 reference array, 3 UTF-16 string.
-# element is a primitive tag or a reference-array component class ID.
+# kind: 0 object, 1 primitive array, 2 reference array, 3 UTF-16 string, 4 InputStream.
+# element is a primitive tag, a reference-array component class ID, or stream position.
 type HeapEntry is Data:
   HeapEntry{class: U32, kind: U32, element: U32, fields: +List<Binding>, values: +List<Slot>, chars: +List<U32>}
+
+type Resource is Data:
+  Resource{name: String, bytes: +List<U32>}
+
 
 # pc is the next/current instruction. invokePc retains a caller's throwing location.
 # initializing=0xffffffff for ordinary calls; otherwise class initialized on return.
 type Frame is Data:
   Frame{method: U32, pc: U32, invokePc: U32, locals: +List<Slot>, stack: +List<Slot>, initializing: U32}
-
-# status: 0 running, 1 finished, 2 throwing, 3 out of fuel, 4 failed.
-# output holds pending print lines in reverse order. Main performs the host effects.
+# resources are ordered host-provided classpath records; lookup uses the first match.
 type VM is Data:
-  VM{classes: +List<LoadedClass>, methods: +List<LoadedMethod>, fields: +List<LoadedField>, symbols: +List<String>, heap: +List<HeapEntry>, statics: +List<Binding>, frames: +List<Frame>, status: U32, exception: U32, result: Slot, output: +List<String>, error: String, maxHeap: U32, steps: Nat}
+  VM{classes: +List<LoadedClass>, methods: +List<LoadedMethod>, fields: +List<LoadedField>, symbols: +List<String>, heap: +List<HeapEntry>, statics: +List<Binding>, resources: +List<Resource>, frames: +List<Frame>, status: U32, exception: U32, result: Slot, output: +List<String>, error: String, maxHeap: U32, steps: Nat}
+
 
 # Result uses messages carrying the stable VmError category plus location detail.
 def error(-A: Data, text: String) -> Result<&2, &2, String, A>:

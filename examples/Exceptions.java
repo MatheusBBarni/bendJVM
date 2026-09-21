@@ -10,5 +10,6 @@ public class Exceptions {
     public static void main(String[] args) {
         System.out.println(safeDivide(20, 4));
         System.out.println(safeDivide(20, 0));
+        System.out.println(safeDivide(9, 2));
     }
 }

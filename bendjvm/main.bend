@@ -2,6 +2,7 @@ import Base
 import ./model.bend as M
 import ./runtime/state.bend as S
 import ./runtime/execute.bend as X
+import ./runtime_api.bend as R
 import ./loader/class_loader.bend as L
 
 def jvm_class_path() -> IO(String):
@@ -11,6 +12,15 @@ def jvm_class_path() -> IO(String):
 def jvm_class_files() -> IO(String):
   import "./args.c"
   import "./args.js"
+
+def jvm_entry_name() -> IO(String):
+  import "./args.c"
+  import "./args.js"
+
+def jvm_application_args() -> IO(String):
+  import "./args.c"
+  import "./args.js"
+
 def jvm_fuel() -> IO(U32):
   import "./args.c"
   import "./args.js"
@@ -18,10 +28,10 @@ def jvm_fuel() -> IO(U32):
 def jvm_max_heap() -> IO(U32):
   import "./args.c"
   import "./args.js"
+
 def jvm_mode() -> IO(U32):
   import "./args.c"
   import "./args.js"
-
 
 def read_file_pair(pair: File & Result<&1, &1, U32 & String, +List<U32>>) -> IO(+List<U32>):
   match pair:
@@ -307,25 +317,48 @@ def dump_loaded(+loaded: M.VM, mode: U32) -> IO(Unit):
 def execute_loaded(+loaded: M.VM, fuel: U32) -> M.VM:
   X.run(loaded, U32.to_nat(fuel))
 
+def execute_loaded_entry(+loaded: M.VM, fuel: U32, entry: String, +args: +List<String>) -> M.VM:
+  R.run_loaded_entry(loaded, U32.to_nat(fuel), entry, args)
+
 def run_mode(+loaded: M.VM, fuel: U32, mode: U32) -> IO(Unit):
   match mode:
     case 1: IO.pure(Unit, Unit{})
     case _: finish(execute_loaded(loaded, fuel))
+
+def run_mode_entry(+loaded: M.VM, fuel: U32, mode: U32, entry: String, +args: +List<String>) -> IO(Unit):
+  match mode:
+    case 1: IO.pure(Unit, Unit{})
+    case _: finish(execute_loaded_entry(loaded, fuel, entry, args))
+
 def run_done(+loaded: M.VM, +fuel: U32, +mode: U32) -> IO(Unit):
   do IO<Unit>:
     dump_loaded(loaded, mode)
     run_mode(loaded, fuel, mode)
 
+def run_done_entry(+loaded: M.VM, +fuel: U32, +mode: U32, entry: String, +args: +List<String>) -> IO(Unit):
+  do IO<Unit>:
+    dump_loaded(loaded, mode)
+    run_mode_entry(loaded, fuel, mode, entry, args)
+
 def run_loaded(value: Result<&2, &2, String, M.VM>, fuel: U32, mode: U32) -> IO(Unit):
   match value:
     case Fail{error}: IO.die(Unit, 1, error)
     case Done{+loaded}: run_done(loaded, fuel, mode)
+
+def run_selected(value: Result<&2, &2, String, M.VM>, fuel: U32, mode: U32, entry: String, +args: +List<String>) -> IO(Unit):
+  match value:
+    case Fail{error}: IO.die(Unit, 1, error)
+    case Done{+loaded}: run_done_entry(loaded, fuel, mode, entry, args)
+
 def main() -> IO(Unit):
   do IO<Unit>:
     class_files : String <- jvm_class_files()
+    entry : String <- jvm_entry_name()
+    argument_text : String <- jvm_application_args()
     maxHeap : U32 <- jvm_max_heap()
     fuel : U32 <- jvm_fuel()
     paths : +List<String> = String.lines(class_files)
+    applicationArgs : +List<String> = String.lines(argument_text)
     bytes : +List<+List<U32>> <- read_files(paths)
     mode : U32 <- jvm_mode()
-    run_loaded(L.load_many(bytes, maxHeap), fuel, mode)
+    run_selected(L.load_many_with_resources(bytes, Nil{}, maxHeap), fuel, mode, entry, applicationArgs)

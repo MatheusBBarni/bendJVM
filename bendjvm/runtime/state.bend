@@ -2,92 +2,96 @@ import Base
 import ../model.bend as M
 
 def classes(vm: M.VM) -> +List<M.LoadedClass>:
-  M.VM{cs, ms, fs, sy, hp, st, fr, stt, ex, result, out, err, max, steps} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
   cs
 
 def methods(vm: M.VM) -> +List<M.LoadedMethod>:
-  M.VM{cs, ms, fs, sy, hp, st, fr, stt, ex, result, out, err, max, steps} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
   ms
 
 def fields(vm: M.VM) -> +List<M.LoadedField>:
-  M.VM{cs, ms, fs, sy, hp, st, fr, stt, ex, result, out, err, max, steps} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
   fs
 
 def symbols(vm: M.VM) -> +List<String>:
-  M.VM{cs, ms, fs, sy, hp, st, fr, stt, ex, result, out, err, max, steps} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
   sy
 
 def heap(vm: M.VM) -> +List<M.HeapEntry>:
-  M.VM{cs, ms, fs, sy, hp, st, fr, stt, ex, result, out, err, max, steps} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
   hp
 
 def statics(vm: M.VM) -> +List<M.Binding>:
-  M.VM{cs, ms, fs, sy, hp, st, fr, stt, ex, result, out, err, max, steps} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
   st
 
+def resources(vm: M.VM) -> +List<M.Resource>:
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
+  rs
+
 def frames(vm: M.VM) -> +List<M.Frame>:
-  M.VM{cs, ms, fs, sy, hp, st, fr, stt, ex, result, out, err, max, steps} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
   fr
 
 def status(vm: M.VM) -> U32:
-  M.VM{cs, ms, fs, sy, hp, st, fr, stt, ex, result, out, err, max, steps} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
   stt
 
 def max_heap(vm: M.VM) -> U32:
-  M.VM{cs, ms, fs, sy, hp, st, fr, stt, ex, result, out, err, max, steps} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
   max
 
 def output(vm: M.VM) -> +List<String>:
-  M.VM{cs, ms, fs, sy, hp, st, fr, stt, ex, result, out, err, max, steps} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
   out
 
 def error(vm: M.VM) -> String:
-  M.VM{cs, ms, fs, sy, hp, st, fr, stt, ex, result, out, err, max, steps} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
   err
 
 def with_classes(vm: M.VM, value: +List<M.LoadedClass>) -> M.VM:
-  M.VM{cs, ms, fs, sy, hp, st, fr, stt, ex, result, out, err, max, steps} = vm
-  M.VM{value, ms, fs, sy, hp, st, fr, stt, ex, result, out, err, max, steps}
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
+  M.VM{value, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps}
 
 def with_heap(vm: M.VM, value: +List<M.HeapEntry>) -> M.VM:
-  M.VM{cs, ms, fs, sy, hp, st, fr, stt, ex, result, out, err, max, steps} = vm
-  M.VM{cs, ms, fs, sy, value, st, fr, stt, ex, result, out, err, max, steps}
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
+  M.VM{cs, ms, fs, sy, value, st, rs, fr, stt, ex, result, out, err, max, steps}
 
 def with_statics(vm: M.VM, value: +List<M.Binding>) -> M.VM:
-  M.VM{cs, ms, fs, sy, hp, st, fr, stt, ex, result, out, err, max, steps} = vm
-  M.VM{cs, ms, fs, sy, hp, value, fr, stt, ex, result, out, err, max, steps}
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
+  M.VM{cs, ms, fs, sy, hp, value, rs, fr, stt, ex, result, out, err, max, steps}
 
 def with_frames(vm: M.VM, value: +List<M.Frame>) -> M.VM:
-  M.VM{cs, ms, fs, sy, hp, st, fr, stt, ex, result, out, err, max, steps} = vm
-  M.VM{cs, ms, fs, sy, hp, st, value, stt, ex, result, out, err, max, steps}
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, value, stt, ex, result, out, err, max, steps}
 
 def with_status(vm: M.VM, value: U32) -> M.VM:
-  M.VM{cs, ms, fs, sy, hp, st, fr, stt, ex, result, out, err, max, steps} = vm
-  M.VM{cs, ms, fs, sy, hp, st, fr, value, ex, result, out, err, max, steps}
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, value, ex, result, out, err, max, steps}
 
 def with_result(vm: M.VM, value: M.Slot) -> M.VM:
-  M.VM{cs, ms, fs, sy, hp, st, fr, stt, ex, result, out, err, max, steps} = vm
-  M.VM{cs, ms, fs, sy, hp, st, fr, stt, ex, value, out, err, max, steps}
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, value, out, err, max, steps}
 def result_slot(vm: M.VM) -> M.Slot:
-  M.VM{cs, ms, fs, sy, hp, st, fr, stt, ex, value, out, err, max, steps} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, value, out, err, max, steps} = vm
   value
 
 
 def with_exception(vm: M.VM, value: U32) -> M.VM:
-  M.VM{cs, ms, fs, sy, hp, st, fr, stt, ex, result, out, err, max, steps} = vm
-  M.VM{cs, ms, fs, sy, hp, st, fr, stt, value, result, out, err, max, steps}
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, value, result, out, err, max, steps}
 
 def emit(vm: M.VM, line: String) -> M.VM:
-  M.VM{cs, ms, fs, sy, hp, st, fr, stt, ex, result, out, err, max, steps} = vm
-  M.VM{cs, ms, fs, sy, hp, st, fr, stt, ex, result, Con{line, out}, err, max, steps}
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, Con{line, out}, err, max, steps}
 
 def fail(vm: M.VM, message: String) -> M.VM:
-  M.VM{cs, ms, fs, sy, hp, st, fr, stt, ex, result, out, err, max, steps} = vm
-  M.VM{cs, ms, fs, sy, hp, st, fr, 4, ex, result, out, message, max, steps}
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, 4, ex, result, out, message, max, steps}
 
 def tick(vm: M.VM) -> M.VM:
-  M.VM{cs, ms, fs, sy, hp, st, fr, stt, ex, result, out, err, max, steps} = vm
-  M.VM{cs, ms, fs, sy, hp, st, fr, stt, ex, result, out, err, max, 1n+steps}
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, 1n+steps}
 
 def method_id(frame: M.Frame) -> U32:
   M.Frame{method, pc0, invoke, ls, stk, init} = frame

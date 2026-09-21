@@ -1,3 +1,23 @@
+public class ObjectsAndDispatch {
+    int value() {
+        return 10;
+    }
+
+    public static void main(String[] args) {
+        ObjectsAndDispatch plain = new ObjectsAndDispatch();
+        ObjectsAndDispatch offset = new OffsetBox();
+        System.out.println(plain.value());
+        System.out.println(offset.value());
+        System.out.println(new Counter(3).next());
+    }
+}
+
+class OffsetBox extends ObjectsAndDispatch {
+    int value() {
+        return 11;
+    }
+}
+
 class Counter {
     private int value;
 
@@ -8,13 +28,5 @@ class Counter {
     int next() {
         value += 1;
         return value;
-    }
-}
-
-public class ObjectsAndDispatch {
-    public static void main(String[] args) {
-        Counter counter = new Counter(10);
-        System.out.println(counter.next());
-        System.out.println(counter.next());
     }
 }

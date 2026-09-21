@@ -5,8 +5,9 @@ public class ArraysAndStrings {
         for (int index = 0; index < values.length; index++) {
             total += values[index];
         }
-        System.out.println("array total");
+        System.out.println("pi digits");
         System.out.println(total);
         System.out.println(values[2] == 4);
+        System.out.println("BendJVM");
     }
 }

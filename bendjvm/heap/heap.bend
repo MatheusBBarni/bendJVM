@@ -181,3 +181,18 @@ def string_intern_scan(entries: +List<M.HeapEntry>, +chars: +List<U32>, +referen
 
 def string_intern(+heap: +List<M.HeapEntry>, +chars: +List<U32>) -> Maybe<&2, U32>:
   string_intern_scan(heap, chars, 1)
+def byte_slots(bytes: +List<U32>) -> +List<M.Slot>:
+  match bytes:
+    case Nil{}: Nil{}
+    case Con{byte, rest}: Con{M.Slot{1, U32.and(byte, 255)}, byte_slots(rest)}
+
+def stream_entry(class: U32, bytes: +List<U32>) -> M.HeapEntry:
+  M.HeapEntry{class, 4, 0, [M.Binding{0, M.Slot{1, 0}}], byte_slots(bytes), Nil{}}
+
+def stream_closed_found(found: Maybe<&2, M.Slot>) -> Bool:
+  match found:
+    case None{}: False{}
+    case Some{M.Slot{tag, bits}}: U32.is_ne(bits, 0)
+
+def stream_closed(fields: +List<M.Binding>) -> Bool:
+  stream_closed_found(binding_find(fields, 0))

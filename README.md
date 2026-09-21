@@ -41,11 +41,14 @@ The project is designed around two boundaries:
 - **Bend owns JVM semantics and state.** Host C/JavaScript code is limited to file input, output, and the generated-artifact adapter.
 - **The reference JVM is the oracle.** The differential test harness compiles the same Java fixture with `javac`, runs it with `java`, runs it with BendJVM, and compares observable output.
 
-## Supported behavior
-
-The current fixture corpus exercises:
-
+The supported slice currently exercises:
 - Java 8 class files (major version 52)
+- ordered directory, JAR, and ZIP classpath sources
+- package-qualified class-name startup and standalone `.class` startup
+- transitive application dependency resolution with first-match precedence
+- manifest `Main-Class` and local `Class-Path` expansion for `-jar`
+- classpath-root-relative resources through `ClassLoader.getSystemResourceAsStream`
+- bounded stored/deflated archive reads with origin-aware diagnostics
 - class loading, symbol interning, constant-pool linking, and descriptors
 - integer and float arithmetic, signed integer behavior, branches, loops, and recursion
 - static and virtual method calls, constructors, objects, fields, and inherited fields
@@ -83,31 +86,47 @@ javac --release 8 -encoding UTF-8 \
   examples/HelloWorld.java
 ```
 
-Run the generated class through the repository runner:
+Run a standalone class file:
 
 ```bash
 python3 scripts/run.py /tmp/bendjvm-classes/HelloWorld.class
 ```
 
-Expected output:
+Run a package-qualified class from ordered directory/JAR/ZIP entries:
 
-```text
-Hello from BendJVM
-42
+```bash
+python3 scripts/run.py \
+  -cp /tmp/bendjvm-classes:/tmp/dependencies.jar \
+  examples.HelloWorld
 ```
 
-The runner builds and caches the Bend loader/runtime artifacts under `/tmp/bendjvm-cache` by default. Override the tools or cache location with `BEND`, `BUN`, or `BENDJVM_CACHE`.
+Launch an executable JAR. Its manifest supplies `Main-Class` and local
+`Class-Path` dependencies:
 
-> [!TIP]
-> The runner automatically includes sibling `.class` files referenced by the selected class. Compile a multi-class example into the same output directory.
+```bash
+python3 scripts/run.py -jar /tmp/example.jar application-argument
+```
+
+The runner builds and caches Bend loader/runtime artifacts under
+`/tmp/bendjvm-cache` by default. Override tools or cache location with
+`BEND`, `BUN`, or `BENDJVM_CACHE`.
+
+Application arguments preserve spaces and Unicode and become a Bend-owned
+`String[]`. CLI usage errors exit 2; loading and VM failures exit 1.
 
 ## Usage
 
-The recommended command is:
-
 ```bash
-python3 scripts/run.py [options] Main.class
+python3 scripts/run.py [options] Main.class [application arguments...]
+python3 scripts/run.py [options] -cp <entries> com.example.Main [arguments...]
+python3 scripts/run.py [options] -jar app.jar [arguments...]
 ```
+
+`-classpath` and `--class-path` are aliases for `-cp`; entries use the host
+platform path separator. Classpath sources are searched left to right, and
+the first matching class or resource wins. Empty entries mean the current
+directory. `-jar` uses the selected archive and its manifest dependencies,
+ignoring ordinary classpath settings.
 
 Useful options:
 
@@ -118,7 +137,12 @@ Useful options:
 | `--dump-class` | Print loaded class metadata without executing `main`. |
 | `--disassemble` | Print class metadata and decoded instructions. |
 | `--trace` | Print decoded instruction execution diagnostics to stderr. |
-| `--prepare` | Build the cached Bend loader/runtime artifacts without running a class. |
+| `--prepare` | Build cached Bend loader/runtime artifacts without running a class. |
+
+Archive sources accept stored and deflated entries. Reads are bounded at
+64 MiB per entry and 512 MiB decompressed per archive. Unsafe names,
+duplicates, encrypted entries, unsupported compression, and corrupt payloads
+are rejected; archives are never extracted.
 
 Example diagnostics:
 
@@ -129,19 +153,61 @@ python3 scripts/run.py --trace /tmp/bendjvm-classes/HelloWorld.class
 python3 scripts/run.py --fuel 10000 /tmp/bendjvm-classes/HelloWorld.class
 ```
 
-
 ## Examples
 
-The `examples/` directory contains small Java programs covering the main user-facing behaviors:
+Standalone programs in `examples/` cover the MiniJRE slice:
 
-- `HelloWorld.java` — strings and integer output
-- `ArithmeticAndBranches.java` — arithmetic, comparisons, and loops
-- `ObjectsAndDispatch.java` — object construction and virtual dispatch
-- `ArraysAndStrings.java` — integer arrays and string output
-- `Exceptions.java` — caught arithmetic exceptions
-- `StaticInitialization.java` — static fields and `<clinit>` execution
+| File | What it shows |
+| --- | --- |
+| `HelloWorld.java` | strings, integers, and optional application arguments |
+| `ArithmeticAndBranches.java` | arithmetic, `for`/`while`, and comparisons |
+| `ObjectsAndDispatch.java` | constructors, fields, and virtual dispatch |
+| `ArraysAndStrings.java` | integer arrays and string constants |
+| `Exceptions.java` | caught `ArithmeticException` |
+| `StaticInitialization.java` | static fields and `<clinit>` |
 
-The broader differential corpus lives in `bendjvm/tests/fixtures/` and includes integer/float operations, arrays, inheritance, strings, exceptions, class initialization, fuel limits, and heap limits.
+`examples/packaged/` is a small application: `example.hello.Main` depends on
+`example.lib.Answer`, reads `banner.txt` from the classpath, and prints its first
+argument.
+
+Compile the standalone samples:
+
+```bash
+mkdir -p /tmp/bendjvm-classes
+javac --release 8 -encoding UTF-8 -d /tmp/bendjvm-classes examples/*.java
+python3 scripts/run.py /tmp/bendjvm-classes/HelloWorld.class
+python3 scripts/run.py /tmp/bendjvm-classes/HelloWorld.class 'spaced arg'
+```
+
+Compile and run the packaged application from a directory:
+
+```bash
+mkdir -p /tmp/bendjvm-app
+javac --release 8 -encoding UTF-8 -d /tmp/bendjvm-app \
+  examples/packaged/example/hello/Main.java \
+  examples/packaged/example/lib/Answer.java
+cp examples/packaged/banner.txt /tmp/bendjvm-app/
+python3 scripts/run.py -cp /tmp/bendjvm-app example.hello.Main Bend
+```
+
+Expected packaged output:
+
+```text
+Bend
+42
+66
+```
+
+`66` is the first byte of `banner.txt` (`B`). The same classes also run from a
+JAR whose manifest names `example.hello.Main`.
+
+Run every example through the practical runner:
+
+```bash
+python3 examples/run.py
+```
+
+The broader differential corpus lives in `bendjvm/tests/fixtures/` and includes integer/float operations, arrays, inheritance, strings, exceptions, class initialization, fuel limits, heap limits, classpaths, archives, manifests, and resources.
 
 ## Testing
 
@@ -173,23 +239,23 @@ The harness requires Python 3.10+, a JDK, Bend 2, and Bun. It compiles sources a
 | `bendjvm/bytecode/` | Instruction decoding, operand normalization, decoded program counters, and branch-target checks. |
 | `bendjvm/verifier/` | Stack contracts, local bounds, descriptor checks, and instruction validation. |
 | `bendjvm/loader/` | Symbol interning, class catalog/linking, bootstrap classes, intrinsic registration, and VM construction. |
-| `bendjvm/runtime/` | Explicit frames, locals, operand stacks, instruction stepping, method calls, returns, exceptions, and VM status. |
-| `bendjvm/heap/` | Object, primitive-array, reference-array, and string entries with bounded allocation. |
-| `bendjvm/java/` | Minimal Java runtime intrinsics, including supported `println` overloads and string conversion. |
-| `bendjvm/model.bend` | Shared class-file, linked-runtime, heap, frame, and VM data types. |
-| `scripts/run.py` | Builds cached Bend JavaScript artifacts and provides the practical command-line runner. |
-| `scripts/test.py` | Differential, malformed-input, resource-limit, debug-mode, and generated-program tests. |
+| `bendjvm/runtime/` | Explicit frames, locals, operand stacks, instruction stepping, method calls, returns, exceptions, resources, and VM status. |
+| `bendjvm/heap/` | Object, primitive-array, reference-array, string, and resource-stream entries with bounded allocation. |
+| `bendjvm/java/` | Minimal Java runtime intrinsics, including `ClassLoader` resource streams, supported `println` overloads, and string conversion. |
+| `bendjvm/model.bend` | Shared class-file, linked-runtime, heap, frame, resource, and VM data types. |
+| `scripts/classpath.py` | Ordered directory/JAR/ZIP sources, manifest expansion, bounded reads, and resource lookup. |
+| `scripts/run.py` | Builds cached Bend JavaScript artifacts and provides the structured practical command-line runner. |
+| `scripts/test.py` | Differential, classpath/archive/manifest/resource, malformed-input, limit, debug-mode, and generated-program tests. |
 | `LAWS.bend` / `PROOF.bend` | Bend law declarations and proofs checked by `bend PROOF.bend`. |
 
 ## Compatibility boundary
+BendJVM accepts Java 8 class files and ordered directory/JAR/ZIP classpaths, but intentionally does not provide full JVM compatibility. It does not yet promise:
 
-BendJVM currently accepts Java 8 class files and intentionally does not provide full JVM compatibility. In particular, the project does not yet promise:
-
-- JAR/ZIP loading, classpaths, modules, reflection, JNI, agents, or custom class loaders
+- modules, reflection, JNI, agents, or custom class loaders
 - `long` and `double` execution, or complete floating-point edge-case compatibility
 - `invokedynamic`, method handles, dynamic proxies, or full verifier compatibility
 - Java threads, monitors, `synchronized`, `volatile`, or complete synchronization semantics
-- garbage collection, JIT compilation, or OpenJDK library compatibility
+- garbage collection, JIT compilation, Spring Boot nested-JAR layouts, or OpenJDK library compatibility
 
 BendJVM is not a sandbox-grade security boundary. Java code only reaches host behavior through registered intrinsics, but untrusted bytecode should still be treated as untrusted input.
 
@@ -203,4 +269,6 @@ The project specification is documented in [`bendjvm-spec.md`](bendjvm-spec.md).
 4. Reject unsupported semantics instead of approximating them.
 5. Prove small interpreter invariants in Bend before optimizing representation or dispatch.
 
-The next milestones are to deepen parser coverage, expand integer VM behavior, and strengthen the law/proof boundary around frames, stacks, heap references, and fuel-bounded execution.
+Classpath, JAR/ZIP, manifest, and MiniJRE resource-stream loading are in place.
+The next milestones are Java runtime expansion, reflection, broader bytecode
+coverage, and concurrency — not Spring Boot until those exist.

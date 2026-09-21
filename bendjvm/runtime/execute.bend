@@ -137,28 +137,42 @@ def invoke_arguments(vm: M.VM, method: M.LoadedMethod, args: F.Arguments, frames
       match args:
         case F.Arguments{caller, values}:
           invoke_frame(vm, id, maxLocals, caller, values, frames)
-def intrinsic_output(+vm: M.VM, frame: M.Frame, output: Maybe<&2, String>) -> Result<&2, &2, String, M.VM>:
-  match output:
+def intrinsic_value(+vm: M.VM, frame: M.Frame, value: Maybe<&2, M.Slot>, max: U32) -> Result<&2, &2, String, M.VM>:
+  match value:
     case None{}:
       Done{S.commit(vm, frame)}
-    case Some{text}:
-      Done{S.commit(S.emit(vm, text), frame)}
+    case Some{slot}:
+      do Result<&2, &2, String, M.VM>:
+        pushed : M.Frame <- F.push(frame, slot, max)
+        return S.commit(vm, pushed)
 
-def intrinsic_args(+vm: M.VM, method: M.LoadedMethod, args: F.Arguments) -> Result<&2, &2, String, M.VM>:
+def intrinsic_output(+vm: M.VM, frame: M.Frame, output: Maybe<&2, String>, value: Maybe<&2, M.Slot>, max: U32) -> Result<&2, &2, String, M.VM>:
+  match output:
+    case None{}:
+      intrinsic_value(vm, frame, value, max)
+    case Some{text}:
+      intrinsic_value(S.emit(vm, text), frame, value, max)
+
+def intrinsic_result(frame: M.Frame, max: U32, result: Result<&2, &2, String, I.Outcome>) -> Result<&2, &2, String, M.VM>:
+  match result:
+    case Fail{error}: Fail{error}
+    case Done{outcome}:
+      match outcome:
+        case I.Outcome{updated, output, value}:
+          intrinsic_output(updated, frame, output, value, max)
+
+def intrinsic_args(+vm: M.VM, +method: M.LoadedMethod, args: F.Arguments, max: U32) -> Result<&2, &2, String, M.VM>:
   match args:
     case F.Arguments{frame, values}:
-      do Result<&2, &2, String, M.VM>:
-        output : Maybe<&2, String> <- I.execute(method_intrinsic(method), S.heap(vm), values)
-        result : M.VM <- intrinsic_output(vm, frame, output)
-        return result
+      intrinsic_result(frame, max, I.execute_vm(method_intrinsic(method), vm, values))
 
-def dispatch_intrinsic(+vm: M.VM, method: M.LoadedMethod, args: F.Arguments, intrinsic: U32) -> Result<&2, &2, String, M.VM>:
+def dispatch_intrinsic(+vm: M.VM, method: M.LoadedMethod, args: F.Arguments, intrinsic: U32, max: U32) -> Result<&2, &2, String, M.VM>:
   match intrinsic:
     case 0: Done{invoke_arguments(vm, method, args, S.frames(vm))}
-    case other: intrinsic_args(vm, method, args)
+    case other: intrinsic_args(vm, method, args, max)
 
-def dispatch_method(+vm: M.VM, +method: M.LoadedMethod, args: F.Arguments) -> Result<&2, &2, String, M.VM>:
-  dispatch_intrinsic(vm, method, args, method_intrinsic(method))
+def dispatch_method(+vm: M.VM, +method: M.LoadedMethod, args: F.Arguments, max: U32) -> Result<&2, &2, String, M.VM>:
+  dispatch_intrinsic(vm, method, args, method_intrinsic(method), max)
 
 def receiver_slot(stack: +List<M.Slot>, count: Nat) -> Maybe<&2, M.Slot>:
   match stack:
@@ -167,13 +181,13 @@ def receiver_slot(stack: +List<M.Slot>, count: Nat) -> Maybe<&2, M.Slot>:
       match count:
         case 0n: Some{receiver}
         case 1n+p: receiver_slot(rest, p)
-def invoke_virtual_found(found: Maybe<&2, M.LoadedMethod>, +vm: M.VM, frame: M.Frame, count: U32) -> Result<&2, &2, String, M.VM>:
+def invoke_virtual_found(found: Maybe<&2, M.LoadedMethod>, +vm: M.VM, frame: M.Frame, count: U32, max: U32) -> Result<&2, &2, String, M.VM>:
   match found:
     case None{}: Fail{"NoSuchMethodError"}
     case Some{+method}:
       do Result<&2, &2, String, M.VM>:
         args : F.Arguments <- F.arguments(frame, U32.add(method_parameters(method), count))
-        result : M.VM <- dispatch_method(vm, method, args)
+        result : M.VM <- dispatch_method(vm, method, args, max)
         return result
 
 def virtual_method_entry(result: Result<&2, &2, String, M.HeapEntry>, +vm: M.VM, +owner: U32, +name: U32, +descriptor: U32) -> Maybe<&2, M.LoadedMethod>:
@@ -195,25 +209,24 @@ def invoke_virtual_method(found: Maybe<&2, M.LoadedMethod>, +vm: M.VM, +stack: +
     case Some{method}:
       virtual_method_stack_case(vm, stack, owner, name, descriptor, U32.to_nat(method_parameters(method)))
 
-
 def virtual_method_stack(+vm: M.VM, +frame: M.Frame, +owner: U32, +name: U32, +descriptor: U32) -> Maybe<&2, M.LoadedMethod>:
   invoke_virtual_method(find_method(S.classes(vm), S.methods(vm), owner, name, descriptor), vm, S.stack(frame), owner, name, descriptor)
 
-def invoke_virtual(+vm: M.VM, +frame: M.Frame, owner: U32, name: U32, descriptor: U32) -> Result<&2, &2, String, M.VM>:
-  invoke_virtual_found(virtual_method_stack(vm, frame, owner, name, descriptor), vm, frame, 1)
-def invoke_found(found: Maybe<&2, M.LoadedMethod>, +vm: M.VM, frame: M.Frame) -> Result<&2, &2, String, M.VM>:
+def invoke_virtual(+vm: M.VM, +frame: M.Frame, owner: U32, name: U32, descriptor: U32, max: U32) -> Result<&2, &2, String, M.VM>:
+  invoke_virtual_found(virtual_method_stack(vm, frame, owner, name, descriptor), vm, frame, 1, max)
+def invoke_found(found: Maybe<&2, M.LoadedMethod>, +vm: M.VM, frame: M.Frame, max: U32) -> Result<&2, &2, String, M.VM>:
   match found:
     case None{}: Fail{"NoSuchMethodError"}
     case Some{+method}:
       do Result<&2, &2, String, M.VM>:
         args : F.Arguments <- F.arguments(frame, method_parameters(method))
-        result : M.VM <- dispatch_method(vm, method, args)
+        result : M.VM <- dispatch_method(vm, method, args, max)
         return result
 
-def invoke_static(+vm: M.VM, frame: M.Frame, owner: U32, name: U32, descriptor: U32) -> Result<&2, &2, String, M.VM>:
-  invoke_found(find_method(S.classes(vm), S.methods(vm), owner, name, descriptor), vm, frame)
-def invoke_special(+vm: M.VM, frame: M.Frame, owner: U32, name: U32, descriptor: U32) -> Result<&2, &2, String, M.VM>:
-  invoke_virtual_found(find_method(S.classes(vm), S.methods(vm), owner, name, descriptor), vm, frame, 1)
+def invoke_static(+vm: M.VM, frame: M.Frame, owner: U32, name: U32, descriptor: U32, max: U32) -> Result<&2, &2, String, M.VM>:
+  invoke_found(find_method(S.classes(vm), S.methods(vm), owner, name, descriptor), vm, frame, max)
+def invoke_special(+vm: M.VM, frame: M.Frame, owner: U32, name: U32, descriptor: U32, max: U32) -> Result<&2, &2, String, M.VM>:
+  invoke_virtual_found(find_method(S.classes(vm), S.methods(vm), owner, name, descriptor), vm, frame, 1, max)
 
 
 def store_popped(vm: M.VM, popped: F.Popped, index: U32) -> Result<&2, &2, String, M.VM>:
@@ -1209,9 +1222,9 @@ def step(+vm: M.VM, +frame: M.Frame, +method: M.LoadedMethod, instruction: M.Ins
     case 188: array_count(vm, frame, Sy.find(S.symbols(vm), B.atype_name(a)), a, 1)
     case 189: array_count(vm, frame, a, a, 2)
     case 187: new_object(vm, frame, a)
-    case 182: invoke_virtual(vm, S.advance(frame), a, b, c)
-    case 183: invoke_special(vm, S.advance(frame), a, b, c)
-    case 184: invoke_static(vm, S.advance(frame), a, b, c)
+    case 182: invoke_virtual(vm, S.advance(frame), a, b, c, method_max_stack(method))
+    case 183: invoke_special(vm, S.advance(frame), a, b, c, method_max_stack(method))
+    case 184: invoke_static(vm, S.advance(frame), a, b, c, method_max_stack(method))
     case _: Fail{"UnsupportedOpcode: " ++ U32.show(op)}
 def method_handlers(value: M.LoadedMethod) -> +List<M.Handler>:
   match value:

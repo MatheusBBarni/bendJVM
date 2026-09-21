@@ -22,7 +22,9 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Callable
+from typing import Callable, Iterable, Mapping
+import warnings
+import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,6 +41,139 @@ EXTENDED = (
     "SignedArithmetic", "RuntimeExceptions", "ReferenceTypes", "Utf16Strings",
 )
 SUPPORT = ("FuelLimit", "HeapLimit", "MutationTarget")
+
+FixtureValue = bytes | bytearray | memoryview | str
+FixtureEntries = Mapping[str, FixtureValue]
+
+
+def _fixture_bytes(value: FixtureValue) -> bytes:
+    if isinstance(value, str):
+        return value.encode("utf-8")
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value)
+    raise TypeError(f"fixture entry must be text or bytes, got {type(value).__name__}")
+
+
+def _fixture_name(name: str) -> str:
+    if not isinstance(name, str) or not name:
+        raise ValueError("fixture entry names must be non-empty strings")
+    if "\\" in name or name.startswith("/"):
+        raise ValueError(f"unsafe fixture entry name: {name!r}")
+    parts = name.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        raise ValueError(f"unsafe fixture entry name: {name!r}")
+    return name
+
+
+def _merged_fixture_entries(entries: FixtureEntries | None,
+                            resources: FixtureEntries | None) -> dict[str, bytes]:
+    merged: dict[str, bytes] = {}
+    for source in (entries or {}, resources or {}):
+        for name, value in source.items():
+            normalized = _fixture_name(name)
+            if normalized in merged:
+                raise ValueError(f"duplicate fixture entry: {normalized!r}")
+            merged[normalized] = _fixture_bytes(value)
+    return merged
+
+
+def write_fixture_directory(root: Path, entries: FixtureEntries | None = None,
+                            *, resources: FixtureEntries | None = None) -> Path:
+    """Write deterministic class/resource entries below a classpath directory."""
+    destination = Path(root)
+    destination.mkdir(parents=True, exist_ok=True)
+    for name, contents in sorted(_merged_fixture_entries(entries, resources).items()):
+        path = destination.joinpath(*name.split("/"))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(contents)
+    return destination
+
+
+def manifest_bytes(*, main_class: str | None = None,
+                   class_path: Iterable[str] = (),
+                   attributes: Mapping[str, str] | None = None,
+                   line_ending: str = "\r\n") -> bytes:
+    """Return a deterministic UTF-8 manifest with an optional main section."""
+    if line_ending not in ("\r\n", "\n"):
+        raise ValueError("manifest line ending must be CRLF or LF")
+    values = dict(attributes or {})
+    names = {name.lower(): name for name in values}
+    if len(names) != len(values):
+        raise ValueError("manifest attribute names must be unique case-insensitively")
+    values[names.get("manifest-version", "Manifest-Version")] = "1.0"
+    if main_class is not None:
+        values[names.get("main-class", "Main-Class")] = main_class
+    paths = tuple(class_path)
+    if paths:
+        values[names.get("class-path", "Class-Path")] = " ".join(paths)
+    for name, value in values.items():
+        if not name or "\r" in name or "\n" in name or ":" in name:
+            raise ValueError(f"invalid manifest attribute name: {name!r}")
+        if "\r" in str(value) or "\n" in str(value):
+            raise ValueError(f"invalid manifest attribute value for {name!r}")
+    manifest_name = names.get("manifest-version", "Manifest-Version")
+    ordered = [manifest_name] + sorted(
+        (name for name in values if name != manifest_name),
+        key=lambda name: (name.lower(), name),
+    )
+    lines: list[str] = []
+    for name in ordered:
+        value = str(values[name])
+        prefix = f"{name}: "
+        current = prefix
+        for character in value:
+            if len((current + character).encode("utf-8")) > 70 and current != prefix:
+                lines.append(current)
+                current = " "
+            current += character
+        lines.append(current)
+    return (line_ending.join(lines) + line_ending + line_ending).encode("utf-8")
+
+
+def write_manifest(path: Path, **kwargs: object) -> Path:
+    """Write :func:`manifest_bytes` to a file and return its path."""
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(manifest_bytes(**kwargs))
+    return destination
+
+
+def write_fixture_archive(path: Path, entries: FixtureEntries | None = None,
+                          *, resources: FixtureEntries | None = None,
+                          manifest: bytes | None = None,
+                          compression: int = zipfile.ZIP_DEFLATED) -> Path:
+    """Write a reproducible JAR/ZIP fixture without filesystem extraction."""
+    if compression not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+        raise ValueError("fixture archives support only stored or deflated entries")
+    merged = _merged_fixture_entries(entries, resources)
+    if manifest is not None:
+        manifest_name = "META-INF/MANIFEST.MF"
+        if manifest_name in merged:
+            raise ValueError(f"duplicate fixture entry: {manifest_name!r}")
+        merged[manifest_name] = _fixture_bytes(manifest)
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(destination, "w", compression=compression,
+                         allowZip64=False) as archive:
+        for name in sorted(merged):
+            info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+            info.compress_type = compression
+            info.create_system = 3
+            info.external_attr = 0o100644 << 16
+            archive.writestr(info, merged[name])
+    return destination
+
+
+def write_fixture_jar(path: Path, entries: FixtureEntries | None = None,
+                      **kwargs: object) -> Path:
+    """Write a deterministic JAR fixture; arguments match write_fixture_archive."""
+    return write_fixture_archive(path, entries, **kwargs)
+
+
+def write_fixture_zip(path: Path, entries: FixtureEntries | None = None,
+                      **kwargs: object) -> Path:
+    """Write a deterministic ZIP fixture; arguments match write_fixture_archive."""
+    return write_fixture_archive(path, entries, **kwargs)
 
 
 class Failure(Exception):
@@ -351,6 +486,190 @@ class Suite:
                 require(re.search(pattern, result.stderr) is not None,
                         f"trace missing {pattern!r}\n{result.detail()}")
 
+    def cli(self, *arguments: str) -> Run:
+        return execute([self.args.bend, *arguments], self.args.timeout, bend=True)
+
+    def classpath(self, directory: Path) -> None:
+        def compile_sources(output: Path, *sources: Path) -> dict[str, bytes]:
+            output.mkdir(parents=True, exist_ok=True)
+            result = execute([self.args.javac, "--release", "8", "-encoding", "UTF-8",
+                              "-g:none", "-d", str(output), *map(str, sources)], self.args.timeout)
+            require(result.code == 0, f"classpath fixture compilation failed\n{result.detail()}")
+            return {
+                path.relative_to(output).as_posix(): path.read_bytes()
+                for path in output.rglob("*.class")
+            }
+
+        fixture = FIXTURES / "classpath"
+        packaged = compile_sources(
+            directory / "packaged-compiled",
+            fixture / "PackagedMain.java",
+            fixture / "Dependency.java",
+            fixture / "TransitiveHelper.java",
+        )
+        packaged_main = {name: value for name, value in packaged.items() if name.endswith("PackagedMain.class")}
+        packaged_dependency = {
+            name: value for name, value in packaged.items() if not name.endswith("PackagedMain.class")
+        }
+        app_dir = write_fixture_directory(directory / "packaged-app", packaged_main)
+        dep_dir = write_fixture_directory(directory / "packaged-dep", packaged_dependency)
+        expected = "packaged-dependency\n"
+        for name, entries in (
+            ("directory", None),
+            ("jar", write_fixture_jar(directory / "dependency.jar", packaged_dependency)),
+            ("zip", write_fixture_zip(directory / "dependency.zip", packaged_dependency)),
+        ):
+            dependency = dep_dir if entries is None else entries
+            result = self.cli("-cp", os.pathsep.join((str(app_dir), str(dependency))),
+                              "fixture.packaged.PackagedMain")
+            require(result.code == 0, f"classpath/{name} failed\n{result.detail()}")
+            same_output(expected, result.stdout, result.detail())
+
+        duplicate_main = compile_sources(
+            directory / "duplicate-compiled",
+            fixture / "DuplicatePrecedenceMain.java",
+            fixture / "duplicate-first" / "Provider.java",
+        )
+        second = compile_sources(
+            directory / "duplicate-second-compiled",
+            fixture / "duplicate-second" / "Provider.java",
+        )
+        duplicate_app = write_fixture_directory(
+            directory / "duplicate-app",
+            {name: value for name, value in duplicate_main.items() if name.endswith("DuplicatePrecedenceMain.class")},
+        )
+        first_provider = write_fixture_directory(
+            directory / "duplicate-first-root",
+            {name: value for name, value in duplicate_main.items() if name.endswith("Provider.class")},
+        )
+        second_provider = write_fixture_directory(directory / "duplicate-second-root", second)
+        for roots, output in (
+            ((first_provider, second_provider, duplicate_app), "first\n"),
+            ((second_provider, first_provider, duplicate_app), "second\n"),
+        ):
+            result = self.cli("-cp", os.pathsep.join(map(str, roots)), "fixture.duplicate.app.DuplicatePrecedenceMain")
+            require(result.code == 0, f"classpath/precedence failed\n{result.detail()}")
+            same_output(output, result.stdout, result.detail())
+
+        resource = compile_sources(directory / "resource-compiled", fixture / "ResourceConsumer.java")
+        resource_app = write_fixture_directory(directory / "resource-app", resource)
+        resource_archive = write_fixture_jar(
+            directory / "resource dependency.jar",
+            resources={"fixture-resource.bin": bytes((0, 1, 127, 128, 255))},
+        )
+        result = self.cli("-cp", os.pathsep.join((str(resource_app), str(resource_archive))),
+                          "fixture.resource.ResourceConsumer")
+        require(result.code == 0, f"classpath/resource failed\n{result.detail()}")
+        same_output("0\n1\n127\n128\n255\n", result.stdout, result.detail())
+
+        manifest = compile_sources(
+            directory / "manifest-compiled",
+            fixture / "ManifestMain.java",
+            fixture / "ManifestDependency.java",
+        )
+        manifest_main = {name: value for name, value in manifest.items() if name.endswith("ManifestMain.class")}
+        manifest_dependency = {
+            name: value for name, value in manifest.items() if name.endswith("ManifestDependency.class")
+        }
+        dependency_jar = write_fixture_jar(directory / "manifest lib.jar", manifest_dependency)
+        app_jar = write_fixture_jar(
+            directory / "manifest app.jar",
+            manifest_main,
+            manifest=manifest_bytes(
+                main_class="fixture.manifest.ManifestMain",
+                class_path=(dependency_jar.name.replace(" ", "%20"),),
+                line_ending="\n",
+            ),
+        )
+        result = self.cli("-jar", str(app_jar), "manifest argument")
+        require(result.code == 0, f"classpath/manifest failed\n{result.detail()}")
+        same_output("manifest-startup\n", result.stdout, result.detail())
+
+        missing_manifest = write_fixture_jar(directory / "missing-main.jar", manifest_main)
+        result = self.cli("-jar", str(missing_manifest))
+        require(result.code > 0 and "Main-Class" in result.stderr,
+                f"missing manifest metadata was not rejected\n{result.detail()}")
+
+        missing = self.cli("-cp", str(app_dir), "fixture.packaged.PackagedMain")
+        require(missing.code > 0 and "MissingClass" in missing.stderr and "fixture/packaged/PackagedMain" in missing.stderr,
+                f"missing dependency was not reported\n{missing.detail()}")
+
+        polluted = write_fixture_directory(
+            directory / "polluted-app",
+            {**packaged_main, "Broken.class": b"not-a-class"},
+        )
+        result = self.cli("-cp", os.pathsep.join((str(polluted), str(dep_dir))), "fixture.packaged.PackagedMain")
+        require(result.code == 0, f"unrelated malformed class broke startup\n{result.detail()}")
+        same_output(expected, result.stdout, result.detail())
+
+        cycle_sources = directory / "cycle-src"
+        cycle_sources.mkdir()
+        (cycle_sources / "CycleA.java").write_text(
+            "package fixture.cycle; public class CycleA {"
+            " public static int value() { return CycleB.other(); }"
+            " public static int other() { return 1; }"
+            " public static void main(String[] args) { System.out.println(CycleA.value() + CycleB.value()); }"
+            "}",
+            encoding="utf-8",
+        )
+        (cycle_sources / "CycleB.java").write_text(
+            "package fixture.cycle; public class CycleB {"
+            " public static int value() { return CycleA.other(); }"
+            " public static int other() { return 6; }"
+            "}",
+            encoding="utf-8",
+        )
+        cycle = compile_sources(directory / "cycle-compiled", cycle_sources / "CycleA.java", cycle_sources / "CycleB.java")
+        cycle_dir = write_fixture_directory(directory / "cycle-app", cycle)
+        result = self.cli("-cp", str(cycle_dir), "fixture.cycle.CycleA")
+        require(result.code == 0, f"cyclic dependencies failed\n{result.detail()}")
+        same_output("7\n", result.stdout, result.detail())
+
+        empty_archive = write_fixture_jar(directory / "empty-resource.jar", resources={"fixture-resource.bin": b""})
+        result = self.cli("-cp", os.pathsep.join((str(resource_app), str(empty_archive))),
+                          "fixture.resource.ResourceConsumer")
+        require(result.code == 0, f"empty resource failed\n{result.detail()}")
+        same_output("-1\n-1\n-1\n-1\n-1\n", result.stdout, result.detail())
+
+        result = self.cli("-cp", str(resource_app), "fixture.resource.ResourceConsumer")
+        require(result.code == 0, f"missing resource failed\n{result.detail()}")
+        same_output("missing\n", result.stdout, result.detail())
+
+        remote = write_fixture_jar(
+            directory / "remote.jar",
+            manifest_main,
+            manifest=manifest_bytes(main_class="fixture.manifest.ManifestMain", class_path=("http://example.com/x.jar",)),
+        )
+        result = self.cli("-jar", str(remote))
+        require(result.code > 0 and "scheme" in result.stderr,
+                f"remote manifest Class-Path was not rejected\n{result.detail()}")
+
+        duplicate = directory / "duplicate-entry.jar"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            with zipfile.ZipFile(duplicate, "w", compression=zipfile.ZIP_STORED, allowZip64=False) as archive:
+                payload = next(iter(packaged_main.values()))
+                archive.writestr("fixture/packaged/PackagedMain.class", payload)
+                archive.writestr("fixture/packaged/PackagedMain.class", payload)
+        result = self.cli("-cp", str(duplicate), "fixture.packaged.PackagedMain")
+        require(result.code > 0 and "duplicate" in result.stderr,
+                f"duplicate archive entry was not rejected\n{result.detail()}")
+
+        closed_source = directory / "ClosedStream.java"
+        closed_source.write_text(
+            "package fixture.resource; import java.io.InputStream;"
+            " public class ClosedStream { public static void main(String[] args) throws Exception {"
+            " InputStream stream = ClassLoader.getSystemResourceAsStream(\"fixture-resource.bin\");"
+            " stream.close(); System.out.println(stream.read()); } }",
+            encoding="utf-8",
+        )
+        closed = compile_sources(directory / "closed-compiled", closed_source)
+        closed_dir = write_fixture_directory(directory / "closed-app", closed)
+        result = self.cli("-cp", os.pathsep.join((str(closed_dir), str(resource_archive))),
+                          "fixture.resource.ClosedStream")
+        require(result.code == 0, f"closed stream failed\n{result.detail()}")
+        same_output("-1\n", result.stdout, result.detail())
+
 
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -408,6 +727,8 @@ def main() -> int:
             for name in selected:
                 suite.check(name, lambda name=name: suite.differential(name))
             if not args.only:
+                suite.check("classpath/archive-manifest-resource", lambda: suite.classpath(directory))
+            if not args.only:
                 original = (classes / "MutationTarget.class").read_bytes()
                 for name, contents, category in malformed_cases(original, args.full):
                     destination = directory / name
@@ -424,7 +745,6 @@ def main() -> int:
     except (Failure, OSError, ValueError, KeyError, struct.error) as error:
         print(f"FAIL harness: {error}", file=sys.stderr)
         return 1
-
 
 if __name__ == "__main__":
     sys.exit(main())

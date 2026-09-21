@@ -38,7 +38,7 @@ program output or a VM error
 
 The project is designed around two boundaries:
 
-- **Bend owns JVM semantics and state.** Host C/JavaScript code is limited to file input, output, and the generated-artifact adapter.
+- **Bend owns JVM semantics and state.** Host C/JavaScript code is limited to launch I/O, file/TCP effects, and the generated-artifact adapter.
 - **The reference JVM is the oracle.** The differential test harness compiles the same Java fixture with `javac`, runs it with `java`, runs it with BendJVM, and compares observable output.
 
 The supported slice currently exercises:
@@ -51,11 +51,13 @@ The supported slice currently exercises:
 - bounded stored/deflated archive reads with origin-aware diagnostics
 - class loading, symbol interning, constant-pool linking, and descriptors
 - integer and float arithmetic, signed integer behavior, branches, loops, and recursion
-- static and virtual method calls, constructors, objects, fields, and inherited fields
+- static and virtual method calls, `invokeinterface`, constructors, objects, fields, and inherited fields
 - primitive and reference arrays, array bounds, null references, and heap limits
-- string constants, UTF-16 decoding, `System.out.println` for supported primitive types
-- class initialization and basic caught/uncaught exceptions
-- instruction tracing, class dumps, disassembly, fuel limits, and heap limits
+- string constants, UTF-16 decoding, `String`/`StringBuilder`/`Integer`/`Math` MiniJRE methods
+- `ArrayList`/`HashMap`, `invokeinterface`, in-memory and file streams, and UTF-8 readers
+- blocking TCP client/server sockets, try-with-resources, and typed exception unwinding
+- class initialization, typed Java exceptions, and `System.out.println` for supported primitive types
+- instruction tracing, class dumps, disassembly, fuel limits, heap limits, and `--no-files`/`--no-net`
 
 ## Getting started
 
@@ -134,6 +136,8 @@ Useful options:
 | --- | --- |
 | `--fuel N` | Stop after at most `N` interpreter steps. Default: `1000000`. |
 | `--max-heap N` | Limit simulated heap entries. Default: `1024`. |
+| `--no-files` | Deny `FileInputStream`/`FileOutputStream` host effects. |
+| `--no-net` | Deny `Socket`/`ServerSocket` host effects. |
 | `--dump-class` | Print loaded class metadata without executing `main`. |
 | `--disassemble` | Print class metadata and decoded instructions. |
 | `--trace` | Print decoded instruction execution diagnostics to stderr. |
@@ -159,16 +163,19 @@ Standalone programs in `examples/` cover the MiniJRE slice:
 
 | File | What it shows |
 | --- | --- |
-| `HelloWorld.java` | strings, integers, and optional application arguments |
+| `HelloWorld.java` | strings, integers, and `String` concatenation of arguments |
 | `ArithmeticAndBranches.java` | arithmetic, `for`/`while`, and comparisons |
-| `ObjectsAndDispatch.java` | constructors, fields, and virtual dispatch |
-| `ArraysAndStrings.java` | integer arrays and string constants |
-| `Exceptions.java` | caught `ArithmeticException` |
+| `ObjectsAndDispatch.java` | constructors, fields, virtual dispatch, and identity `equals` |
+| `ArraysAndStrings.java` | integer arrays, `System.arraycopy`, and `substring` |
+| `Exceptions.java` | caught `ArithmeticException` and `getMessage` |
 | `StaticInitialization.java` | static fields and `<clinit>` |
+| `CollectionsAndText.java` | `ArrayList`/`HashMap` via interfaces, boxing cache, `valueOf` |
+| `FilesAndTryWithResources.java` | files, UTF-8 `readLine`, and try-with-resources |
+| `TcpLoopback.java` | blocking TCP client and single-connection server |
 
 `examples/packaged/` is a small application: `example.hello.Main` depends on
-`example.lib.Answer`, reads `banner.txt` from the classpath, and prints its first
-argument.
+`example.lib.Answer`, stores the argument and answer in an `ArrayList`, and
+reads `banner.txt` from the classpath.
 
 Compile the standalone samples:
 
@@ -177,6 +184,9 @@ mkdir -p /tmp/bendjvm-classes
 javac --release 8 -encoding UTF-8 -d /tmp/bendjvm-classes examples/*.java
 python3 scripts/run.py /tmp/bendjvm-classes/HelloWorld.class
 python3 scripts/run.py /tmp/bendjvm-classes/HelloWorld.class 'spaced arg'
+python3 scripts/run.py /tmp/bendjvm-classes/CollectionsAndText.class
+python3 scripts/run.py /tmp/bendjvm-classes/TcpLoopback.class
+python3 scripts/run.py /tmp/bendjvm-classes/FilesAndTryWithResources.class /tmp/bendjvm-example.bin
 ```
 
 Compile and run the packaged application from a directory:
@@ -207,7 +217,7 @@ Run every example through the practical runner:
 python3 examples/run.py
 ```
 
-The broader differential corpus lives in `bendjvm/tests/fixtures/` and includes integer/float operations, arrays, inheritance, strings, exceptions, class initialization, fuel limits, heap limits, classpaths, archives, manifests, and resources.
+The broader differential corpus lives in `bendjvm/tests/fixtures/` and includes integer/float operations, arrays, inheritance, strings, exceptions, class initialization, collections, files, TCP, try-with-resources, fuel limits, heap limits, classpaths, archives, manifests, and resources.
 
 ## Testing
 
@@ -241,12 +251,38 @@ The harness requires Python 3.10+, a JDK, Bend 2, and Bun. It compiles sources a
 | `bendjvm/loader/` | Symbol interning, class catalog/linking, bootstrap classes, intrinsic registration, and VM construction. |
 | `bendjvm/runtime/` | Explicit frames, locals, operand stacks, instruction stepping, method calls, returns, exceptions, resources, and VM status. |
 | `bendjvm/heap/` | Object, primitive-array, reference-array, string, and resource-stream entries with bounded allocation. |
-| `bendjvm/java/` | Minimal Java runtime intrinsics, including `ClassLoader` resource streams, supported `println` overloads, and string conversion. |
+| `bendjvm/java/` | MiniJRE intrinsics: objects/strings/collections, streams, files, TCP, throwables, and `println`. |
 | `bendjvm/model.bend` | Shared class-file, linked-runtime, heap, frame, resource, and VM data types. |
 | `scripts/classpath.py` | Ordered directory/JAR/ZIP sources, manifest expansion, bounded reads, and resource lookup. |
 | `scripts/run.py` | Builds cached Bend JavaScript artifacts and provides the structured practical command-line runner. |
-| `scripts/test.py` | Differential, classpath/archive/manifest/resource, malformed-input, limit, debug-mode, and generated-program tests. |
+| `scripts/test.py` | Differential, classpath/JAR, file/TCP, malformed-input, limit, debug-mode, and generated-program tests. |
 | `LAWS.bend` / `PROOF.bend` | Bend law declarations and proofs checked by `bend PROOF.bend`. |
+
+## MiniJRE surface
+
+Supported methods are registered by exact owner, name, descriptor, and flags in
+`bendjvm/loader/bootstrap.bend`. Unlisted overloads are not implied by a class
+name; they fail with `NoSuchMethodError` before execution. Access flags are
+`public` instance native (`0x0101`), `public static` native (`0x0109`), or
+interface abstract (`0x0401`).
+
+| Area | Classes and descriptors |
+| --- | --- |
+| Objects | `Object.<init>()V`, `equals(Ljava/lang/Object;)Z`, `hashCode()I`, `toString()Ljava/lang/String;`; `Objects.requireNonNull(Ljava/lang/Object;)Ljava/lang/Object;`, `equals(Ljava/lang/Object;Ljava/lang/Object;)Z` |
+| Strings | `String.length()I`, `isEmpty()Z`, `charAt(I)C`, `equals`, `hashCode`, `substring(I)`, `substring(II)`, `concat`, `toString`, `valueOf(I\|Z\|Ljava/lang/Object;)`; `StringBuilder.<init>()V`, `<init>(Ljava/lang/String;)V`, `append(String\|Object\|I\|C\|Z)`, `length`, `toString` |
+| Integers / Math | `Integer.valueOf(I)`, `intValue()`, `parseInt`, `equals`, `hashCode`, `toString`; cached `valueOf` identities for `-128..127`; `Math.abs/min/max` on `I`; `System.arraycopy` |
+| Collections | `ArrayList`/`List`/`Collection`/`Iterable`/`Iterator` and `HashMap`/`Map` as registered in bootstrap, including iterator `hasNext/next/remove` |
+| Streams | `InputStream.read()I`, `read([B)I`, `read([BII)I`, `close`; `OutputStream.write(I\|[B\|[BII)`, `flush`, `close`; `ByteArrayInputStream([B)`, `ByteArrayOutputStream` `toByteArray/size/reset` |
+| Files | `File(String)` `exists/isFile/isDirectory/getPath`; `FileInputStream(String)`; `FileOutputStream(String)` and `(String,Z)` |
+| Text | `Reader.read()I`, `read([CII)I`, `close`; `Writer.write(I\|String\|[CII)`, `flush`, `close`; `InputStreamReader`/`OutputStreamWriter` `(stream, UTF-8)`; `BufferedReader.readLine` |
+| TCP | `InetSocketAddress(String,I)`; `Socket()V`, `(String,I)`, `connect(SocketAddress,I)`, `getInputStream`, `getOutputStream`, `setSoTimeout`, `close`; `ServerSocket(I)`, `getLocalPort`, `accept`, `setSoTimeout`, `close` |
+| Throwables | `Throwable` no-arg/message/cause/message+cause `<init>`, `getMessage`, `getCause`, `initCause`, `addSuppressed`, `getSuppressed`, `toString`; `IOException` has the four Java 8 constructors |
+
+Host file and TCP effects use opaque handles scoped to one VM run. `--no-files`
+and `--no-net` deny those effects with `IOException`. `--max-heap` counts heap
+entries. Relative files resolve against the launch working directory. The host
+closes remaining handles on every process exit, including fuel exhaustion and
+uncaught exceptions. This is a capability control, not a sandbox.
 
 ## Compatibility boundary
 BendJVM accepts Java 8 class files and ordered directory/JAR/ZIP classpaths, but intentionally does not provide full JVM compatibility. It does not yet promise:
@@ -269,6 +305,6 @@ The project specification is documented in [`bendjvm-spec.md`](bendjvm-spec.md).
 4. Reject unsupported semantics instead of approximating them.
 5. Prove small interpreter invariants in Bend before optimizing representation or dispatch.
 
-Classpath, JAR/ZIP, manifest, and MiniJRE resource-stream loading are in place.
-The next milestones are Java runtime expansion, reflection, broader bytecode
-coverage, and concurrency — not Spring Boot until those exist.
+Classpath, JAR/ZIP, manifest, MiniJRE streams, files, and blocking TCP are in place.
+The next milestones are reflection, broader bytecode coverage, and concurrency —
+not Spring Boot until those exist.

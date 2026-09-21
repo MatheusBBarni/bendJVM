@@ -10,13 +10,27 @@ import ./symbols.bend as S
 type Inspected is Data:
   Inspected{name: String, dependencies: +List<String>}
 
+
 def bootstrap_heap(+names: +List<String>) -> +List<M.HeapEntry>:
-  [M.HeapEntry{S.find(names, "java/io/PrintStream"), 0, 0, Nil{}, Nil{}, Nil{}}]
+  [M.HeapEntry{S.find(names, "java/io/PrintStream"), 0, 0, Nil{}, Nil{}, Nil{}},
+   M.HeapEntry{S.find(names, "java/lang/OutOfMemoryError"), 0, 0, [M.Binding{0, M.Slot{3, 0}}, M.Binding{1, M.Slot{3, 0}}, M.Binding{2, M.Slot{3, 0}}, M.Binding{3, M.Slot{1, 0}}], Nil{}, Nil{}}]
+
+def set_static(xs: +List<M.Binding>, +id: U32, +value: M.Slot) -> +List<M.Binding>:
+  match xs:
+    case Nil{}: Nil{}
+    case Con{M.Binding{+bid, old}, rest}:
+      Con{M.Binding{bid, Bool.pick(M.Slot, U32.is_eq(bid, id), value, old)}, set_static(rest, id, value)}
+
+def patch_out(fields: +List<M.LoadedField>, +symbols: +List<String>, +statics: +List<M.Binding>) -> +List<M.Binding>:
+  match fields:
+    case Nil{}: statics
+    case Con{+field, rest}:
+      patch_out(rest, symbols, Bool.pick(+List<M.Binding>, String.eq(S.text(symbols, M.loaded_field_name(field)), "out"), set_static(statics, M.loaded_field_id(field), M.Slot{3, 1}), statics))
 
 def vm_from(catalog: C.Catalog, classes: +List<M.LoadedClass>, resources: +List<M.Resource>, maxHeap: U32) -> M.VM:
   match catalog:
-    case C.Catalog{sources, names, symbols, +fields, methods}:
-      M.VM{classes, methods, fields, symbols, bootstrap_heap(names), C.static_fields(fields, Nil{}), resources, Nil{}, 0, 0, M.Slot{0, 0}, Nil{}, "", maxHeap, 0n}
+    case C.Catalog{sources, names, +symbols, +fields, methods}:
+      M.VM{classes, methods, fields, symbols, bootstrap_heap(names), patch_out(fields, symbols, C.static_fields(fields, Nil{})), resources, Nil{}, 0, 0, M.Slot{0, 0}, Nil{}, "", maxHeap, 0n, M.idle_host()}
 
 def parse_classes(values: +List<+List<U32>>, +acc: +List<M.ClassFile>) -> Result<&2, &2, String, +List<M.ClassFile>>:
   match values:

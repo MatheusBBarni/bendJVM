@@ -77,7 +77,8 @@ def main() -> int:
         if shutil.which(javac) is None and not Path(javac).is_file():
             fail(f"javac not found: {args.javac}")
         with tempfile.TemporaryDirectory(prefix="bendjvm-examples-") as temporary:
-            classes = Path(temporary) / "classes"
+            workspace = Path(temporary)
+            classes = workspace / "classes"
             classes.mkdir()
             compilation = execute(
                 [javac, "--release", "8", "-encoding", "UTF-8", "-g:none", "-d", str(classes), *map(str, sources)],
@@ -90,7 +91,10 @@ def main() -> int:
             command = runner_command(args.runner)
             passed = 0
             for source in selected:
-                result = execute([*command, str(classes / f"{source.stem}.class")], args.timeout)
+                extra: list[str] = []
+                if source.stem == "FilesAndTryWithResources":
+                    extra = [str(workspace / "example.bin")]
+                result = execute([*command, str(classes / f"{source.stem}.class"), *extra], args.timeout)
                 if result.returncode != 0:
                     print(f"FAIL {source.stem}", file=sys.stderr)
                     print(textwrap.indent(result.stdout, "  "), end="", file=sys.stderr)

@@ -22,7 +22,7 @@ def binding_set(xs: +List<M.Binding>, +id: U32, +value: M.Slot) -> +List<M.Bindi
 def get_nonnull(heap: +List<M.HeapEntry>, reference: U32, null: Bool) -> Result<&2, &2, String, M.HeapEntry>:
   match null:
     case True{}:
-      Fail{"NullPointerException"}
+      Fail{"java/lang/NullPointerException"}
     case False{}:
       S.require(M.HeapEntry, M.nth(M.HeapEntry, heap, U32.sub(reference, 1)), "InvalidReference")
 
@@ -196,3 +196,46 @@ def stream_closed_found(found: Maybe<&2, M.Slot>) -> Bool:
 
 def stream_closed(fields: +List<M.Binding>) -> Bool:
   stream_closed_found(binding_find(fields, 0))
+
+def throwable_entry(class: U32) -> M.HeapEntry:
+  M.HeapEntry{class, 0, 0, [M.Binding{0, M.Slot{3, 0}}, M.Binding{1, M.Slot{3, 0}}, M.Binding{2, M.Slot{3, 0}}, M.Binding{3, M.Slot{1, 0}}], Nil{}, Nil{}}
+
+def builder_entry(class: U32, chars: +List<U32>) -> M.HeapEntry:
+  M.HeapEntry{class, 7, 0, Nil{}, Nil{}, chars}
+
+def list_entry(class: U32, values: +List<M.Slot>, size: U32, mod: U32) -> M.HeapEntry:
+  M.HeapEntry{class, 5, size, [M.Binding{0, M.Slot{1, mod}}], values, Nil{}}
+
+def map_entry(class: U32, values: +List<M.Slot>, size: U32, mod: U32) -> M.HeapEntry:
+  M.HeapEntry{class, 6, size, [M.Binding{0, M.Slot{1, mod}}], values, Nil{}}
+
+def slice_slots(xs: +List<M.Slot>, n: Nat) -> +List<M.Slot>:
+  M.take(M.Slot, xs, n)
+
+def drop_slots(xs: +List<M.Slot>, n: Nat) -> +List<M.Slot>:
+  M.drop(M.Slot, xs, n)
+
+def slice_chars(xs: +List<U32>, n: Nat) -> +List<U32>:
+  M.take(U32, xs, n)
+
+def drop_chars(xs: +List<U32>, n: Nat) -> +List<U32>:
+  M.drop(U32, xs, n)
+
+def integer_value_found(found: Maybe<&2, M.Slot>) -> U32:
+  match found:
+    case None{}: 0
+    case Some{M.Slot{tag, bits}}: bits
+
+def integer_value(fields: +List<M.Binding>) -> U32:
+  integer_value_found(binding_find(fields, 0))
+
+def integer_intern_scan(entries: +List<M.HeapEntry>, +class: U32, +bits: U32, +reference: U32) -> Maybe<&2, U32>:
+  match entries:
+    case Nil{}: None{}
+    case Con{entry, rest}:
+      match entry:
+        case M.HeapEntry{+cls, kind, element, +fields, values, chars}:
+          Bool.pick(Maybe<&2, U32>, U32.is_eq(kind, 0) && U32.is_eq(cls, class) && U32.is_eq(integer_value(fields), bits), Some{reference}, integer_intern_scan(rest, class, bits, (reference + 1 : U32)))
+
+def integer_intern(+heap: +List<M.HeapEntry>, class: U32, bits: U32) -> Maybe<&2, U32>:
+  integer_intern_scan(heap, class, bits, 1)

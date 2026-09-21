@@ -86,6 +86,18 @@ def loaded_method_name(value: LoadedMethod) -> U32:
 def loaded_method_descriptor(value: LoadedMethod) -> U32:
   LoadedMethod{id, owner, name, descriptor, flags, parameters, resultTag, maxStack, maxLocals, instructions, handlers, intrinsic} = value
   descriptor
+def loaded_method_flags(value: LoadedMethod) -> U32:
+  LoadedMethod{id, owner, name, descriptor, flags, parameters, resultTag, maxStack, maxLocals, instructions, handlers, intrinsic} = value
+  flags
+
+def loaded_method_intrinsic(value: LoadedMethod) -> U32:
+  LoadedMethod{id, owner, name, descriptor, flags, parameters, resultTag, maxStack, maxLocals, instructions, handlers, intrinsic} = value
+  intrinsic
+
+def loaded_method_result(value: LoadedMethod) -> U32:
+  LoadedMethod{id, owner, name, descriptor, flags, parameters, resultTag, maxStack, maxLocals, instructions, handlers, intrinsic} = value
+  resultTag
+
 
 # state: 0 loaded, 1 initializing, 2 initialized, 3 failed; parent=0xffffffff for Object.
 type LoadedClass is Data:
@@ -105,23 +117,58 @@ def loaded_class_parent(value: LoadedClass) -> U32:
 def loaded_class_initializer(value: LoadedClass) -> U32:
   LoadedClass{id, name, parent, interfaces, fields, methods, initializer, state} = value
   initializer
+def loaded_class_interfaces(value: LoadedClass) -> +List<U32>:
+  LoadedClass{id, name, parent, interfaces, fields, methods, initializer, state} = value
+  interfaces
 
-# kind: 0 object, 1 primitive array, 2 reference array, 3 UTF-16 string, 4 InputStream.
-# element is a primitive tag, a reference-array component class ID, or stream position.
+def loaded_class_state(value: LoadedClass) -> U32:
+  LoadedClass{id, name, parent, interfaces, fields, methods, initializer, state} = value
+  state
+
+
+# kind: 0 object, 1 primitive array, 2 reference array, 3 UTF-16 string, 4 byte stream,
+# 5 ArrayList, 6 HashMap, 7 StringBuilder.
+# element is a primitive tag, component class, stream position, or collection size.
 type HeapEntry is Data:
   HeapEntry{class: U32, kind: U32, element: U32, fields: +List<Binding>, values: +List<Slot>, chars: +List<U32>}
 
 type Resource is Data:
   Resource{name: String, bytes: +List<U32>}
 
+# Host effects are opaque OS requests. Bend keeps Java-visible state only.
+type Effect is Data:
+  Idle{}
+  OpenFile{path: String, mode: U32, receiver: U32}
+  StatPath{path: String, op: U32}
+  ReadBytes{handle: U32, count: U32, timeout: U32}
+  WriteBytes{handle: U32, bytes: +List<U32>}
+  CloseHandle{handle: U32}
+  ConnectTcp{host: String, port: U32, timeout: U32, receiver: U32}
+  BindTcp{port: U32, receiver: U32}
+  AcceptTcp{handle: U32, timeout: U32, receiver: U32}
+
+# Continuation of an intrinsic after a virtual Java callback returns.
+type Cont is Data:
+  NeedHash{map: U32, key: U32, op: U32, extra: Slot}
+  NeedEq{map: U32, key: U32, hash: U32, index: U32, op: U32, extra: Slot}
+  NeedToString{op: U32, extra: U32}
+  NeedEquals{op: U32, left: U32, right: U32}
+  NeedListEq{list: U32, query: U32, index: U32, op: U32}
+
+type Host is Data:
+  Host{effect: Effect, cwd: String, caps: U32, maxPayload: U32, cont: +List<Cont>}
+
+def idle_host() -> Host:
+  Host{Idle{}, ".", 3, 16777216, Nil{}}
 
 # pc is the next/current instruction. invokePc retains a caller's throwing location.
 # initializing=0xffffffff for ordinary calls; otherwise class initialized on return.
+# status: 0 run, 1 done, 3 fuel, 4 fail, 5 host, 6 java throw.
 type Frame is Data:
   Frame{method: U32, pc: U32, invokePc: U32, locals: +List<Slot>, stack: +List<Slot>, initializing: U32}
 # resources are ordered host-provided classpath records; lookup uses the first match.
 type VM is Data:
-  VM{classes: +List<LoadedClass>, methods: +List<LoadedMethod>, fields: +List<LoadedField>, symbols: +List<String>, heap: +List<HeapEntry>, statics: +List<Binding>, resources: +List<Resource>, frames: +List<Frame>, status: U32, exception: U32, result: Slot, output: +List<String>, error: String, maxHeap: U32, steps: Nat}
+  VM{classes: +List<LoadedClass>, methods: +List<LoadedMethod>, fields: +List<LoadedField>, symbols: +List<String>, heap: +List<HeapEntry>, statics: +List<Binding>, resources: +List<Resource>, frames: +List<Frame>, status: U32, exception: U32, result: Slot, output: +List<String>, error: String, maxHeap: U32, steps: Nat, host: Host}
 
 
 # Result uses messages carrying the stable VmError category plus location detail.
@@ -179,3 +226,21 @@ def zeros(n: Nat) -> +List<Slot>:
       Nil{}
     case 1n+p:
       Con{Slot{0, 0}, zeros(p)}
+
+def take(-A: Data, xs: +List<A>, n: Nat) -> +List<A>:
+  match xs n:
+    case Nil{} _:
+      Nil{}
+    case _ 0n:
+      Nil{}
+    case Con{h, t} 1n+p:
+      Con{h, take(A, t, p)}
+
+def drop(-A: Data, xs: +List<A>, n: Nat) -> +List<A>:
+  match xs n:
+    case Nil{} _:
+      Nil{}
+    case rest 0n:
+      rest
+    case Con{h, t} 1n+p:
+      drop(A, t, p)

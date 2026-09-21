@@ -76,14 +76,37 @@ class Launch:
 
 
 BOOTSTRAP_NAMES = {
-    "java/lang/Object", "java/lang/String", "java/lang/System", "java/io/PrintStream",
-    "java/lang/Throwable", "java/lang/Exception", "java/lang/RuntimeException",
+    "java/lang/Object", "java/lang/String", "java/lang/StringBuilder", "java/lang/Integer",
+    "java/lang/Math", "java/util/Objects", "java/lang/System", "java/io/PrintStream",
+    "java/lang/ClassLoader", "java/lang/Class", "java/lang/Cloneable", "java/io/Serializable",
+    "java/lang/Throwable", "java/lang/Exception", "java/lang/RuntimeException", "java/lang/Error",
     "java/lang/ArithmeticException", "java/lang/NullPointerException",
-    "java/lang/ArrayIndexOutOfBoundsException", "java/lang/ClassCastException",
-    "java/lang/NegativeArraySizeException", "java/lang/OutOfMemoryError", "java/lang/Error",
-    "java/lang/ArrayStoreException", "java/lang/ExceptionInInitializerError",
-    "java/lang/NoClassDefFoundError", "java/lang/Cloneable", "java/io/Serializable",
-    "java/lang/ClassLoader", "java/io/InputStream",
+    "java/lang/IndexOutOfBoundsException", "java/lang/ArrayIndexOutOfBoundsException",
+    "java/lang/StringIndexOutOfBoundsException", "java/lang/ClassCastException",
+    "java/lang/NegativeArraySizeException", "java/lang/ArrayStoreException",
+    "java/lang/IllegalArgumentException", "java/lang/IllegalStateException",
+    "java/lang/NumberFormatException", "java/lang/NoSuchElementException",
+    "java/lang/ConcurrentModificationException", "java/lang/UnsupportedOperationException",
+    "java/lang/OutOfMemoryError", "java/lang/NoClassDefFoundError", "java/lang/LinkageError",
+    "java/lang/IncompatibleClassChangeError", "java/lang/AbstractMethodError",
+    "java/lang/NoSuchMethodError", "java/lang/NoSuchFieldError",
+    "java/lang/ExceptionInInitializerError",
+    "java/io/IOException", "java/io/FileNotFoundException", "java/io/EOFException",
+    "java/io/UnsupportedEncodingException", "java/io/InterruptedIOException",
+    "java/net/SocketException", "java/net/ConnectException", "java/net/UnknownHostException",
+    "java/net/SocketTimeoutException",
+    "java/lang/AutoCloseable", "java/io/Closeable", "java/io/Flushable",
+    "java/lang/Iterable", "java/util/Iterator", "java/util/Collection", "java/util/List",
+    "java/util/Map", "java/util/ArrayList", "java/util/ArrayList$Itr", "java/util/HashMap",
+    "java/io/InputStream", "java/io/OutputStream",
+    "java/io/ByteArrayInputStream", "java/io/ByteArrayOutputStream",
+    "java/io/File", "java/io/FileInputStream", "java/io/FileOutputStream",
+    "java/io/Reader", "java/io/Writer", "java/io/InputStreamReader", "java/io/OutputStreamWriter",
+    "java/io/BufferedReader",
+    "java/net/SocketAddress", "java/net/InetSocketAddress", "java/net/Socket",
+    "java/net/ServerSocket", "java/io/SocketInputStream", "java/io/SocketOutputStream",
+    "[Ljava/lang/String;", "[B", "[C", "[Ljava/lang/Object;", "[Ljava/lang/Throwable;",
+    "[Z", "[S", "[I", "[F",
 }
 
 
@@ -223,27 +246,37 @@ def build_artifacts() -> Path:
         loader_name = re.search(r"function (\$loader\$class_loader\$load_many_with_resources\$)\(", loader_source)
         inspect_name = re.search(r"function (\$inspect_class_info\$)\(", loader_source)
         runtime_name = re.search(r"function (\$run_loaded_entry\$)\(", runtime_source)
-        if loader_name is None or inspect_name is None or runtime_name is None:
+        continue_name = re.search(r"function (\$[^(\n]*continue_run[^(\n]*)\(", runtime_source)
+        resume_ok_name = re.search(r"function (\$[^(\n]*resume_ok[^(\n]*)\(", runtime_source)
+        resume_fail_name = re.search(r"function (\$[^(\n]*resume_fail[^(\n]*)\(", runtime_source)
+        if loader_name is None or inspect_name is None or runtime_name is None or continue_name is None or resume_ok_name is None or resume_fail_name is None:
             raise RuntimeError("Bend launch API export not found in generated artifact")
         host_tmp = directory / "host.mjs"
-        host_tmp.write_text(host_source(loader_source, runtime_source, loader_name.group(1), runtime_name.group(1), inspect_name.group(1)), encoding="utf-8")
+        host_tmp.write_text(host_source(loader_source, runtime_source, loader_name.group(1), runtime_name.group(1), inspect_name.group(1), continue_name.group(1), resume_ok_name.group(1), resume_fail_name.group(1)), encoding="utf-8")
         os.replace(loader_tmp, loader)
         os.replace(runtime_tmp, runtime)
         os.replace(host_tmp, host)
     return host
 
 
-def host_source(loader_source: str, runtime_source: str, loader_name: str, runtime_name: str, inspect_name: str) -> str:
+def host_source(loader_source: str, runtime_source: str, loader_name: str, runtime_name: str, inspect_name: str, continue_name: str, resume_ok_name: str, resume_fail_name: str) -> str:
     def fragment(source: str) -> str:
         return re.sub(r"\ncli\(process\.argv\.slice\(2\)\);[\s\S]*$", "\n", source)
 
-    return f'''import {{ readFileSync }} from "node:fs";
+    return f'''import {{ openSync, readSync, writeSync, closeSync, statSync, existsSync }} from "node:fs";
+import net from "node:net";
+import {{ readFileSync }} from "node:fs";
 
 const loader = new Function({fragment(loader_source)!r} + `
 return {{ loadManyWithResources: (values, resources, heap) => run_loop({loader_name}(values, resources, heap)), inspectClassInfo: (values) => run_loop({inspect_name}(values)) }};
 `)();
 const runtime = new Function({fragment(runtime_source)!r} + `
-return {{ runLoadedEntry: (vm, fuel, entry, args) => run_loop({runtime_name}(vm, fuel, entry, args)) }};
+return {{
+  runLoadedEntry: (vm, fuel, entry, args) => run_loop({runtime_name}(vm, fuel, entry, args)),
+  continueRun: (vm, fuel) => run_loop({continue_name}(vm, fuel)),
+  resumeOk: (vm, handle, extra, bytes) => run_loop({resume_ok_name}(vm, handle, extra, bytes)),
+  resumeFail: (vm, name) => run_loop({resume_fail_name}(vm, name))
+}};
 `)();
 
 function list(values) {{
@@ -274,6 +307,154 @@ function fail(error) {{
   console.error(normalized);
   process.exit(1);
 }}
+const handles = new Map();
+let nextHandle = 1;
+function once(emitter, event, timeout) {{
+  return new Promise((resolve, reject) => {{
+    const timer = timeout > 0 ? setTimeout(() => reject(new Error("timeout")), timeout) : null;
+    const ok = value => {{ if (timer) clearTimeout(timer); resolve(value); }};
+    const err = error => {{ if (timer) clearTimeout(timer); reject(error); }};
+    emitter.once(event, ok);
+    emitter.once("error", err);
+  }});
+}}
+async function applyEffect(vm) {{
+  const effect = vm.host && vm.host.effect;
+  const kind = effect && effect.$;
+  const caps = (vm.host && vm.host.caps) >>> 0;
+  try {{
+    if (kind === "OpenFile") {{
+      if ((caps & 1) === 0) return runtime.resumeFail(vm, "java/io/IOException");
+      const path = text(effect.path);
+      const mode = effect.mode >>> 0;
+      const flag = mode === 2 ? "a" : mode === 1 ? "w" : "r";
+      const fd = openSync(path, flag);
+      const handle = nextHandle++;
+      handles.set(handle, {{ type: "file", fd }});
+      return runtime.resumeOk(vm, handle, 0, {{ $: "Nil" }});
+    }}
+    if (kind === "StatPath") {{
+      if ((caps & 1) === 0) return runtime.resumeFail(vm, "java/io/IOException");
+      const path = text(effect.path);
+      const op = effect.op >>> 0;
+      let value = 0;
+      if (existsSync(path)) {{
+        const st = statSync(path);
+        if (op === 0) value = 1;
+        else if (op === 1) value = st.isFile() ? 1 : 0;
+        else if (op === 2) value = st.isDirectory() ? 1 : 0;
+      }}
+      return runtime.resumeOk(vm, 0, value, {{ $: "Nil" }});
+    }}
+    if (kind === "ReadBytes") {{
+      const handle = effect.handle >>> 0;
+      const count = Math.max(1, effect.count >>> 0);
+      const rec = handles.get(handle);
+      if (!rec) return runtime.resumeFail(vm, "java/io/IOException");
+      if (rec.type === "file") {{
+        const buf = Buffer.alloc(count);
+        const n = readSync(rec.fd, buf, 0, count, null);
+        const values = n <= 0 ? [] : [...buf.subarray(0, n)];
+        return runtime.resumeOk(vm, handle, 0, list(values));
+      }}
+      if (rec.socket) {{
+        let chunk = rec.socket.read(count);
+        if (!chunk && rec.socket.readableEnded) return runtime.resumeOk(vm, handle, 0, {{ $: "Nil" }});
+        if (!chunk) {{
+          await once(rec.socket, "readable", (effect.timeout >>> 0) || rec.timeout || 0);
+          chunk = rec.socket.read(count);
+        }}
+        const values = chunk && chunk.length ? [...chunk] : [];
+        return runtime.resumeOk(vm, handle, 0, list(values));
+      }}
+      return runtime.resumeFail(vm, "java/io/IOException");
+    }}
+    if (kind === "WriteBytes") {{
+      const handle = effect.handle >>> 0;
+      const rec = handles.get(handle);
+      if (!rec) return runtime.resumeFail(vm, "java/io/IOException");
+      const values = listValues(effect.bytes).map(value => value >>> 0);
+      const buf = Buffer.from(values);
+      if (rec.type === "file") writeSync(rec.fd, buf);
+      else if (rec.socket) await new Promise((resolve, reject) => rec.socket.write(buf, error => error ? reject(error) : resolve()));
+      else return runtime.resumeFail(vm, "java/io/IOException");
+      return runtime.resumeOk(vm, handle, 0, {{ $: "Nil" }});
+    }}
+    if (kind === "CloseHandle") {{
+      const handle = effect.handle >>> 0;
+      const rec = handles.get(handle);
+      if (rec) {{
+        try {{
+          if (rec.type === "file") closeSync(rec.fd);
+          else if (rec.socket) rec.socket.destroy();
+          else if (rec.server) rec.server.close();
+        }} catch (_) {{}}
+        handles.delete(handle);
+      }}
+      return runtime.resumeOk(vm, handle, 0, {{ $: "Nil" }});
+    }}
+    if (kind === "ConnectTcp") {{
+      if ((caps & 2) === 0) return runtime.resumeFail(vm, "java/io/IOException");
+      const host = text(effect.host);
+      const port = effect.port >>> 0;
+      const timeout = effect.timeout >>> 0;
+      const socket = net.connect({{ host, port }});
+      try {{
+        await once(socket, "connect", timeout);
+      }} catch (error) {{
+        socket.destroy();
+        const message = String(error && error.message || error);
+        return runtime.resumeFail(vm, message.includes("ECONNREFUSED") ? "java/net/ConnectException" : message.includes("timeout") ? "java/net/SocketTimeoutException" : "java/io/IOException");
+      }}
+      const handle = nextHandle++;
+      handles.set(handle, {{ type: "socket", socket, timeout }});
+      return runtime.resumeOk(vm, handle, 0, {{ $: "Nil" }});
+    }}
+    if (kind === "BindTcp") {{
+      if ((caps & 2) === 0) return runtime.resumeFail(vm, "java/io/IOException");
+      const port = effect.port >>> 0;
+      const pending = [];
+      const server = net.createServer(socket => pending.push(socket));
+      let failed = null;
+      server.on("error", error => {{ failed = error; }});
+      server.listen(port);
+      await once(server, "listening", 5000);
+      if (failed) return runtime.resumeFail(vm, "java/net/SocketException");
+      const bound = server.address().port >>> 0;
+      const handle = nextHandle++;
+      handles.set(handle, {{ type: "server", server, pending, timeout: 0 }});
+      return runtime.resumeOk(vm, handle, bound, {{ $: "Nil" }});
+    }}
+    if (kind === "AcceptTcp") {{
+      if ((caps & 2) === 0) return runtime.resumeFail(vm, "java/io/IOException");
+      const rec = handles.get(effect.handle >>> 0);
+      if (!rec || rec.type !== "server") return runtime.resumeFail(vm, "java/io/IOException");
+      const timeout = effect.timeout >>> 0;
+      if (rec.pending.length === 0) await once(rec.server, "connection", timeout);
+      const socket = rec.pending.shift();
+      const handle = nextHandle++;
+      handles.set(handle, {{ type: "socket", socket, timeout }});
+      return runtime.resumeOk(vm, handle, 0, {{ $: "Nil" }});
+    }}
+    return runtime.resumeFail(vm, "java/io/IOException");
+  }} catch (error) {{
+    const message = String(error && error.message || error);
+    if (message.includes("timeout")) return runtime.resumeFail(vm, "java/net/SocketTimeoutException");
+    if (message.includes("ENOENT") || message.includes("ENOTDIR")) return runtime.resumeFail(vm, "java/io/FileNotFoundException");
+    return runtime.resumeFail(vm, "java/io/IOException");
+  }}
+}}
+function closeAll() {{
+  for (const rec of handles.values()) {{
+    try {{
+      if (rec.type === "file") closeSync(rec.fd);
+      else if (rec.socket) rec.socket.destroy();
+      else if (rec.server) rec.server.close();
+    }} catch (_) {{}}
+  }}
+  handles.clear();
+}}
+process.on("exit", closeAll);
 const requestText = readFileSync(process.env.BENDJVM_REQUEST || "", "utf8");
 let request;
 try {{ request = JSON.parse(requestText); }} catch (error) {{ console.error(`InvalidLaunchRequest: ${{error}}`); process.exit(1); }}
@@ -324,10 +505,26 @@ if (request.mode === 3) for (const method of methods) {{
     console.error("stack: []");
   }}
 }}
-const vm = runtime.runLoadedEntry(loaded.value, BigInt(request.fuel), request.entry, list(request.args));
+if (loaded.value.host) {{
+  loaded.value.host.cwd = request.cwd || process.cwd();
+  loaded.value.host.caps = request.caps == null ? 3 : request.caps >>> 0;
+}}
+await (async () => {{
+let vm = runtime.runLoadedEntry(loaded.value, BigInt(request.fuel), request.entry, list(request.args));
+let guard = 0;
+while ((vm.status === 5 || vm.status === 6) && guard < 100000) {{
+  guard += 1;
+  if (vm.status === 5) vm = await applyEffect(vm);
+  if (vm.status === 0 || vm.status === 6) vm = runtime.continueRun(vm, BigInt(request.fuel));
+  else break;
+}}
+closeAll();
 for (const line of listValues(vm.output).reverse()) console.log(text(line));
 if (vm.status === 3) {{ console.error("OutOfFuel"); process.exit(1); }}
 if (vm.status === 4) fail(vm.error);
+if (vm.status === 6) fail(vm.error || "java/lang/Throwable");
+if (vm.status === 5) {{ console.error("java/io/IOException"); process.exit(1); }}
+}})();
 '''
 
 
@@ -480,6 +677,10 @@ def _parse_options(args: list[str]) -> tuple[dict[str, Any], str, list[str]]:
             options["flags"].append(value)
             index += 1
             continue
+        if value in ("--no-files", "--no-net"):
+            options["flags"].append(value)
+            index += 1
+            continue
         if value.startswith("-"):
             raise LaunchUsageError(f"unknown VM option before launch target: {value}")
         target = value
@@ -546,6 +747,8 @@ def _request(launch: Launch) -> str:
         "fuel": launch.fuel,
         "maxHeap": launch.max_heap,
         "mode": launch.mode,
+        "cwd": os.getcwd(),
+        "caps": (0 if "--no-files" in launch.flags else 1) | (0 if "--no-net" in launch.flags else 2),
         "classes": [{"name": match.name, "origin": match.origin, "bytes": base64.b64encode(match.data).decode("ascii")} for match in launch.classes],
         "resources": [{"name": name, "bytes": base64.b64encode(data).decode("ascii")} for name, data in launch.resources],
     }

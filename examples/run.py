@@ -16,14 +16,6 @@ ROOT = Path(__file__).resolve().parents[1]
 EXAMPLES = Path(__file__).resolve().parent
 PACKAGED = EXAMPLES / "packaged"
 RUNNER = ROOT / "scripts" / "run.py"
-STANDALONE = (
-    "HelloWorld",
-    "ArithmeticAndBranches",
-    "ObjectsAndDispatch",
-    "ArraysAndStrings",
-    "Exceptions",
-    "StaticInitialization",
-)
 
 
 def require(condition: bool, message: str) -> None:
@@ -43,8 +35,8 @@ def compile_java(output: Path, sources: list[Path]) -> None:
     require(result.returncode == 0, f"javac failed\n{result.stderr}")
 
 
-def launch(*arguments: str) -> subprocess.CompletedProcess[str]:
-    result = run([sys.executable, str(RUNNER), *arguments])
+def launch(cwd: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+    result = run([sys.executable, str(RUNNER), *arguments], cwd=cwd)
     require(result.returncode == 0, f"BendJVM failed: {' '.join(arguments)}\n"
             f"stdout: {result.stdout!r}\nstderr: {result.stderr!r}")
     return result
@@ -61,14 +53,21 @@ def write_jar(path: Path, root: Path) -> None:
 
 def main() -> int:
     require(RUNNER.is_file(), "missing scripts/run.py")
+    standalone_sources = sorted(EXAMPLES.glob("*.java"))
+    require(bool(standalone_sources), f"no Java examples in {EXAMPLES}")
     with tempfile.TemporaryDirectory(prefix="bendjvm-examples-") as temporary:
         directory = Path(temporary)
         standalone = directory / "standalone"
         packaged = directory / "packaged"
-        compile_java(standalone, [EXAMPLES / f"{name}.java" for name in STANDALONE])
-        for name in STANDALONE:
-            result = launch(str(standalone / f"{name}.class"))
-            print(f"== {name} ==")
+        compile_java(standalone, standalone_sources)
+        for source in standalone_sources:
+            extra: list[str] = []
+            if source.stem == "FilesAndTryWithResources":
+                extra = [str(directory / "example.bin")]
+            elif source.stem == "HelloWorld":
+                extra = ["spaced arg"]
+            result = launch(directory, str(standalone / f"{source.stem}.class"), *extra)
+            print(f"== {source.stem} ==")
             print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
 
         sources = [
@@ -77,13 +76,13 @@ def main() -> int:
         ]
         compile_java(packaged, sources)
         shutil.copyfile(PACKAGED / "banner.txt", packaged / "banner.txt")
-        classpath = launch("-cp", str(packaged), "example.hello.Main", "Bend")
+        classpath = launch(directory, "-cp", str(packaged), "example.hello.Main", "Bend")
         print("== packaged classpath ==")
         print(classpath.stdout, end="" if classpath.stdout.endswith("\n") else "\n")
 
         archive = directory / "hello.jar"
         write_jar(archive, packaged)
-        jar = launch("-jar", str(archive), "from-jar")
+        jar = launch(directory, "-jar", str(archive), "from-jar")
         print("== packaged -jar ==")
         print(jar.stdout, end="" if jar.stdout.endswith("\n") else "\n")
     return 0

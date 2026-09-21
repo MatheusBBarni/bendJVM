@@ -111,7 +111,7 @@ def allocate_argument_strings(args: +List<String>, +vm: M.VM, +acc: +List<M.Slot
       Done{ArgumentAllocation{vm, M.reverse(M.Slot, acc)}}
     case Con{arg, rest}:
       do Result<&2, &2, String, ArgumentAllocation>:
-        allocation : H.Allocation <- H.allocate(vm, H.string_entry(Sy.find(S.symbols(vm), "java/lang/String"), string_units(String.to_list(arg))))
+        allocation : H.Allocation <- H.allocate(vm, H.string_entry(H.named_class(S.classes(vm), S.symbols(vm), "java/lang/String"), string_units(String.to_list(arg))))
         +parts : ArgumentAllocation = allocation_parts(allocation, acc)
         result : ArgumentAllocation <- allocate_argument_strings(rest, argument_vm(parts), argument_values(parts))
         return result
@@ -124,7 +124,7 @@ def allocate_argument_array_allocation(+vm: M.VM, allocation: Result<&2, &2, Str
         case H.Allocation{updated, reference}: Done{ArrayAllocation{updated, reference}}
 
 def allocate_argument_array(+vm: M.VM, +values: +List<M.Slot>) -> Result<&2, &2, String, ArrayAllocation>:
-  allocate_argument_array_allocation(vm, H.allocate(vm, H.reference_array_entry(Sy.find(S.symbols(vm), "[Ljava/lang/String;"), Sy.find(S.symbols(vm), "java/lang/String"), values)))
+  allocate_argument_array_allocation(vm, H.allocate(vm, H.reference_array_entry(H.named_class(S.classes(vm), S.symbols(vm), "[Ljava/lang/String;"), H.named_class(S.classes(vm), S.symbols(vm), "java/lang/String"), values)))
 
 def class_id_or_missing_found(found: Maybe<&2, U32>) -> U32:
   match found:
@@ -159,9 +159,21 @@ def run_loaded(+vm: M.VM, fuel: Nat) -> M.VM:
 def run_loaded_entry(+vm: M.VM, fuel: Nat, entryBinaryName: String, applicationArgs: +List<String>) -> M.VM:
   X.run(start_loaded_entry(vm, entryBinaryName, applicationArgs), fuel)
 
+def continue_run(vm: M.VM, fuel: Nat) -> M.VM:
+  X.continue_run(vm, fuel)
+
+def resume_ok(+vm: M.VM, handle: U32, extra: U32, bytes: +List<U32>) -> M.VM:
+  X.resume_ok(vm, handle, extra, bytes)
+
+def resume_fail(+vm: M.VM, name: String) -> M.VM:
+  X.resume_fail(vm, name)
+
 def make_vm() -> M.VM:
-  M.VM{Nil{}, Nil{}, Nil{}, Nil{}, Nil{}, Nil{}, Nil{}, Nil{}, 0, 0, M.Slot{0, 0}, Nil{}, "", 1, 0n}
+  M.VM{Nil{}, Nil{}, Nil{}, Nil{}, Nil{}, Nil{}, Nil{}, Nil{}, 0, 0, M.Slot{0, 0}, Nil{}, "", 1, 0n, M.idle_host()}
+
+def keep_host_api(vm: M.VM) -> M.VM:
+  continue_run(resume_ok(resume_fail(vm, ""), 0, 0, Nil{}), 0n)
 
 def main() -> IO(Unit):
-  result = run_loaded_entry(make_vm(), 1n, "", Nil{})
+  result = run_loaded_entry(keep_host_api(make_vm()), 1n, "", Nil{})
   IO.print(U32.show(S.status(result)))

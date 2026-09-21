@@ -9,6 +9,8 @@ public class ObjectsAndDispatch {
         System.out.println(plain.value());
         System.out.println(offset.value());
         System.out.println(new Counter(3).next());
+        System.out.println(plain.equals(plain));
+        System.out.println(plain.equals(offset));
     }
 }
 

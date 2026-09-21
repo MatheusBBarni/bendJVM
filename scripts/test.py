@@ -17,10 +17,12 @@ from pathlib import Path
 import random
 import re
 import shutil
+import socket
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from typing import Callable, Iterable, Mapping
 import warnings
@@ -39,6 +41,10 @@ NAMED = (
 EXTENDED = (
     "FloatOperations", "FloatArray", "InheritedFields", "ClassInitialization",
     "SignedArithmetic", "RuntimeExceptions", "ReferenceTypes", "Utf16Strings",
+    "ObjectStringInteger", "Collections", "MemoryStreams",
+    "ArrayCopy", "FileRoundtrip", "InterfaceCollections",
+    "LineReader", "TryWithResources", "TcpEcho", "TcpAccept",
+    "TcpRefused", "TcpTimeout", "SuppressionTWR",
 )
 SUPPORT = ("FuelLimit", "HeapLimit", "MutationTarget")
 
@@ -416,8 +422,86 @@ class Suite:
         else:
             self.passed += 1
             print(f"PASS {name} ({time.monotonic() - started:.2f}s)", flush=True)
+    def tcp_echo(self) -> None:
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("127.0.0.1", 0))
+        server.listen(2)
+        port = str(server.getsockname()[1])
+
+        def serve() -> None:
+            for _ in range(2):
+                conn, _addr = server.accept()
+                try:
+                    data = conn.recv(1)
+                    if data:
+                        conn.sendall(bytes([(data[0] + 1) & 255]))
+                finally:
+                    conn.close()
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        try:
+            reference = execute([self.args.java, "-Dfile.encoding=UTF-8", "-cp", str(self.classes), "TcpEcho", port],
+                                self.args.timeout)
+            actual = execute([self.args.bend, "bendjvm/main.bend", "--", str(self.classes / "TcpEcho.class"), port],
+                             self.args.timeout, bend=True)
+            require(reference.code == 0, f"reference failed\n{reference.detail()}")
+            require(actual.code == 0, f"Bend failed\n{actual.detail()}")
+            same_output(reference.stdout, actual.stdout, actual.detail())
+            require(not reference.stderr, f"reference stderr\n{reference.detail()}")
+            require(not actual.stderr, f"unexpected Bend stderr\n{actual.detail()}")
+        finally:
+            server.close()
+
+    def tcp_accept(self) -> None:
+        def probe(command: list[str]) -> bytes:
+            binder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            binder.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            binder.bind(("127.0.0.1", 0))
+            port = binder.getsockname()[1]
+            binder.close()
+            proc = subprocess.Popen(command + [str(port)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                deadline = time.monotonic() + self.args.timeout
+                data = b""
+                while time.monotonic() < deadline:
+                    try:
+                        client = socket.create_connection(("127.0.0.1", port), 0.2)
+                        try:
+                            client.sendall(b"A")
+                            client.settimeout(self.args.timeout)
+                            data = client.recv(1)
+                        finally:
+                            client.close()
+                        break
+                    except OSError:
+                        if proc.poll() is not None:
+                            stdout, stderr = proc.communicate()
+                            raise Failure(f"server exited early\ncode={proc.returncode}\nstdout={stdout!r}\nstderr={stderr!r}")
+                        time.sleep(0.05)
+                else:
+                    proc.kill()
+                    raise Failure("server did not accept")
+                code = proc.wait(timeout=self.args.timeout)
+                stdout, stderr = proc.communicate()
+                require(code == 0, f"server failed code={code} stdout={stdout!r} stderr={stderr!r}")
+                require(data == b"B", f"expected echoed B, got {data!r}")
+                return data
+            except Exception:
+                proc.kill()
+                raise
+
+        probe([self.args.java, "-Dfile.encoding=UTF-8", "-cp", str(self.classes), "TcpAccept"])
+        probe([self.args.bend, "bendjvm/main.bend", "--", str(self.classes / "TcpAccept.class")])
 
     def differential(self, name: str) -> None:
+        if name == "TcpEcho":
+            self.tcp_echo()
+            return
+        if name == "TcpAccept":
+            self.tcp_accept()
+            return
         reference = execute([self.args.java, "-Dfile.encoding=UTF-8", "-cp", str(self.classes), name],
                             self.args.timeout)
         actual = self.bend(self.classes / f"{name}.class")
@@ -461,6 +545,17 @@ class Suite:
         require(result.code == 0, result.detail())
         same_output("100\n", result.stdout, result.detail())
 
+    def capabilities(self) -> None:
+        files = self.bend(self.classes / "FileRoundtrip.class", "--no-files")
+        require(files.code > 0, f"--no-files must deny file effects\n{files.detail()}")
+        require(re.search(r"IOException", files.stdout + "\n" + files.stderr) is not None,
+                f"--no-files expected IOException\n{files.detail()}")
+        net = execute([self.args.bend, "bendjvm/main.bend", "--", "--no-net", str(self.classes / "TcpEcho.class"), "1"],
+                      self.args.timeout, bend=True)
+        require(net.code > 0, f"--no-net must deny TCP effects\n{net.detail()}")
+        require(re.search(r"IOException", net.stdout + "\n" + net.stderr) is not None,
+                f"--no-net expected IOException\n{net.detail()}")
+
     def debug(self, mode: str) -> None:
         result = self.bend(self.classes / "HelloInteger.class", mode)
         require(result.code == 0, result.detail())
@@ -488,6 +583,60 @@ class Suite:
 
     def cli(self, *arguments: str) -> Run:
         return execute([self.args.bend, *arguments], self.args.timeout, bend=True)
+
+    def runtime_app(self, directory: Path) -> None:
+        output = directory / "runtime-app-compiled"
+        output.mkdir(parents=True, exist_ok=True)
+        compilation = execute(
+            [self.args.javac, "--release", "8", "-encoding", "UTF-8", "-g:none",
+             "-d", str(output), str(FIXTURES / "RuntimeExpansionApp.java")],
+            self.args.timeout,
+        )
+        require(compilation.code == 0, f"runtime app compilation failed\n{compilation.detail()}")
+        classes = {
+            path.relative_to(output).as_posix(): path.read_bytes()
+            for path in output.rglob("*.class")
+        }
+        app_jar = write_fixture_jar(
+            directory / "runtime-expansion.jar",
+            classes,
+            resources={"fixture-resource.bin": bytes((9,))},
+            manifest=manifest_bytes(main_class="RuntimeExpansionApp"),
+        )
+        file_path = directory / "runtime-app.bin"
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("127.0.0.1", 0))
+        server.listen(2)
+        port = str(server.getsockname()[1])
+
+        def serve() -> None:
+            for _ in range(2):
+                conn, _addr = server.accept()
+                try:
+                    data = conn.recv(1)
+                    if data:
+                        conn.sendall(bytes([(data[0] + 1) & 255]))
+                finally:
+                    conn.close()
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        try:
+            reference = execute(
+                [self.args.java, "-Dfile.encoding=UTF-8", "-jar", str(app_jar), str(file_path), port],
+                self.args.timeout,
+            )
+            actual = self.cli("-jar", str(app_jar), str(file_path), port)
+            require(reference.code == 0, f"reference runtime app failed\n{reference.detail()}")
+            require(actual.code == 0, f"Bend runtime app failed\n{actual.detail()}")
+            same_output(reference.stdout, actual.stdout, actual.detail())
+            require(not reference.stderr, f"reference stderr\n{reference.detail()}")
+            require(not actual.stderr, f"unexpected Bend stderr\n{actual.detail()}")
+            same_output("9ok\n65\n67\n-2\n", actual.stdout, actual.detail())
+        finally:
+            server.close()
+            thread.join(timeout=2)
 
     def classpath(self, directory: Path) -> None:
         def compile_sources(output: Path, *sources: Path) -> dict[str, bytes]:
@@ -728,6 +877,8 @@ def main() -> int:
                 suite.check(name, lambda name=name: suite.differential(name))
             if not args.only:
                 suite.check("classpath/archive-manifest-resource", lambda: suite.classpath(directory))
+            if args.full and not args.only:
+                suite.check("runtime-expansion-app", lambda: suite.runtime_app(directory))
             if not args.only:
                 original = (classes / "MutationTarget.class").read_bytes()
                 for name, contents, category in malformed_cases(original, args.full):
@@ -738,6 +889,8 @@ def main() -> int:
                     suite.check(f"malformed/{name}", lambda path=path, category=category: suite.reject(path, category))
                 suite.check("cli/fuel", suite.fuel)
                 suite.check("cli/max-heap", suite.heap)
+                if args.full:
+                    suite.check("cli/capabilities", suite.capabilities)
                 for mode in ("--dump-class", "--disassemble", "--trace"):
                     suite.check(f"cli/{mode[2:]}", lambda mode=mode: suite.debug(mode))
             print(f"{suite.passed} passed, {suite.failed} failed", flush=True)

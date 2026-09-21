@@ -3,7 +3,7 @@ public class HelloWorld {
         System.out.println("Hello from BendJVM");
         System.out.println(42);
         if (args.length > 0) {
-            System.out.println(args[0]);
+            System.out.println("arg=" + args[0]);
         }
     }
 }

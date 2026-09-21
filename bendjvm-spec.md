@@ -3122,7 +3122,11 @@ java/lang/Exception
 java/lang/RuntimeException
 ```
 
----
+The implemented MiniJRE slice also covers `Objects`, `StringBuilder`, `Integer`,
+`Math`, collection interfaces, `ArrayList`/`HashMap`, memory and file streams,
+UTF-8 readers/writers, blocking TCP sockets, try-with-resources, and supporting
+I/O exceptions. Unknown natives fail before execution; unsupported overloads
+are not implied by a class name.
 
 # 111. MiniJRE Representation
 

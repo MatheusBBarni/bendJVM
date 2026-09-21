@@ -7,6 +7,8 @@ import ../heap/heap.bend as H
 import ../loader/bootstrap.bend as B
 import ../loader/symbols.bend as Sy
 import ../java/intrinsic.bend as I
+import ../java/outcome.bend as O
+import ../java/library.bend as L
 
 @unsafe def class_id_by_name(classes: +List<M.LoadedClass>, +name: U32) -> Maybe<&2, U32>:
   match classes:
@@ -84,7 +86,14 @@ def make_locals(n: Nat) -> +List<M.Slot>:
     case Con{value, rest}:
       copy_arguments(rest, M.replace(M.Slot, locals, index, value), 1n+index)
 
-def return_frames(+vm: M.VM, value: M.Slot, frames: +List<M.Frame>) -> M.VM:
+def host_cont_of(h: M.Host) -> +List<M.Cont>:
+  match h:
+    case M.Host{effect, cwd, caps, maxPayload, cont}: cont
+
+def host_cont(vm: M.VM) -> +List<M.Cont>:
+  host_cont_of(S.host(vm))
+
+@unsafe def return_frames(+vm: M.VM, value: M.Slot, frames: +List<M.Frame>) -> M.VM:
   match frames:
     case Nil{}: S.with_result(S.with_status(vm, 1), value)
     case Con{current, rest}:
@@ -92,6 +101,7 @@ def return_frames(+vm: M.VM, value: M.Slot, frames: +List<M.Frame>) -> M.VM:
         case Nil{}: S.with_result(S.with_status(vm, 1), value)
         case Con{+caller, callers}:
           S.with_frames(vm, Con{S.frame_stack(caller, Con{value, S.stack(caller)}), callers})
+
 
 def push_return(+vm: M.VM, value: M.Slot) -> M.VM:
   return_frames(vm, value, S.frames(vm))
@@ -127,7 +137,7 @@ def finish_void(+vm: M.VM) -> M.VM:
 def invoke_frame(vm: M.VM, id: U32, maxLocals: U32, +caller: M.Frame, values: +List<M.Slot>, frames: +List<M.Frame>) -> M.VM:
   match frames:
     case Con{old, rest}:
-      S.with_frames(vm, Con{M.Frame{id, 0, U32.sub(S.pc(caller), 1), copy_arguments(values, make_locals(U32.to_nat(maxLocals)), 0n), Nil{}, 4294967295}, Con{caller, rest}})
+      S.with_frames(vm, Con{M.Frame{id, 0, S.pc(caller), copy_arguments(values, make_locals(U32.to_nat(maxLocals)), 0n), Nil{}, 4294967295}, Con{S.advance(caller), rest}})
     case Nil{}:
       S.fail(vm, "InvalidState: invocation without caller")
 
@@ -140,26 +150,30 @@ def invoke_arguments(vm: M.VM, method: M.LoadedMethod, args: F.Arguments, frames
 def intrinsic_value(+vm: M.VM, frame: M.Frame, value: Maybe<&2, M.Slot>, max: U32) -> Result<&2, &2, String, M.VM>:
   match value:
     case None{}:
-      Done{S.commit(vm, frame)}
+      Done{S.commit(vm, S.advance(frame))}
     case Some{slot}:
       do Result<&2, &2, String, M.VM>:
-        pushed : M.Frame <- F.push(frame, slot, max)
+        pushed : M.Frame <- F.push(S.advance(frame), slot, max)
         return S.commit(vm, pushed)
 
-def intrinsic_output(+vm: M.VM, frame: M.Frame, output: Maybe<&2, String>, value: Maybe<&2, M.Slot>, max: U32) -> Result<&2, &2, String, M.VM>:
-  match output:
-    case None{}:
-      intrinsic_value(vm, frame, value, max)
-    case Some{text}:
-      intrinsic_value(S.emit(vm, text), frame, value, max)
+def intrinsic_outcome(frame: M.Frame, max: U32, outcome: O.Outcome) -> Result<&2, &2, String, M.VM>:
+  match outcome:
+    case O.Returned{updated, value}:
+      intrinsic_value(updated, frame, value, max)
+    case O.ThrownRef{updated, reference}:
+      Done{S.with_status(S.with_exception(updated, reference), 6)}
+    case O.ThrownName{updated, name}:
+      Fail{name}
+    case O.Suspend{updated, effect}:
+      Done{S.commit(updated, frame)}
+    case O.Call{+updated, method, args}:
+      Done{invoke_arguments(updated, method, F.Arguments{frame, args}, S.frames(updated))}
 
-def intrinsic_result(frame: M.Frame, max: U32, result: Result<&2, &2, String, I.Outcome>) -> Result<&2, &2, String, M.VM>:
+def intrinsic_result(frame: M.Frame, max: U32, result: Result<&2, &2, String, O.Outcome>) -> Result<&2, &2, String, M.VM>:
   match result:
     case Fail{error}: Fail{error}
     case Done{outcome}:
-      match outcome:
-        case I.Outcome{updated, output, value}:
-          intrinsic_output(updated, frame, output, value, max)
+      intrinsic_outcome(frame, max, outcome)
 
 def intrinsic_args(+vm: M.VM, +method: M.LoadedMethod, args: F.Arguments, max: U32) -> Result<&2, &2, String, M.VM>:
   match args:
@@ -621,7 +635,7 @@ def new_array_found(found: Maybe<&2, M.LoadedClass>, +vm: M.VM, +frame: M.Frame,
       new_array_entry(vm, frame, id, element, kind, count)
 def new_array_size(negative: Bool, found: Maybe<&2, M.LoadedClass>, +vm: M.VM, +frame: M.Frame, class_name: U32, element: U32, kind: U32, count: U32) -> Result<&2, &2, String, M.VM>:
   match negative:
-    case True{}: Fail{"NegativeArraySizeException"}
+    case True{}: Fail{"java/lang/NegativeArraySizeException"}
     case False{}: new_array_found(found, vm, frame, class_name, element, kind, count)
 
 def new_array(+vm: M.VM, +frame: M.Frame, +class_name: U32, element: U32, kind: U32, +count: U32) -> Result<&2, &2, String, M.VM>:
@@ -662,13 +676,13 @@ def iinc(+vm: M.VM, +frame: M.Frame, +index: U32, delta: U32) -> Result<&2, &2, 
 def ref_assignable_checked(+vm: M.VM, reference: U32, target: U32, cast: Bool, +frame: M.Frame, checked: Bool) -> Result<&2, &2, String, M.VM>:
   match cast:
     case True{}:
-      Bool.pick(Result<&2, &2, String, M.VM>, checked, Done{S.commit(vm, S.frame_stack(S.advance(frame), Con{M.Slot{3, reference}, S.stack(frame)}))}, Fail{"ClassCastException"})
+      Bool.pick(Result<&2, &2, String, M.VM>, checked, Done{S.commit(vm, S.frame_stack(S.advance(frame), Con{M.Slot{3, reference}, S.stack(frame)}))}, Fail{"java/lang/ClassCastException"})
     case False{}:
       Done{S.commit(vm, S.frame_stack(S.advance(frame), Con{M.Slot{1, Bool.pick(U32, checked, 1, 0)}, S.stack(frame)}))}
 
 def ref_assignable_target(+vm: M.VM, reference: U32, +target: U32, cast: Bool, +frame: M.Frame, class: U32, found: Maybe<&2, U32>) -> Result<&2, &2, String, M.VM>:
   match found:
-    case None{}: Bool.pick(Result<&2, &2, String, M.VM>, cast, Fail{"ClassCastException"}, Done{S.commit(vm, S.frame_stack(S.advance(frame), Con{M.Slot{1, 0}, S.stack(frame)}))})
+    case None{}: Bool.pick(Result<&2, &2, String, M.VM>, cast, Fail{"java/lang/ClassCastException"}, Done{S.commit(vm, S.frame_stack(S.advance(frame), Con{M.Slot{1, 0}, S.stack(frame)}))})
     case Some{+target_id}: ref_assignable_checked(vm, reference, target_id, cast, frame, H.assignable(S.classes(vm), S.symbols(vm), class, target_id))
 
 def ref_assignable_frame(+vm: M.VM, reference: U32, +target: U32, cast: Bool, +frame: M.Frame, entry: M.HeapEntry) -> Result<&2, &2, String, M.VM>:
@@ -707,7 +721,7 @@ def reference_store_loaded(+vm: M.VM, +value: M.Slot, +target: U32, result: Resu
       match entry:
         case M.HeapEntry{class, kind, element, fields, values, chars}:
           do Result<&2, &2, String, M.VM>:
-            checked : Unit <- S.check(H.assignable(S.classes(vm), S.symbols(vm), class, target), "ArrayStoreException")
+            checked : Unit <- S.check(H.assignable(S.classes(vm), S.symbols(vm), class, target), "java/lang/ArrayStoreException")
             return vm
 
 def array_store_kind(expected: U32) -> U32:
@@ -736,7 +750,7 @@ def array_store_entry(+vm: M.VM, +value: M.Slot, +index: M.Slot, +popped: F.Popp
         case M.HeapEntry{+class, +kind, +element, fields, +values, chars}:
           do Result<&2, &2, String, M.VM>:
             checked_kind : Unit <- S.check(U32.is_eq(kind, array_store_kind(expected)), "ArrayTypeMismatch")
-            checked_index : Unit <- S.check(U32.is_lt(V.slot_bits(index), M.length(M.Slot, values)), "ArrayIndexOutOfBoundsException")
+            checked_index : Unit <- S.check(U32.is_lt(V.slot_bits(index), M.length(M.Slot, values)), "java/lang/ArrayIndexOutOfBoundsException")
             checked_vm : M.VM <- array_store_check(vm, value, expected, reference_component_id(S.classes(vm), element))
             updated : M.HeapEntry = M.HeapEntry{class, kind, element, fields, M.replace(M.Slot, values, U32.to_nat(V.slot_bits(index)), value), chars}
             return S.commit(H.put(checked_vm, V.slot_bits(ref), updated), S.advance(next))
@@ -786,8 +800,8 @@ def array_load_entry(+vm: M.VM, +index: M.Slot, +popped: F.Popped, expected: U32
         case M.HeapEntry{class, kind, element, fields, +values, chars}:
           do Result<&2, &2, String, M.VM>:
             checked_kind : Unit <- S.check(U32.is_eq(kind, expected), "ArrayTypeMismatch")
-            checked_index : Unit <- S.check(U32.is_lt(V.slot_bits(index), M.length(M.Slot, values)), "ArrayIndexOutOfBoundsException")
-            slot : M.Slot <- S.require(M.Slot, M.nth(M.Slot, values, V.slot_bits(index)), "ArrayIndexOutOfBoundsException")
+            checked_index : Unit <- S.check(U32.is_lt(V.slot_bits(index), M.length(M.Slot, values)), "java/lang/ArrayIndexOutOfBoundsException")
+            slot : M.Slot <- S.require(M.Slot, M.nth(M.Slot, values, V.slot_bits(index)), "java/lang/ArrayIndexOutOfBoundsException")
             return S.commit(vm, S.frame_stack(S.advance(next), Con{slot, S.stack(next)}))
 
 def array_load_result(+vm: M.VM, +index: M.Slot, popped: F.Popped, expected: U32, result: Result<&2, &2, String, M.HeapEntry>) -> Result<&2, &2, String, M.VM>:
@@ -814,15 +828,16 @@ def array_load(+vm: M.VM, frame: M.Frame, expected: U32) -> Result<&2, &2, Strin
     popped : F.Popped <- F.pop(frame, 1)
     result : M.VM <- array_load_start(vm, popped, expected)
     return result
-
 def array_length(vm: M.VM, frame: M.Frame) -> Result<&2, &2, String, M.VM>:
   do Result<&2, &2, String, M.VM>:
     popped : F.Popped <- F.pop(frame, 3)
     result : M.VM <- array_length_popped(vm, popped)
     return result
+
 def athrow_popped(vm: M.VM, popped: F.Popped) -> Result<&2, &2, String, M.VM>:
   match popped:
-    case F.Popped{frame, value}: Bool.pick(Result<&2, &2, String, M.VM>, U32.is_eq(V.slot_bits(value), 0), Fail{"NullPointerException"}, Fail{"ThrownException"})
+    case F.Popped{frame, +value}:
+      Bool.pick(Result<&2, &2, String, M.VM>, U32.is_eq(V.slot_bits(value), 0), Fail{"java/lang/NullPointerException"}, Done{S.with_status(S.with_exception(S.commit(vm, frame), V.slot_bits(value)), 6)})
 
 def athrow(vm: M.VM, frame: M.Frame) -> Result<&2, &2, String, M.VM>:
   do Result<&2, &2, String, M.VM>:
@@ -851,7 +866,7 @@ def literal_string_found(+vm: M.VM, +frame: M.Frame, symbol: U32, class: U32, fo
 def literal_string(+vm: M.VM, +frame: M.Frame, +symbol: U32) -> Result<&2, &2, String, M.VM>:
   do Result<&2, &2, String, M.VM>:
     text : String <- S.require(String, M.nth(String, S.symbols(vm), symbol), "InvalidConstant")
-    class : U32 = Sy.find(S.symbols(vm), "java/lang/String")
+    class : U32 = H.named_class(S.classes(vm), S.symbols(vm), "java/lang/String")
     chars : +List<U32> = string_units(String.to_list(text))
     found : Maybe<&2, U32> = H.string_intern(S.heap(vm), chars)
     result : M.VM <- literal_string_found(vm, frame, symbol, class, found)
@@ -968,10 +983,14 @@ def step(+vm: M.VM, +frame: M.Frame, +method: M.LoadedMethod, instruction: M.Ins
     case 79: array_store(vm, frame, 1)
     case 81: array_store(vm, frame, 3)
     case 83: array_store(vm, frame, 2)
+    case 84: array_store(vm, frame, 1)
+    case 85: array_store(vm, frame, 1)
     case 1: constant_push(vm, frame, 0, 3, method_max_stack(method))
     case 46: array_load(vm, frame, 1)
     case 48: array_load(vm, frame, 1)
     case 50: array_load(vm, frame, 2)
+    case 51: array_load(vm, frame, 1)
+    case 52: array_load(vm, frame, 1)
     case 2: constant_push(vm, frame, 4294967295, 1, method_max_stack(method))
     case 3: constant_push(vm, frame, 0, 1, method_max_stack(method))
     case 4: constant_push(vm, frame, 1, 1, method_max_stack(method))
@@ -1222,54 +1241,124 @@ def step(+vm: M.VM, +frame: M.Frame, +method: M.LoadedMethod, instruction: M.Ins
     case 188: array_count(vm, frame, Sy.find(S.symbols(vm), B.atype_name(a)), a, 1)
     case 189: array_count(vm, frame, a, a, 2)
     case 187: new_object(vm, frame, a)
-    case 182: invoke_virtual(vm, S.advance(frame), a, b, c, method_max_stack(method))
-    case 183: invoke_special(vm, S.advance(frame), a, b, c, method_max_stack(method))
-    case 184: invoke_static(vm, S.advance(frame), a, b, c, method_max_stack(method))
+    case 182: invoke_virtual(vm, frame, a, b, c, method_max_stack(method))
+    case 183: invoke_special(vm, frame, a, b, c, method_max_stack(method))
+    case 184: invoke_static(vm, frame, a, b, c, method_max_stack(method))
+    case 185: invoke_virtual(vm, frame, a, b, c, method_max_stack(method))
     case _: Fail{"UnsupportedOpcode: " ++ U32.show(op)}
 def method_handlers(value: M.LoadedMethod) -> +List<M.Handler>:
   match value:
     case M.LoadedMethod{id, owner, name, descriptor, flags, parameters, resultTag, maxStack, maxLocals, instructions, handlers, intrinsic}: handlers
 
-def exception_handler(+pc: U32, +handlers: +List<M.Handler>) -> Maybe<&2, U32>:
+def java_fault(error: String) -> Bool:
+  String.starts_with(error, "java/")
+
+def thrown_class_entry(result: Result<&2, &2, String, M.HeapEntry>) -> U32:
+  match result:
+    case Fail{error}: 0
+    case Done{entry}: H.entry_class(entry)
+
+def thrown_class_of(+vm: M.VM) -> U32:
+  thrown_class_entry(H.get(S.heap(vm), S.exception(vm)))
+
+def catch_matches_id(+vm: M.VM, +thrown: U32, found: Maybe<&2, U32>) -> Bool:
+  match found:
+    case None{}: False{}
+    case Some{id}: H.assignable(S.classes(vm), S.symbols(vm), thrown, id)
+
+def catch_matches(+vm: M.VM, +thrown: U32, catch: U32) -> Bool:
+  match catch:
+    case 0: True{}
+    case _:
+      catch_matches_id(vm, thrown, class_id_by_name(S.classes(vm), catch))
+
+def exception_handler(+vm: M.VM, +pc: U32, +thrown: U32, +handlers: +List<M.Handler>) -> Maybe<&2, U32>:
   match handlers:
     case Nil{}: None{}
     case Con{M.Handler{start, end, target, catch}, rest}:
-      Bool.pick(Maybe<&2, U32>, U32.is_ge(pc, start) && U32.is_lt(pc, end), Some{target}, exception_handler(pc, rest))
+      Bool.pick(Maybe<&2, U32>, U32.is_ge(pc, start) && U32.is_lt(pc, end) && catch_matches(vm, thrown, catch), Some{target}, exception_handler(vm, pc, thrown, rest))
 
-def frame_exception_handler_found(+frame: M.Frame, pc: U32, found: Maybe<&2, M.LoadedMethod>) -> Maybe<&2, U32>:
+def frame_exception_handler_found(+vm: M.VM, +frame: M.Frame, pc: U32, thrown: U32, found: Maybe<&2, M.LoadedMethod>) -> Maybe<&2, U32>:
   match found:
     case None{}: None{}
-    case Some{method}: exception_handler(pc, method_handlers(method))
+    case Some{method}: exception_handler(vm, pc, thrown, method_handlers(method))
 
-def frame_exception_handler(vm: M.VM, +frame: M.Frame, pc: U32) -> Maybe<&2, U32>:
-  frame_exception_handler_found(frame, pc, M.nth(M.LoadedMethod, S.methods(vm), S.method_id(frame)))
+def frame_exception_handler(+vm: M.VM, +frame: M.Frame, pc: U32) -> Maybe<&2, U32>:
+  frame_exception_handler_found(vm, frame, pc, thrown_class_of(vm), M.nth(M.LoadedMethod, S.methods(vm), S.method_id(frame)))
 
-def exception_unwind_frame(error: String, +vm: M.VM, +caller: M.Frame, callers: +List<M.Frame>, fuel: Nat, continue: U32 -> Nat -> M.VM -> M.VM, +found: Maybe<&2, U32>) -> M.VM:
+def enter_handler(+vm: M.VM, frame: M.Frame, target: U32, fuel: Nat, continue: U32 -> Nat -> M.VM -> M.VM) -> M.VM:
+  +resumed = S.tick(S.with_status(S.commit(vm, S.frame_stack(S.frame_pc(frame, target), Con{M.Slot{3, S.exception(vm)}, Nil{}})), 0))
+  +cleared = S.with_exception(resumed, 0)
+  continue(S.status(cleared), fuel, cleared)
+
+def fail_initializer_state(+vm: M.VM, owner: U32) -> M.VM:
+  match owner:
+    case 4294967295: vm
+    case value: S.set_class_state(vm, value, 3)
+
+def fail_initializer(+vm: M.VM, frame: M.Frame) -> M.VM:
+  fail_initializer_state(vm, S.initializing(frame))
+def uncaught(+vm: M.VM, error: String) -> M.VM:
+  S.fail(vm, error)
+
+def handler_target(found: Maybe<&2, U32>) -> U32:
   match found:
-    case None{}: S.fail(vm, error)
-    case Some{target}:
-      +resumed = S.tick(S.commit(vm, S.frame_stack(S.frame_pc(caller, target), Con{M.Slot{3, 0}, Nil{}})))
-      continue(S.status(resumed), fuel, resumed)
+    case None{}: 4294967295
+    case Some{target}: target
 
-def exception_unwind(error: String, +vm: M.VM, +frames: +List<M.Frame>, fuel: Nat, continue: U32 -> Nat -> M.VM -> M.VM) -> M.VM:
+@unsafe def exception_unwind_miss(+error: String, +vm: M.VM, +caller: M.Frame, callers: +List<M.Frame>, +fuel: Nat, +k: U32 -> Nat -> M.VM -> M.VM) -> M.VM:
+  match callers:
+    case Nil{}: uncaught(fail_initializer(vm, caller), error)
+    case Con{+next_caller, +next_callers}:
+      +next = S.with_frames(fail_initializer(vm, caller), Con{next_caller, next_callers})
+      +target = handler_target(frame_exception_handler(next, next_caller, S.invoke_pc(caller)))
+      Bool.pick(M.VM, U32.is_eq(target, 4294967295), exception_unwind_miss(error, next, next_caller, next_callers, fuel, k), enter_handler(next, next_caller, target, fuel, k))
+
+def exception_unwind_choice(miss: Bool, error: String, +vm: M.VM, +frame: M.Frame, frames: +List<M.Frame>, fuel: Nat, k: U32 -> Nat -> M.VM -> M.VM, target: U32) -> M.VM:
+  match miss:
+    case True{}: exception_unwind_miss(error, vm, frame, frames, fuel, k)
+    case False{}: enter_handler(vm, frame, target, fuel, k)
+
+def exception_unwind(+error: String, +vm: M.VM, +frames: +List<M.Frame>, +fuel: Nat, k: U32 -> Nat -> M.VM -> M.VM) -> M.VM:
   match frames:
-    case Nil{}: S.fail(vm, error)
+    case Nil{}: uncaught(vm, error)
     case Con{+current, rest}:
       match rest:
-        case Nil{}: S.fail(vm, error)
+        case Nil{}: uncaught(fail_initializer(vm, current), error)
         case Con{+caller, callers}:
-          +next = S.with_frames(vm, Con{caller, callers})
-          exception_unwind_frame(error, next, caller, callers, fuel, continue, frame_exception_handler(next, caller, S.invoke_pc(current)))
+          +next = S.with_frames(fail_initializer(vm, current), Con{caller, callers})
+          +target = handler_target(frame_exception_handler(next, caller, S.invoke_pc(current)))
+          exception_unwind_choice(U32.is_eq(target, 4294967295), error, next, caller, callers, fuel, k, target)
+
+def allocate_named_result(+vm: M.VM, name: String, result: Result<&2, &2, String, H.Allocation>) -> M.VM:
+  match result:
+    case Fail{error}: S.with_exception(vm, 2)
+    case Done{allocation}:
+      match allocation:
+        case H.Allocation{updated, reference}: S.with_exception(updated, reference)
+
+def allocate_named(+vm: M.VM, +name: String) -> M.VM:
+  allocate_named_result(vm, name, H.allocate(vm, H.throwable_entry(H.named_class(S.classes(vm), S.symbols(vm), name))))
+
+def ensure_throw(+vm: M.VM, error: String) -> M.VM:
+  Bool.pick(M.VM, U32.is_ne(S.exception(vm), 0), vm, allocate_named(vm, error))
 
 def exception_resume_found(error: String, +vm: M.VM, +frame: M.Frame, fuel: Nat, continue: U32 -> Nat -> M.VM -> M.VM, found: Maybe<&2, U32>) -> M.VM:
   match found:
     case None{}: exception_unwind(error, vm, S.frames(vm), fuel, continue)
-    case Some{target}:
-      +next = S.tick(S.commit(vm, S.frame_stack(S.frame_pc(frame, target), Con{M.Slot{3, 0}, Nil{}})))
-      continue(S.status(next), fuel, next)
+    case Some{target}: enter_handler(vm, frame, target, fuel, continue)
 
-def exception_resume(error: String, +vm: M.VM, +frame: M.Frame, method: M.LoadedMethod, fuel: Nat, continue: U32 -> Nat -> M.VM -> M.VM) -> M.VM:
-  exception_resume_found(error, vm, frame, fuel, continue, exception_handler(S.pc(frame), method_handlers(method)))
+def exception_resume_java(+error: String, +vm: M.VM, +frame: M.Frame, method: M.LoadedMethod, fuel: Nat, continue: U32 -> Nat -> M.VM -> M.VM) -> M.VM:
+  +ready = ensure_throw(vm, error)
+  exception_resume_found(error, ready, frame, fuel, continue, exception_handler(ready, S.pc(frame), thrown_class_of(ready), method_handlers(method)))
+
+def exception_resume_kind(java: Bool, error: String, +vm: M.VM, +frame: M.Frame, method: M.LoadedMethod, fuel: Nat, continue: U32 -> Nat -> M.VM -> M.VM) -> M.VM:
+  match java:
+    case True{}: exception_resume_java(error, vm, frame, method, fuel, continue)
+    case False{}: S.fail(vm, error)
+
+def exception_resume(+error: String, +vm: M.VM, +frame: M.Frame, method: M.LoadedMethod, fuel: Nat, continue: U32 -> Nat -> M.VM -> M.VM) -> M.VM:
+  exception_resume_kind(java_fault(error), error, vm, frame, method, fuel, continue)
 
 def step_continue(result: Result<&2, &2, String, M.VM>, fuel: Nat, +vm: M.VM, +frame: M.Frame, method: M.LoadedMethod, continue: U32 -> Nat -> M.VM -> M.VM) -> M.VM:
   match result:
@@ -1293,18 +1382,117 @@ def run_frames(fuel: Nat, +vm: M.VM, frames: +List<M.Frame>, continue: U32 -> Na
     case Nil{}: S.with_status(vm, 1)
     case Con{+frame, rest}: run_method(M.nth(M.LoadedMethod, S.methods(vm), S.method_id(frame)), fuel, vm, frame, continue)
 
-@unsafe def loop_status(status: U32, fuel: Nat, +vm: M.VM) -> M.VM:
-  match status:
-    case 1: vm
-    case 4: vm
-    case 3: vm
+@unsafe def loop_with(mode: U32, status: U32, +fuel: Nat, +vm: M.VM, +frames: +List<M.Frame>, found: Maybe<&2, M.LoadedMethod>, +frame: M.Frame) -> M.VM:
+  match mode:
+    case 0:
+      match status:
+        case 1: vm
+        case 4: vm
+        case 3: vm
+        case 5: vm
+        case 6:
+          match frames:
+            case Nil{}: uncaught(vm, "java/lang/Throwable")
+            case Con{+cur, rest}:
+              loop_with(1, status, fuel, vm, Con{cur, rest}, M.nth(M.LoadedMethod, S.methods(vm), S.method_id(cur)), cur)
+        case _:
+          match fuel:
+            case 0n: S.with_status(vm, 3)
+            case 1n+p: run_frames(p, vm, frames, nextStatus => nextFuel => +nextVm => loop_with(0, nextStatus, nextFuel, nextVm, S.frames(nextVm), None{}, frame))
     case _:
-      match fuel:
-        case 0n: S.with_status(vm, 3)
-        case 1n+p: run_frames(p, vm, S.frames(vm), nextStatus => nextFuel => nextVm => loop_status(nextStatus, nextFuel, nextVm))
+      match found:
+        case None{}: uncaught(vm, "java/lang/Throwable")
+        case Some{method}:
+          exception_resume_java("java/lang/Throwable", vm, frame, method, fuel, nextStatus => nextFuel => +nextVm => loop_with(0, nextStatus, nextFuel, nextVm, S.frames(nextVm), None{}, frame))
 
 @unsafe def loop(fuel: Nat, +vm: M.VM) -> M.VM:
-  loop_status(S.status(vm), fuel, vm)
+  loop_with(0, S.status(vm), fuel, vm, S.frames(vm), None{}, M.Frame{0, 0, 0, Nil{}, Nil{}, 4294967295})
 
 def run(vm: M.VM, fuel: Nat) -> M.VM:
   loop(fuel, vm)
+
+def resume_clear(+vm: M.VM) -> M.VM:
+  S.with_effect(S.with_status(vm, 0), M.Idle{})
+
+def resume_void_frames(+vm: M.VM, frames: +List<M.Frame>) -> M.VM:
+  match frames:
+    case Nil{}: resume_clear(vm)
+    case Con{frame, rest}: resume_clear(S.commit(vm, S.advance(frame)))
+
+def resume_void(+vm: M.VM) -> M.VM:
+  resume_void_frames(vm, S.frames(vm))
+
+def resume_push_done(+vm: M.VM, result: Result<&2, &2, String, M.Frame>) -> M.VM:
+  match result:
+    case Fail{error}: S.fail(vm, error)
+    case Done{pushed}: resume_clear(S.commit(vm, pushed))
+
+def resume_push_frames(+vm: M.VM, value: M.Slot, frames: +List<M.Frame>) -> M.VM:
+  match frames:
+    case Nil{}: resume_clear(vm)
+    case Con{frame, rest}: resume_push_done(vm, F.push(S.advance(frame), value, 256))
+
+def resume_push(+vm: M.VM, value: M.Slot) -> M.VM:
+  resume_push_frames(vm, value, S.frames(vm))
+
+def resume_int(+vm: M.VM, bits: U32) -> M.VM:
+  resume_push(vm, M.Slot{1, bits})
+
+def resume_ref(+vm: M.VM, reference: U32) -> M.VM:
+  resume_push(vm, M.Slot{3, reference})
+
+
+def put_handle_entry(+vm: M.VM, +reference: U32, +handle: U32, extra: U32, entry: M.HeapEntry) -> M.VM:
+  M.HeapEntry{class, kind, element, fields, values, chars} = entry
+  H.put(vm, reference, M.HeapEntry{class, kind, element, [M.Binding{0, M.Slot{1, 0}}, M.Binding{1, M.Slot{1, handle}}, M.Binding{2, M.Slot{1, extra}}], values, chars})
+
+def put_handle_found(+vm: M.VM, +reference: U32, +handle: U32, extra: U32, result: Result<&2, &2, String, M.HeapEntry>) -> M.VM:
+  match result:
+    case Fail{error}: S.fail(vm, error)
+    case Done{entry}: put_handle_entry(vm, reference, handle, extra, entry)
+
+def put_handle(+vm: M.VM, +reference: U32, +handle: U32, extra: U32) -> M.VM:
+  put_handle_found(vm, reference, handle, extra, H.get(S.heap(vm), reference))
+
+def resume_open_to(+vm: M.VM, +handle: U32, +receiver: U32) -> M.VM:
+  resume_void(put_handle(vm, receiver, handle, 0))
+
+def resume_bind_to(+vm: M.VM, +handle: U32, +port: U32, +receiver: U32) -> M.VM:
+  resume_void(put_handle(vm, receiver, handle, port))
+
+def resume_accept_alloc(+vm: M.VM, +handle: U32, result: Result<&2, &2, String, H.Allocation>) -> M.VM:
+  match result:
+    case Fail{error}: S.fail(vm, error)
+    case Done{allocation}:
+      match allocation:
+        case H.Allocation{updated, reference}: resume_ref(updated, reference)
+
+def resume_accept_to(+vm: M.VM, +handle: U32) -> M.VM:
+  resume_accept_alloc(vm, handle, H.allocate(vm, M.HeapEntry{H.named_class(S.classes(vm), S.symbols(vm), "java/net/Socket"), 0, 0, [M.Binding{0, M.Slot{1, 0}}, M.Binding{1, M.Slot{1, handle}}, M.Binding{2, M.Slot{1, 0}}], Nil{}, Nil{}}))
+
+def resume_read_bytes(values: +List<U32>, +vm: M.VM) -> M.VM:
+  match values:
+    case Nil{}: resume_int(vm, 4294967295)
+    case Con{b, rest}: resume_int(vm, U32.and(b, 255))
+
+def resume_ok_effect(+vm: M.VM, +handle: U32, extra: U32, bytes: +List<U32>, effect: M.Effect) -> M.VM:
+  match effect:
+    case M.Idle{}: resume_clear(vm)
+    case M.OpenFile{path, mode, receiver}: resume_open_to(vm, handle, receiver)
+    case M.StatPath{path, op}: resume_int(vm, extra)
+    case M.ReadBytes{old, count, timeout}: resume_read_bytes(bytes, vm)
+    case M.WriteBytes{old, data}: resume_void(vm)
+    case M.CloseHandle{old}: resume_void(vm)
+    case M.ConnectTcp{host, port, timeout, receiver}: resume_open_to(vm, handle, receiver)
+    case M.BindTcp{port, receiver}: resume_bind_to(vm, handle, extra, receiver)
+    case M.AcceptTcp{old, timeout, receiver}: resume_accept_to(vm, handle)
+
+def resume_ok(+vm: M.VM, +handle: U32, extra: U32, bytes: +List<U32>) -> M.VM:
+  resume_ok_effect(vm, handle, extra, bytes, S.host_effect(vm))
+
+def resume_fail(+vm: M.VM, name: String) -> M.VM:
+  S.with_effect(S.with_status(ensure_throw(vm, name), 6), M.Idle{})
+
+def continue_run(vm: M.VM, fuel: Nat) -> M.VM:
+  loop(fuel, vm)
+

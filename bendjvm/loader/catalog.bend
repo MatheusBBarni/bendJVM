@@ -200,6 +200,23 @@ def method_value(native: Bool, intrinsic: U32, nextId: U32, owner: U32, +sy: +Li
     case _ other:
       Done{M.LoadedMethod{nextId, owner, S.find(sy, name), S.find(sy, descriptor), flags, parameters, resultTag, maxStack, maxLocals, instructions, handlers, other}}
 
+def link_catch(+catch: U32, +pool: +List<M.Constant>, +sy: +List<String>) -> Result<&2, &2, String, U32>:
+  match catch:
+    case 0: Done{0}
+    case _:
+      do Result<&2, &2, String, U32>:
+        name : String <- CP.class_name(pool, catch)
+        return S.find(sy, name)
+
+def link_handlers(handlers: +List<M.Handler>, +pool: +List<M.Constant>, +sy: +List<String>) -> Result<&2, &2, String, +List<M.Handler>>:
+  match handlers:
+    case Nil{}: Done{Nil{}}
+    case Con{M.Handler{start, end, target, catch}, rest}:
+      do Result<&2, &2, String, +List<M.Handler>>:
+        linked : U32 <- link_catch(catch, pool, sy)
+        tail : +List<M.Handler> <- link_handlers(rest, pool, sy)
+        return Con{M.Handler{start, end, target, linked}, tail}
+
 def method_records(methods: +List<M.Method>, +owner: U32, +ownerName: String, +pool: +List<M.Constant>, +sy: +List<String>, id: U32) -> Result<&2, &2, String, +List<M.LoadedMethod>>:
   match methods:
     case Nil{}: Done{Nil{}}
@@ -212,7 +229,8 @@ def method_records(methods: +List<M.Method>, +owner: U32, +ownerName: String, +p
         resultTag : U32 = D.slot_tag(D.result_type(parsed))
         tail : +List<M.LoadedMethod> <- method_records(rest, owner, ownerName, pool, sy, (nextId + 1 : U32))
         linked : +List<M.Instruction> <- link_instructions(ins, pool, sy)
-        method : M.LoadedMethod <- method_value(U32.is_ne(U32.and(flags, 256), 0), intrinsic, nextId, owner, sy, name, desc, flags, D.parameter_count(parsed), resultTag, stack, locals, linked, handlers)
+        linked_handlers : +List<M.Handler> <- link_handlers(handlers, pool, sy)
+        method : M.LoadedMethod <- method_value(U32.is_ne(U32.and(flags, 256), 0), intrinsic, nextId, owner, sy, name, desc, flags, D.parameter_count(parsed), resultTag, stack, locals, linked, linked_handlers)
         return Con{method, tail}
 
 def collect(classes: +List<M.ClassFile>, +all: +List<M.ClassFile>, +ns: +List<String>, +sy: +List<String>, fs: +List<M.LoadedField>, ms: +List<M.LoadedMethod>, owner: U32) -> Result<&2, &2, String, Catalog>:

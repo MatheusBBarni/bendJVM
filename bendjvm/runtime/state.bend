@@ -2,96 +2,152 @@ import Base
 import ../model.bend as M
 
 def classes(vm: M.VM) -> +List<M.LoadedClass>:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
   cs
 
 def methods(vm: M.VM) -> +List<M.LoadedMethod>:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
   ms
 
 def fields(vm: M.VM) -> +List<M.LoadedField>:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
   fs
 
 def symbols(vm: M.VM) -> +List<String>:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
   sy
 
 def heap(vm: M.VM) -> +List<M.HeapEntry>:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
   hp
 
 def statics(vm: M.VM) -> +List<M.Binding>:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
   st
 
 def resources(vm: M.VM) -> +List<M.Resource>:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
   rs
 
 def frames(vm: M.VM) -> +List<M.Frame>:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
   fr
 
 def status(vm: M.VM) -> U32:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
   stt
 
+def exception(vm: M.VM) -> U32:
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
+  ex
+
 def max_heap(vm: M.VM) -> U32:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
   max
 
 def output(vm: M.VM) -> +List<String>:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
   out
 
 def error(vm: M.VM) -> String:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
   err
 
+def host(vm: M.VM) -> M.Host:
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
+  host
+
 def with_classes(vm: M.VM, value: +List<M.LoadedClass>) -> M.VM:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
-  M.VM{value, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps}
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
+  M.VM{value, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host}
 
 def with_heap(vm: M.VM, value: +List<M.HeapEntry>) -> M.VM:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
-  M.VM{cs, ms, fs, sy, value, st, rs, fr, stt, ex, result, out, err, max, steps}
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
+  M.VM{cs, ms, fs, sy, value, st, rs, fr, stt, ex, result, out, err, max, steps, host}
 
 def with_statics(vm: M.VM, value: +List<M.Binding>) -> M.VM:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
-  M.VM{cs, ms, fs, sy, hp, value, rs, fr, stt, ex, result, out, err, max, steps}
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
+  M.VM{cs, ms, fs, sy, hp, value, rs, fr, stt, ex, result, out, err, max, steps, host}
 
 def with_frames(vm: M.VM, value: +List<M.Frame>) -> M.VM:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
-  M.VM{cs, ms, fs, sy, hp, st, rs, value, stt, ex, result, out, err, max, steps}
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, value, stt, ex, result, out, err, max, steps, host}
 
 def with_status(vm: M.VM, value: U32) -> M.VM:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, value, ex, result, out, err, max, steps}
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, value, ex, result, out, err, max, steps, host}
 
 def with_result(vm: M.VM, value: M.Slot) -> M.VM:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, value, out, err, max, steps}
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, value, out, err, max, steps, host}
+
 def result_slot(vm: M.VM) -> M.Slot:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, value, out, err, max, steps} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, value, out, err, max, steps, host} = vm
   value
 
-
 def with_exception(vm: M.VM, value: U32) -> M.VM:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, value, result, out, err, max, steps}
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, value, result, out, err, max, steps, host}
+
+def host_cwd_of(h: M.Host) -> String:
+  match h:
+    case M.Host{effect, cwd, caps, maxPayload, cont}: cwd
+
+def host_caps_of(h: M.Host) -> U32:
+  match h:
+    case M.Host{effect, cwd, caps, maxPayload, cont}: caps
+
+def host_effect_of(h: M.Host) -> M.Effect:
+  match h:
+    case M.Host{effect, cwd, caps, maxPayload, cont}: effect
+
+def host_effect(vm: M.VM) -> M.Effect:
+  host_effect_of(host(vm))
+
+
+def host_cont_of(h: M.Host) -> +List<M.Cont>:
+  match h:
+    case M.Host{effect, cwd, caps, maxPayload, cont}: cont
+
+def with_host(vm: M.VM, value: M.Host) -> M.VM:
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, value}
+
+def with_effect_on(vm: M.VM, effect: M.Effect, h: M.Host) -> M.VM:
+  match h:
+    case M.Host{old, cwd, caps, maxPayload, cont}:
+      with_host(vm, M.Host{effect, cwd, caps, maxPayload, cont})
+
+def with_effect(+vm: M.VM, effect: M.Effect) -> M.VM:
+  with_effect_on(vm, effect, host(vm))
+
+def with_cont_on(vm: M.VM, cont: +List<M.Cont>, h: M.Host) -> M.VM:
+  match h:
+    case M.Host{effect, cwd, caps, maxPayload, old}:
+      with_host(vm, M.Host{effect, cwd, caps, maxPayload, cont})
+
+def with_cont(+vm: M.VM, cont: +List<M.Cont>) -> M.VM:
+  with_cont_on(vm, cont, host(vm))
+
+def with_launch_on(vm: M.VM, cwd: String, caps: U32, h: M.Host) -> M.VM:
+  match h:
+    case M.Host{effect, old_cwd, old_caps, maxPayload, cont}:
+      with_host(vm, M.Host{effect, cwd, caps, maxPayload, cont})
+
+def with_launch(+vm: M.VM, cwd: String, caps: U32) -> M.VM:
+  with_launch_on(vm, cwd, caps, host(vm))
 
 def emit(vm: M.VM, line: String) -> M.VM:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, Con{line, out}, err, max, steps}
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, Con{line, out}, err, max, steps, host}
 
 def fail(vm: M.VM, message: String) -> M.VM:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, 4, ex, result, out, message, max, steps}
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, 4, ex, result, out, message, max, steps, host}
 
 def tick(vm: M.VM) -> M.VM:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps} = vm
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, 1n+steps}
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, 1n+steps, host}
 
 def method_id(frame: M.Frame) -> U32:
   M.Frame{method, pc0, invoke, ls, stk, init} = frame

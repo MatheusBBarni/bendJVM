@@ -1,6 +1,6 @@
 # Plan: Java runtime expansion
 
-Status: planned; no runtime changes implemented.
+Status: implemented; verified by `python3 scripts/test.py --full` (90 passed) and `bend PROOF.bend`.
 Source: `ROADMAP.md`, milestone 2.
 Related plan: [JAR and classpath loading](01-jar-and-classpath-loading.md).
 
@@ -16,18 +16,14 @@ This is a defined standard-library compatibility slice, not an OpenJDK replaceme
 | Expand file, stream, collection, and networking support | In-memory and file streams, UTF-8 readers/writers, lists/maps/iterators, and blocking TCP client/server APIs |
 | Improve exception and resource handling | Typed throwable objects, complete frame unwinding, causes/suppression, try-with-resources, and deterministic host-handle cleanup |
 
-## Current implementation and blockers
+## Current implementation
 
-Grounded in the current repository, not in completion of the previous plan:
-
-- `bendjvm/loader/bootstrap.bend:classes` synthesizes Object, String, System, PrintStream, a small exception hierarchy, and marker types. String currently has no registered methods.
-- `bootstrap.bend:intrinsic_desc` recognizes a small set of signatures with numeric IDs. Its constructor branch is not restricted to an exact class/descriptor allowlist. New library constructors must not accidentally become no-ops through this mechanism.
-- `bendjvm/java/intrinsic.bend:execute` accepts a heap snapshot and arguments, returning only an optional output string. It cannot express a returned Java value, updated heap, thrown object, or suspended host operation. Exception constructors currently do not retain messages.
-- `bendjvm/runtime/execute.bend:athrow_popped` replaces a non-null thrown reference with the string `ThrownException`. `exception_handler` checks protected PC ranges but ignores catch types. Handler entry pushes a null reference; an unmatched immediate caller stops unwinding instead of searching all ancestors.
-- Decoder and verifier support `invokeinterface` (185), but runtime dispatch has no corresponding execution case. Real `List`, `Map`, `Iterator`, and `AutoCloseable` use requires this prerequisite.
-- `bendjvm/heap/heap.bend` already provides object/array/string entries, allocation limits, and hierarchy/assignability helpers. Reuse these rather than storing Java objects in Python or JavaScript.
-- The practical execution surface is `scripts/run.py` plus generated loader/runtime artifacts. `bendjvm/main.bend` is another caller that must stay consistent with shared API changes.
-- `scripts/test.py` is the existing temporary-fixture/OpenJDK differential harness. `bendjvm-spec.md` sections 110–111 explicitly prefer a small synthetic MiniJRE before broad OpenJDK library compatibility.
+The MiniJRE slice is implemented as synthetic bootstrap classes plus Bend
+intrinsics. Exact registrations are in `bendjvm/loader/bootstrap.bend`.
+`java/outcome.bend` is the typed intrinsic result. `invokeinterface` uses the
+existing virtual lookup. Host file/TCP effects resume in `scripts/run.py`.
+Historical blockers in earlier drafts of this section (output-only intrinsics,
+stringless `athrow`, missing `invokeinterface`) are closed.
 
 ## Dependencies and milestone boundaries
 

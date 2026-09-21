@@ -2,15 +2,10 @@
 
 ## Current position
 
-Milestone 1 runs Java 8 applications from standalone classes, ordered directory
-classpaths, JARs, and ZIPs. It resolves the selected class's transitive
-application closure, reads dependency resources, and launches executable JARs
-through manifest metadata.
-
-The host owns source indexing, bounded archive bytes, manifest expansion, and
-the structured launch request. Bend owns class parsing/linking, entry
-validation, argument-array allocation, resource lookup, stream state, and VM
-execution.
+Milestone 2 is complete: a Bend-owned MiniJRE runs small Java 8 apps that
+use strings, collections, resources, files, blocking TCP, and try-with-resources.
+Milestone 1 classpath/JAR/resource startup is unchanged. Host JDK classes are
+not loaded.
 
 ## Spring Boot target
 
@@ -21,7 +16,7 @@ basic JAR/classpath/resource startup, but Spring Boot still requires:
 - Dynamic proxies.
 - `invokedynamic`.
 - Threads and synchronization.
-- Native libraries, sockets, NIO, and TLS.
+- Native libraries, NIO, and TLS.
 - A much larger Java standard library and nested-JAR launcher support.
 
 Without these features, a Spring Boot application would fail when it loads
@@ -36,11 +31,13 @@ missing runtime classes or reaches unsupported bytecode.
 - Load resources from dependency archives through the MiniJRE stream slice.
 - Support manifest `Main-Class` startup and local transitive `Class-Path`.
 
-### 2. Java runtime expansion
+### 2. Java runtime expansion — complete
 
-- Add the standard library classes needed by common applications.
-- Expand file, stream, collection, and networking support.
-- Improve exception and resource handling.
+- Object, Objects, String, StringBuilder, Integer, Math, and `System.arraycopy`.
+- ArrayList/HashMap plus collection interfaces, with `invokeinterface`.
+- Memory and file streams, UTF-8 readers/writers, `BufferedReader.readLine`, and TWR.
+- Blocking TCP client/server sockets with host resume, capability flags, and handle teardown.
+- Typed throwables, catch-type unwinding, and a packaged integrated-app check.
 
 ### 3. Reflection and metadata
 

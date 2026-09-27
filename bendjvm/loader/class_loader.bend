@@ -11,9 +11,25 @@ type Inspected is Data:
   Inspected{name: String, dependencies: +List<String>}
 
 
+def primitive_mirror_entries(+names: +List<String>) -> +List<M.HeapEntry>:
+  +mirror_class : U32 = S.find(names, "java/lang/Class")
+  [M.HeapEntry{mirror_class, 8, S.find(names, "boolean"), Nil{}, Nil{}, Nil{}},
+   M.HeapEntry{mirror_class, 8, S.find(names, "byte"), Nil{}, Nil{}, Nil{}},
+   M.HeapEntry{mirror_class, 8, S.find(names, "char"), Nil{}, Nil{}, Nil{}},
+   M.HeapEntry{mirror_class, 8, S.find(names, "short"), Nil{}, Nil{}, Nil{}},
+   M.HeapEntry{mirror_class, 8, S.find(names, "int"), Nil{}, Nil{}, Nil{}},
+   M.HeapEntry{mirror_class, 8, S.find(names, "long"), Nil{}, Nil{}, Nil{}},
+   M.HeapEntry{mirror_class, 8, S.find(names, "float"), Nil{}, Nil{}, Nil{}},
+   M.HeapEntry{mirror_class, 8, S.find(names, "double"), Nil{}, Nil{}, Nil{}},
+   M.HeapEntry{mirror_class, 8, S.find(names, "void"), Nil{}, Nil{}, Nil{}}]
+
 def bootstrap_heap(+names: +List<String>) -> +List<M.HeapEntry>:
-  [M.HeapEntry{S.find(names, "java/io/PrintStream"), 0, 0, Nil{}, Nil{}, Nil{}},
-   M.HeapEntry{S.find(names, "java/lang/OutOfMemoryError"), 0, 0, [M.Binding{0, M.Slot{3, 0}}, M.Binding{1, M.Slot{3, 0}}, M.Binding{2, M.Slot{3, 0}}, M.Binding{3, M.Slot{1, 0}}], Nil{}, Nil{}}]
+  M.append(M.HeapEntry,
+    [M.HeapEntry{S.find(names, "java/io/PrintStream"), 0, 0, Nil{}, Nil{}, Nil{}},
+     M.HeapEntry{S.find(names, "java/lang/OutOfMemoryError"), 0, 0, [M.Binding{0, M.Slot{3, 0}}, M.Binding{1, M.Slot{3, 0}}, M.Binding{2, M.Slot{3, 0}}, M.Binding{3, M.Slot{1, 0}}], Nil{}, Nil{}},
+     M.HeapEntry{S.find(names, "java/lang/Boolean"), 0, 0, [M.Binding{0, M.Slot{1, 1}}], Nil{}, Nil{}},
+     M.HeapEntry{S.find(names, "java/lang/Boolean"), 0, 0, [M.Binding{0, M.Slot{1, 0}}], Nil{}, Nil{}}],
+    primitive_mirror_entries(names))
 
 def set_static(xs: +List<M.Binding>, +id: U32, +value: M.Slot) -> +List<M.Binding>:
   match xs:
@@ -26,11 +42,37 @@ def patch_out(fields: +List<M.LoadedField>, +symbols: +List<String>, +statics: +
     case Nil{}: statics
     case Con{+field, rest}:
       patch_out(rest, symbols, Bool.pick(+List<M.Binding>, String.eq(S.text(symbols, M.loaded_field_name(field)), "out"), set_static(statics, M.loaded_field_id(field), M.Slot{3, 1}), statics))
+def primitive_type_reference(+owner: String) -> U32:
+  Bool.pick(U32, String.eq(owner, "java/lang/Boolean"), 5,
+  Bool.pick(U32, String.eq(owner, "java/lang/Byte"), 6,
+  Bool.pick(U32, String.eq(owner, "java/lang/Character"), 7,
+  Bool.pick(U32, String.eq(owner, "java/lang/Short"), 8,
+  Bool.pick(U32, String.eq(owner, "java/lang/Integer"), 9,
+  Bool.pick(U32, String.eq(owner, "java/lang/Long"), 10,
+  Bool.pick(U32, String.eq(owner, "java/lang/Float"), 11,
+  Bool.pick(U32, String.eq(owner, "java/lang/Double"), 12,
+  Bool.pick(U32, String.eq(owner, "java/lang/Void"), 13, 0)))))))))
+
+def patch_type_fields(fields: +List<M.LoadedField>, +symbols: +List<String>, +names: +List<String>, +statics: +List<M.Binding>) -> +List<M.Binding>:
+  match fields:
+    case Nil{}: statics
+    case Con{+field, rest}:
+      +field_name : String = S.text(symbols, M.loaded_field_name(field))
+      +owner_name : String = S.text(names, M.loaded_field_owner(field))
+      +reference : U32 = primitive_type_reference(owner_name)
+      +next : +List<M.Binding> = patch_type_fields(rest, symbols, names, statics)
+      Bool.pick(+List<M.Binding>, String.eq(field_name, "TYPE") && U32.is_ne(reference, 0), set_static(next, M.loaded_field_id(field), M.Slot{3, reference}),
+      Bool.pick(+List<M.Binding>, String.eq(owner_name, "java/lang/Boolean") && String.eq(field_name, "TRUE"), set_static(next, M.loaded_field_id(field), M.Slot{3, 3}),
+        Bool.pick(+List<M.Binding>, String.eq(owner_name, "java/lang/Boolean") && String.eq(field_name, "FALSE"), set_static(next, M.loaded_field_id(field), M.Slot{3, 4}), next)))
+
 
 def vm_from(catalog: C.Catalog, classes: +List<M.LoadedClass>, resources: +List<M.Resource>, maxHeap: U32) -> M.VM:
   match catalog:
-    case C.Catalog{sources, names, +symbols, +fields, methods}:
-      M.VM{classes, methods, fields, symbols, bootstrap_heap(names), patch_out(fields, symbols, C.static_fields(fields, Nil{})), resources, Nil{}, 0, 0, M.Slot{0, 0}, Nil{}, "", maxHeap, 0n, M.idle_host()}
+    case C.Catalog{sources, +names, +symbols, +fields, methods, metadata}:
+      host : M.Host = M.Host{M.Idle{}, ".", 3, 16777216, Nil{}, metadata}
+      statics : +List<M.Binding> = C.static_fields(fields, Nil{})
+      patched : +List<M.Binding> = patch_type_fields(fields, symbols, names, patch_out(fields, symbols, statics))
+      M.VM{classes, methods, fields, symbols, bootstrap_heap(names), patched, resources, Nil{}, 0, 0, M.Slot{0, 0}, Nil{}, "", maxHeap, 0n, host}
 
 def parse_classes(values: +List<+List<U32>>, +acc: +List<M.ClassFile>) -> Result<&2, &2, String, +List<M.ClassFile>>:
   match values:

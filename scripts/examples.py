@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compile and run the Java examples through BendJVM.
+"""Compile, run, and verify the Java examples through BendJVM.
 
 Run from the project root:
   python3 scripts/examples.py
@@ -22,6 +22,18 @@ ROOT = Path(__file__).resolve().parents[1]
 EXAMPLES = ROOT / "examples"
 DEFAULT_RUNNER = ROOT / "scripts" / "run.py"
 
+EXPECTED_OUTPUT = {
+    "ArithmeticAndBranches": "37\n55\n24\ntrue\n",
+    "ArraysAndStrings": "array sum\n14\ntrue\nBend\n",
+    "CollectionsAndText": "BendJVM\n2\ntrue\n2\ntrue\ntrue\n",
+    "Exceptions": "5\n0\n4\nbad\n",
+    "FilesAndTryWithResources": "true\n65\nhi\n-2\n",
+    "HelloWorld": "Hello from BendJVM\n42\n",
+    "ObjectsAndDispatch": "10\n11\n4\ntrue\nfalse\n",
+    "ReflectionAndConfiguration": "true\ntrue\n12\n10\nBendJVM\n",
+    "StaticInitialization": "6\n12\n18\n",
+    "TcpLoopback": "66\ntrue\n",
+}
 
 def execute(command: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
@@ -99,6 +111,15 @@ def main() -> int:
                     print(f"FAIL {source.stem}", file=sys.stderr)
                     print(textwrap.indent(result.stdout, "  "), end="", file=sys.stderr)
                     print(textwrap.indent(result.stderr, "  "), end="", file=sys.stderr)
+                    return 1
+                expected = EXPECTED_OUTPUT.get(source.stem)
+                if expected is None:
+                    print(f"FAIL {source.stem}: missing expected output", file=sys.stderr)
+                    return 1
+                if result.stdout != expected:
+                    print(f"FAIL {source.stem}: output mismatch", file=sys.stderr)
+                    print(f"expected: {expected!r}", file=sys.stderr)
+                    print(f"actual:   {result.stdout!r}", file=sys.stderr)
                     return 1
                 print(f"PASS {source.stem}")
                 if result.stdout:

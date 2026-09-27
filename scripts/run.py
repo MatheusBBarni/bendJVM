@@ -67,7 +67,7 @@ class ClassInfo:
 class Launch:
     entry: str
     classes: tuple[SourceMatch, ...]
-    resources: tuple[tuple[str, bytes], ...]
+    resources: tuple[tuple[str, bytes, str], ...]
     app_args: tuple[str, ...]
     flags: tuple[str, ...]
     mode: int
@@ -78,8 +78,18 @@ class Launch:
 BOOTSTRAP_NAMES = {
     "java/lang/Object", "java/lang/String", "java/lang/StringBuilder", "java/lang/Integer",
     "java/lang/Math", "java/util/Objects", "java/lang/System", "java/io/PrintStream",
-    "java/lang/ClassLoader", "java/lang/Class", "java/lang/Cloneable", "java/io/Serializable",
-    "java/lang/Throwable", "java/lang/Exception", "java/lang/RuntimeException", "java/lang/Error",
+    "java/lang/Integer", "java/lang/Byte", "java/lang/Short", "java/lang/Character", "java/lang/Float", "java/lang/Void",
+    "java/lang/Boolean", "java/lang/Enum", "java/util/Enumeration", "java/util/ResourceEnumeration",
+    "java/lang/ClassLoader", "java/lang/Class", "java/net/URL",
+    "java/lang/reflect/AccessibleObject", "java/lang/reflect/Field", "java/lang/reflect/Method",
+    "java/lang/reflect/Constructor", "java/lang/reflect/AnnotatedType", "java/lang/reflect/InvocationHandler", "java/lang/reflect/Proxy", "java/lang/annotation/Annotation", "[Ljava/lang/annotation/Annotation;", "[[Ljava/lang/annotation/Annotation;", "java/lang/annotation/Retention", "java/lang/annotation/Target", "java/lang/annotation/Inherited", "java/lang/annotation/Documented", "java/lang/annotation/Repeatable",
+    "java/lang/annotation/RetentionPolicy", "java/lang/AnnotationEnumCache", "java/lang/annotation/ElementType",
+    "java/lang/AssertionError",
+    "java/lang/Cloneable", "java/io/Serializable",
+    "java/lang/Throwable", "java/lang/Exception", "java/lang/ReflectiveOperationException",
+    "java/lang/IllegalAccessException", "java/lang/InstantiationException",
+    "java/lang/ClassNotFoundException", "java/lang/NoSuchFieldException", "java/lang/NoSuchMethodException",
+    "java/lang/RuntimeException", "java/lang/reflect/UndeclaredThrowableException", "java/lang/Error",
     "java/lang/ArithmeticException", "java/lang/NullPointerException",
     "java/lang/IndexOutOfBoundsException", "java/lang/ArrayIndexOutOfBoundsException",
     "java/lang/StringIndexOutOfBoundsException", "java/lang/ClassCastException",
@@ -96,7 +106,7 @@ BOOTSTRAP_NAMES = {
     "java/net/SocketException", "java/net/ConnectException", "java/net/UnknownHostException",
     "java/net/SocketTimeoutException",
     "java/lang/AutoCloseable", "java/io/Closeable", "java/io/Flushable",
-    "java/lang/Iterable", "java/util/Iterator", "java/util/Collection", "java/util/List",
+    "java/lang/Iterable", "java/util/Iterator", "java/util/Collection", "java/util/List", "java/util/Properties",
     "java/util/Map", "java/util/ArrayList", "java/util/ArrayList$Itr", "java/util/HashMap",
     "java/io/InputStream", "java/io/OutputStream",
     "java/io/ByteArrayInputStream", "java/io/ByteArrayOutputStream",
@@ -107,6 +117,8 @@ BOOTSTRAP_NAMES = {
     "java/net/ServerSocket", "java/io/SocketInputStream", "java/io/SocketOutputStream",
     "[Ljava/lang/String;", "[B", "[C", "[Ljava/lang/Object;", "[Ljava/lang/Throwable;",
     "[Z", "[S", "[I", "[F",
+    "[Ljava/lang/reflect/Field;", "[Ljava/lang/reflect/Method;", "[Ljava/lang/reflect/Constructor;",
+    "[Ljava/lang/Class;", "[Ljava/lang/reflect/AnnotatedType;", "[Ljava/lang/annotation/Annotation;", "[[Ljava/lang/annotation/Annotation;",
 }
 
 
@@ -458,7 +470,9 @@ process.on("exit", closeAll);
 const requestText = readFileSync(process.env.BENDJVM_REQUEST || "", "utf8");
 let request;
 try {{ request = JSON.parse(requestText); }} catch (error) {{ console.error(`InvalidLaunchRequest: ${{error}}`); process.exit(1); }}
-if (request.version !== 1 || !Array.isArray(request.classes) || !Array.isArray(request.resources)) {{
+if (request.version !== 1 || !Array.isArray(request.classes) || !Array.isArray(request.resources) ||
+    !request.resources.every(value => value && typeof value.name === "string" &&
+      typeof value.bytes === "string" && typeof value.origin === "string")) {{
   console.error("InvalidLaunchRequest: unsupported protocol"); process.exit(1);
 }}
 if (request.mode === 4) {{
@@ -472,7 +486,7 @@ if (request.mode === 4) {{
   process.exit(0);
 }}
 const bytes = list(request.classes.map(value => list([...Buffer.from(value.bytes, "base64")])));
-const resources = list(request.resources.map(value => ({{ $: "Resource", name: value.name, bytes: list([...Buffer.from(value.bytes, "base64")]) }})));
+const resources = list(request.resources.map(value => ({{ $: "Resource", name: value.name, bytes: list([...Buffer.from(value.bytes, "base64")]), origin: value.origin }})));
 const loaded = loader.loadManyWithResources(bytes, resources, request.maxHeap);
 if (loaded.$ === "Fail") fail(loaded.error);
 const symbols = listValues(loaded.value.symbols);
@@ -585,29 +599,29 @@ def _inspect_many(matches: list[SourceMatch]) -> list[ClassInfo]:
     return infos
 
 
-def _resources(classpath: Classpath) -> tuple[tuple[str, bytes], ...]:
-    found: dict[str, bytes] = {}
+def _resources(classpath: Classpath) -> tuple[tuple[str, bytes, str], ...]:
+    found: list[tuple[str, bytes, str]] = []
     for source in classpath.sources:
         if hasattr(source, "_entries"):
             names = sorted(getattr(source, "_entries"))
             for name in names:
                 if name.endswith("/") or name.endswith(".class") or name == "META-INF/MANIFEST.MF":
                     continue
-                if name in found:
-                    continue
                 match = source.find_resource(name)
                 if match is not None:
-                    found[name] = match.data
+                    found.append((match.name, match.data, match.origin))
         elif hasattr(source, "path") and Path(source.path).is_dir():
             root = Path(source.path)
             for path in sorted(root.rglob("*")):
                 if not path.is_file():
                     continue
                 name = path.relative_to(root).as_posix()
-                if name.endswith(".class") or name in found:
+                if name.endswith(".class"):
                     continue
-                found[name] = path.read_bytes()
-    return tuple(found.items())
+                match = source.find_resource(name)
+                if match is not None:
+                    found.append((match.name, match.data, match.origin))
+    return tuple(found)
 
 
 def _closure(classpath: Classpath, entry: str, selected: SourceMatch) -> tuple[SourceMatch, ...]:
@@ -632,6 +646,20 @@ def _closure(classpath: Classpath, entry: str, selected: SourceMatch) -> tuple[S
             if info.name != name:
                 raise ClasspathError(f"{match.origin}: declared class {info.name!r} does not match requested {name!r}")
             pending.extend((dependency, None, name) for dependency in info.dependencies if dependency not in matches)
+    for source in classpath.sources:
+        for match in source.class_matches():
+            if not match.data.startswith(b"\xca\xfe\xba\xbe"):
+                continue
+            name = match.name[:-6]
+            if not name or name in matches or name in BOOTSTRAP_NAMES:
+                continue
+            try:
+                info = _inspect_many([match])[0]
+            except ClasspathError:
+                continue
+            if info.name != name:
+                continue
+            matches[name] = match
     return tuple(matches.values())
 
 
@@ -750,7 +778,7 @@ def _request(launch: Launch) -> str:
         "cwd": os.getcwd(),
         "caps": (0 if "--no-files" in launch.flags else 1) | (0 if "--no-net" in launch.flags else 2),
         "classes": [{"name": match.name, "origin": match.origin, "bytes": base64.b64encode(match.data).decode("ascii")} for match in launch.classes],
-        "resources": [{"name": name, "bytes": base64.b64encode(data).decode("ascii")} for name, data in launch.resources],
+        "resources": [{"name": name, "bytes": base64.b64encode(data).decode("ascii"), "origin": origin} for name, data, origin in launch.resources],
     }
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 

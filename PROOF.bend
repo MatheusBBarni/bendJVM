@@ -1,3 +1,5 @@
+# This proof gate covers the pure law above; milestone-3 VM/host behavior is
+# documented without claiming a proof over effectful state transitions.
 import Base
 import ./LAWS.bend as Laws
 

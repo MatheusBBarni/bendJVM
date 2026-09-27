@@ -36,7 +36,8 @@ NAMED = (
     "HelloInteger", "Arithmetic", "Branching", "WhileLoop", "ForLoop",
     "StaticMethod", "RecursiveMethod", "MultipleArguments", "ObjectCreation",
     "Fields", "VirtualMethod", "IntArray", "ObjectArray", "StringConstant",
-    "Println", "ExceptionCaught", "ExceptionUncaught",
+    "Println", "ExceptionCaught", "ExceptionUncaught", "MetadataFixture",
+    "ReflectionAccess", "RepeatableAnnotation", "InheritedAnnotation", "EnumAnnotation", "ProxyIntegration", "ProxyExceptions", "DynamicLoadingFailure", "ReflectionIntegration", "CrossPackageReflection",
 )
 EXTENDED = (
     "FloatOperations", "FloatArray", "InheritedFields", "ClassInitialization",
@@ -47,6 +48,9 @@ EXTENDED = (
     "TcpRefused", "TcpTimeout", "SuppressionTWR",
 )
 SUPPORT = ("FuelLimit", "HeapLimit", "MutationTarget")
+FIXTURE_DEPENDENCIES = {
+    "CrossPackageReflection": ("CrossPackageTarget.java",),
+}
 
 FixtureValue = bytes | bytearray | memoryview | str
 FixtureEntries = Mapping[str, FixtureValue]
@@ -297,6 +301,7 @@ class ClassLayout:
     utf: dict[int, str]
     this_class_offset: int
     methods: dict[str, CodeAttribute]
+    attributes: dict[str, list[tuple[int, int]]]
 
 
 def u2(data: bytes, offset: int) -> int:
@@ -333,23 +338,33 @@ def class_layout(data: bytes) -> ClassLayout:
     interfaces = u2(data, position)
     position += 2 + interfaces * 2
     methods = {}
+    attributes: dict[str, list[tuple[int, int]]] = {}
     for section in ("fields", "methods"):
         members = u2(data, position)
         position += 2
         for _ in range(members):
             name = utf[u2(data, position + 2)]
-            attributes = u2(data, position + 6)
+            attribute_count = u2(data, position + 6)
             position += 8
-            for _ in range(attributes):
+            for _ in range(attribute_count):
                 attribute_name = utf[u2(data, position)]
                 length_offset = position + 2
                 length = u4(data, length_offset)
                 payload_start = position + 6
                 position = payload_start + length
+                attributes.setdefault(attribute_name, []).append((payload_start, length))
                 if section == "methods" and attribute_name == "Code":
                     methods[name] = CodeAttribute(length_offset, payload_start,
                                                   position, u2(data, payload_start + 2))
-    return ClassLayout(pool, utf, this_class_offset, methods)
+    class_attribute_count = u2(data, position)
+    position += 2
+    for _ in range(class_attribute_count):
+        attribute_name = utf[u2(data, position)]
+        length = u4(data, position + 2)
+        payload_start = position + 6
+        position = payload_start + length
+        attributes.setdefault(attribute_name, []).append((payload_start, length))
+    return ClassLayout(pool, utf, this_class_offset, methods, attributes)
 
 
 def patch(data: bytes, offset: int, replacement: bytes) -> bytes:
@@ -525,6 +540,53 @@ class Suite:
             require(not reference.stderr, f"reference stderr\n{reference.detail()}")
             require(not actual.stderr, f"unexpected Bend stderr\n{actual.detail()}")
 
+    def metadata(self, directory: Path) -> None:
+        probe = execute(
+            [self.args.java, "-Dfile.encoding=UTF-8", "-cp", str(self.classes),
+             "MetadataFixture$Probe"],
+            self.args.timeout,
+        )
+        require(probe.code == 0, f"metadata probe failed\n{probe.detail()}")
+        same_output("metadata-probe\n", probe.stdout, probe.detail())
+        require(not probe.stderr, f"metadata probe stderr\n{probe.detail()}")
+
+        original_path = self.classes / "MetadataFixture$Annotated.class"
+        original = original_path.read_bytes()
+        layout = class_layout(original)
+        required = (
+            "RuntimeVisibleAnnotations", "RuntimeInvisibleAnnotations",
+            "RuntimeVisibleTypeAnnotations", "RuntimeInvisibleTypeAnnotations",
+            "RuntimeVisibleParameterAnnotations",
+            "RuntimeInvisibleParameterAnnotations", "Exceptions",
+        )
+        for attribute_name in required:
+            require(layout.attributes.get(attribute_name),
+                    f"metadata fixture is missing {attribute_name}")
+        defaults = class_layout((self.classes / "MetadataFixture$Visible.class").read_bytes())
+        require(defaults.attributes.get("AnnotationDefault"),
+                "metadata fixture is missing AnnotationDefault")
+        visible = max(layout.attributes["RuntimeVisibleAnnotations"],
+                     key=lambda item: item[1], default=None)
+        require(visible is not None and visible[1] >= 9,
+                "metadata fixture has no class annotation payload")
+        payload_start, payload_length = visible
+        require(payload_length >= 9 and u2(original, payload_start) == 1,
+                "metadata fixture class annotation count changed")
+        malformed = bytearray(original)
+        malformed[payload_start + 8] = 0xFF
+        malformed_root = directory / "metadata-malformed"
+        malformed_root.mkdir()
+        (malformed_root / original_path.name).write_bytes(malformed)
+        rejected = execute(
+            [self.args.java, "-Dfile.encoding=UTF-8", "-cp",
+             os.pathsep.join((str(malformed_root), str(self.classes))),
+             "MetadataFixture$Probe"],
+            self.args.timeout,
+        )
+        require(rejected.code > 0, f"malformed annotation was accepted\n{rejected.detail()}")
+        require("AnnotationFormatError" in rejected.stdout + "\n" + rejected.stderr,
+                f"malformed annotation had the wrong rejection\n{rejected.detail()}")
+
     def reject(self, path: Path, category: str, *flags: str) -> None:
         result = self.bend(path, *flags)
         require(result.code > 0, f"expected rejection (not a signal crash)\n{result.detail()}")
@@ -674,6 +736,29 @@ class Suite:
             require(result.code == 0, f"classpath/{name} failed\n{result.detail()}")
             same_output(expected, result.stdout, result.detail())
 
+        dynamic_source = directory / "DynamicLookup.java"
+        dynamic_source.write_text(
+            "package fixture.dynamic; public class DynamicLookup { "
+            "public static void main(String[] args) throws Exception { "
+            "System.out.println(Class.forName(\"fixture.dynamic.ConfigOnly\").getName()); } }",
+            encoding="utf-8",
+        )
+        dynamic = compile_sources(directory / "dynamic-compiled", dynamic_source)
+        dynamic_app = write_fixture_directory(
+            directory / "dynamic-app",
+            {name: value for name, value in dynamic.items() if name.endswith("DynamicLookup.class")},
+        )
+        dynamic_dependency_source = directory / "ConfigOnly.java"
+        dynamic_dependency_source.write_text(
+            "package fixture.dynamic; public class ConfigOnly { }",
+            encoding="utf-8",
+        )
+        dynamic_dependency = compile_sources(directory / "dynamic-dependency-compiled", dynamic_dependency_source)
+        dynamic_archive = write_fixture_jar(directory / "dynamic dependency.jar", dynamic_dependency)
+        result = self.cli("-cp", os.pathsep.join((str(dynamic_app), str(dynamic_archive))), "fixture.dynamic.DynamicLookup")
+        require(result.code == 0, f"classpath/configuration-only loading failed\n{result.detail()}")
+        same_output("fixture.dynamic.ConfigOnly\n", result.stdout, result.detail())
+
         duplicate_main = compile_sources(
             directory / "duplicate-compiled",
             fixture / "DuplicatePrecedenceMain.java",
@@ -710,7 +795,100 @@ class Suite:
                           "fixture.resource.ResourceConsumer")
         require(result.code == 0, f"classpath/resource failed\n{result.detail()}")
         same_output("0\n1\n127\n128\n255\n", result.stdout, result.detail())
-
+        enumeration_source = directory / "ResourceEnumerationConsumer.java"
+        enumeration_source.write_text(
+            "package fixture.resource; import java.io.InputStream; import java.net.URL; "
+            "import java.util.Enumeration; "
+            "public class ResourceEnumerationConsumer { public static void main(String[] args) throws Exception { "
+            "Enumeration<URL> resources = ClassLoader.getSystemResources(\"fixture-resource.bin\"); "
+            "while (resources.hasMoreElements()) { URL url = resources.nextElement(); "
+            "System.out.println(url.getProtocol().equals(\"jar\")); "
+            "System.out.println(url.toExternalForm().charAt(0)); "
+            "InputStream stream = url.openStream(); System.out.println(stream.read()); stream.close(); } } }",
+            encoding="utf-8",
+        )
+        enumeration = compile_sources(directory / "resource-enumeration-compiled", enumeration_source)
+        enumeration_app = write_fixture_directory(directory / "resource-enumeration-app", enumeration)
+        first_archive = write_fixture_jar(
+            directory / "resource-first.jar",
+            resources={"fixture-resource.bin": bytes((9,))},
+        )
+        second_archive = write_fixture_jar(
+            directory / "resource-second.jar",
+            resources={"fixture-resource.bin": bytes((8,))},
+        )
+        result = self.cli(
+            "-cp",
+            os.pathsep.join((str(enumeration_app), str(first_archive), str(second_archive))),
+            "fixture.resource.ResourceEnumerationConsumer",
+        )
+        require(result.code == 0, f"classpath/resource enumeration failed\n{result.detail()}")
+        same_output("true\nj\n9\ntrue\nj\n8\n", result.stdout, result.detail())
+        properties_source = directory / "PropertiesConsumer.java"
+        properties_source.write_text(
+            "package fixture.resource; import java.io.InputStream; import java.io.InputStreamReader; import java.io.Reader; import java.util.Properties; "
+            "public class PropertiesConsumer { public static void main(String[] args) throws Exception { "
+            "InputStream stream = ClassLoader.getSystemResourceAsStream(\"fixture.properties\"); "
+            "Properties properties = new Properties(); properties.load(stream); stream.close(); "
+            "System.out.println(properties.getProperty(\"accent\")); "
+            "System.out.println(properties.getProperty(\"unicode\")); "
+            "System.out.println(properties.getProperty(\"joined\")); "
+            "System.out.println(properties.getProperty(\"escaped:key\")); "
+            "System.out.println(properties.getProperty(\"duplicate\")); "
+            "System.out.println(properties.getProperty(\"missing\", \"fallback\")); "
+            "InputStream malformed = ClassLoader.getSystemResourceAsStream(\"bad.properties\"); "
+            "try { new Properties().load(malformed); System.out.println(false); } "
+            "catch (IllegalArgumentException error) { System.out.println(true); } "
+            "Reader reader = new InputStreamReader(ClassLoader.getSystemResourceAsStream(\"reader.properties\"), \"UTF-8\"); "
+            "Properties readerProperties = new Properties(); readerProperties.load(reader); "
+            "System.out.println(readerProperties.getProperty(\"accent\")); "
+            "System.out.println(readerProperties.getProperty(\"unicode\")); } }",
+            encoding="utf-8",
+        )
+        properties = compile_sources(directory / "properties-compiled", properties_source)
+        properties_app = write_fixture_directory(directory / "properties-app", properties)
+        properties_archive = write_fixture_jar(
+            directory / "properties.jar",
+            resources={"fixture.properties": b"# comment\naccent=caf\xe9\nunicode=\\u263A\njoined=hello\\\n  world\nescaped\\:key=value\\=x\nduplicate=first\nduplicate=second\n", "bad.properties": b"bad=\\u12G4\n", "reader.properties": "accent=café\nunicode=☃\n".encode("utf-8")},
+        )
+        result = self.cli(
+            "-cp",
+            os.pathsep.join((str(properties_app), str(properties_archive))),
+            "fixture.resource.PropertiesConsumer",
+        )
+        require(result.code == 0, f"classpath/properties failed\n{result.detail()}")
+        same_output("café\n☺\nhelloworld\nvalue=x\nsecond\nfallback\ntrue\ncafé\n☃\n", result.stdout, result.detail())
+        class_resource_source = directory / "ClassResourceConsumer.java"
+        class_resource_source.write_text(
+            "package fixture.resource; import java.io.InputStream; "
+            "public class ClassResourceConsumer { public static void main(String[] args) throws Exception { "
+            "InputStream relative = ClassResourceConsumer.class.getResourceAsStream(\"class.properties\"); "
+            "InputStream dot = ClassResourceConsumer.class.getResourceAsStream(\"./class.properties\"); "
+            "InputStream parent = ClassResourceConsumer.class.getResourceAsStream(\"../resource/class.properties\"); "
+            "InputStream absolute = ClassResourceConsumer.class.getResourceAsStream(\"/fixture/resource/class.properties\"); "
+            "InputStream root = ClassResourceConsumer.class.getResourceAsStream(\"/root.properties\"); "
+            "System.out.println(relative == null); System.out.println(dot == null); "
+            "System.out.println(parent == null); System.out.println(absolute == null); System.out.println(root == null); "
+            "if (relative != null) System.out.println(relative.read()); "
+            "if (dot != null) System.out.println(dot.read()); "
+            "if (parent != null) System.out.println(parent.read()); "
+            "if (absolute != null) System.out.println(absolute.read()); "
+            "if (root != null) System.out.println(root.read()); } }",
+            encoding="utf-8",
+        )
+        class_resource = compile_sources(directory / "class-resource-compiled", class_resource_source)
+        class_resource_app = write_fixture_directory(directory / "class-resource-app", class_resource)
+        class_resource_archive = write_fixture_jar(
+            directory / "class-resource.jar",
+            resources={"fixture/resource/class.properties": b"r", "root.properties": b"root"},
+        )
+        result = self.cli(
+            "-cp",
+            os.pathsep.join((str(class_resource_app), str(class_resource_archive))),
+            "fixture.resource.ClassResourceConsumer",
+        )
+        require(result.code == 0, f"classpath/class-relative resource failed\n{result.detail()}")
+        same_output("false\nfalse\nfalse\nfalse\nfalse\n114\n114\n114\n114\n114\n", result.stdout, result.detail())
         manifest = compile_sources(
             directory / "manifest-compiled",
             fixture / "ManifestMain.java",
@@ -860,6 +1038,8 @@ def main() -> int:
             classes.mkdir()
             sources.mkdir()
             inputs = [FIXTURES / f"{name}.java" for name in selected]
+            for name in selected:
+                inputs.extend(FIXTURES / dependency for dependency in FIXTURE_DEPENDENCIES.get(name, ()))
             if not args.only:
                 inputs.extend(FIXTURES / f"{name}.java" for name in SUPPORT)
             rng = random.Random(args.seed)
@@ -874,7 +1054,11 @@ def main() -> int:
             require(compilation.code == 0, f"fixture compilation failed\n{compilation.detail()}")
             suite = Suite(args, classes)
             for name in selected:
-                suite.check(name, lambda name=name: suite.differential(name))
+                if name != "MetadataFixture":
+                    suite.check(name, lambda name=name: suite.differential(name))
+            if "MetadataFixture" in selected:
+                suite.check("metadata/retention-defaults-malformed",
+                            lambda: suite.metadata(directory))
             if not args.only:
                 suite.check("classpath/archive-manifest-resource", lambda: suite.classpath(directory))
             if args.full and not args.only:

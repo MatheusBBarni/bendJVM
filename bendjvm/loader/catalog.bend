@@ -4,9 +4,10 @@ import ./symbols.bend as S
 import ./bootstrap.bend as B
 import ../classfile/descriptor.bend as D
 import ../classfile/constant_pool.bend as CP
+import ../classfile/annotation.bend as AN
 
 type Catalog is Data:
-  Catalog{sources: +List<M.ClassFile>, names: +List<String>, symbols: +List<String>, fields: +List<M.LoadedField>, methods: +List<M.LoadedMethod>}
+  Catalog{sources: +List<M.ClassFile>, names: +List<String>, symbols: +List<String>, fields: +List<M.LoadedField>, methods: +List<M.LoadedMethod>, metadata: M.Metadata}
 
 def check(ok: Bool, error: String) -> Result<&2, &2, String, Unit>:
   match ok:
@@ -128,12 +129,30 @@ def literal_tag(kind: U32) -> U32:
   match kind:
     case 3: 1
     case 4: 2
+    case 7: 4
     case 8: 3
     case _: 0
+
+def class_literal_name(name: String) -> String:
+  match name:
+    case "Z": "boolean"
+    case "B": "byte"
+    case "C": "char"
+    case "S": "short"
+    case "I": "int"
+    case "J": "long"
+    case "F": "float"
+    case "D": "double"
+    case "V": "void"
+    case _: name
 
 def link_literal(op: U32, a: U32, b: U32, c: U32, offset: U32, value: M.Constant, +pool: +List<M.Constant>, +sy: +List<String>) -> Result<&2, &2, String, M.Instruction>:
   match value:
     case M.Number{kind, bits}: Done{M.Instruction{op, bits, literal_tag(kind), c, offset}}
+    case M.Index{7, index}:
+      do Result<&2, &2, String, M.Instruction>:
+        name : String <- CP.utf(pool, index)
+        return M.Instruction{op, S.find(sy, class_literal_name(name)), 4, c, offset}
     case M.Index{8, index}:
       do Result<&2, &2, String, M.Instruction>:
         text : String <- CP.utf(pool, index)
@@ -196,7 +215,7 @@ def method_value(native: Bool, intrinsic: U32, nextId: U32, owner: U32, +sy: +Li
     case False{} 0:
       Done{M.LoadedMethod{nextId, owner, S.find(sy, name), S.find(sy, descriptor), flags, parameters, resultTag, maxStack, maxLocals, instructions, handlers, 0}}
     case True{} 0:
-      Fail{"UnsupportedFeature: native method"}
+      Fail{"UnsupportedFeature: native method owner#" ++ U32.show(owner)}
     case _ other:
       Done{M.LoadedMethod{nextId, owner, S.find(sy, name), S.find(sy, descriptor), flags, parameters, resultTag, maxStack, maxLocals, instructions, handlers, other}}
 
@@ -233,20 +252,104 @@ def method_records(methods: +List<M.Method>, +owner: U32, +ownerName: String, +p
         method : M.LoadedMethod <- method_value(U32.is_ne(U32.and(flags, 256), 0), intrinsic, nextId, owner, sy, name, desc, flags, D.parameter_count(parsed), resultTag, stack, locals, linked, linked_handlers)
         return Con{method, tail}
 
-def collect(classes: +List<M.ClassFile>, +all: +List<M.ClassFile>, +ns: +List<String>, +sy: +List<String>, fs: +List<M.LoadedField>, ms: +List<M.LoadedMethod>, owner: U32) -> Result<&2, &2, String, Catalog>:
+def field_metadata_records(fields: +List<M.Field>, +owner: U32, +pool: +List<M.Constant>, +id: U32) -> Result<&2, &2, String, +List<M.FieldMetadata>>:
+  match fields:
+    case Nil{}: Done{Nil{}}
+    case Con{M.Field{flags, name, desc, constant, +attributes}, rest}:
+      do Result<&2, &2, String, +List<M.FieldMetadata>>:
+        metadata : M.AnnotationMetadata <- AN.parse_attributes(attributes, pool)
+        tail : +List<M.FieldMetadata> <- field_metadata_records(rest, owner, pool, (id + 1 : U32))
+        return Con{M.FieldMetadata{owner, id, metadata}, tail}
+
+def method_metadata_records(methods: +List<M.Method>, +owner: U32, +pool: +List<M.Constant>, +id: U32) -> Result<&2, &2, String, +List<M.MethodMetadata>>:
+  match methods:
+    case Nil{}: Done{Nil{}}
+    case Con{M.Method{flags, name, desc, stack, locals, code, ins, handlers, +attrs}, rest}:
+      do Result<&2, &2, String, +List<M.MethodMetadata>>:
+        metadata : M.AnnotationMetadata <- AN.parse_attributes(attrs, pool)
+        tail : +List<M.MethodMetadata> <- method_metadata_records(rest, owner, pool, (id + 1 : U32))
+        return Con{M.MethodMetadata{owner, id, metadata}, tail}
+def annotation_type_name(value: M.JvmType) -> Result<&2, &2, String, String>:
+  match value:
+    case M.ObjectType{name}: Done{name}
+    case _: Fail{"VmError.InvalidAnnotation: annotation type is not an object"}
+
+def annotation_name_from_pool(+pool: +List<M.Constant>, index: U32) -> Result<&2, &2, String, String>:
+  do Result<&2, &2, String, String>:
+    +descriptor : String <- CP.utf(pool, index)
+    parsed : M.JvmType <- D.parse_field(descriptor)
+    result : String <- annotation_type_name(parsed)
+    return result
+
+def annotation_names(+annotations: +List<M.Annotation>, +pool: +List<M.Constant>, +acc: +List<String>) -> Result<&2, &2, String, +List<String>>:
+  match annotations:
+    case Nil{}: Done{M.reverse(String, acc)}
+    case Con{M.Annotation{typeIndex, elements}, rest}:
+      do Result<&2, &2, String, +List<String>>:
+        +name : String <- annotation_name_from_pool(pool, typeIndex)
+        +names : +List<String> <- annotation_names(rest, pool, Con{name, acc})
+        return names
+
+def annotation_metadata_annotations(metadata: M.AnnotationMetadata) -> +List<M.Annotation>:
+  match metadata:
+    case M.AnnotationMetadata{flags, exceptions, annotations, parameterAnnotations, typeAnnotations, defaultValue}: annotations
+
+
+def metadata_add(meta: M.Metadata, class_meta: M.ClassMetadata, field_meta: +List<M.FieldMetadata>, method_meta: +List<M.MethodMetadata>) -> M.Metadata:
+  match meta:
+    case M.Metadata{classes, fields, methods}:
+      M.Metadata{M.append(M.ClassMetadata, classes, Con{class_meta, Nil{}}), M.append(M.FieldMetadata, fields, field_meta), M.append(M.MethodMetadata, methods, method_meta)}
+
+def collect(classes: +List<M.ClassFile>, +all: +List<M.ClassFile>, +ns: +List<String>, +sy: +List<String>, fs: +List<M.LoadedField>, ms: +List<M.LoadedMethod>, metadata: M.Metadata, owner: U32) -> Result<&2, &2, String, Catalog>:
   match classes:
-    case Nil{}: Done{Catalog{all, ns, sy, fs, ms}}
-    case Con{M.ClassFile{mi, ma, fl, name, parent, interfaces, pool, fields, methods, attrs}, rest}:
+    case Nil{}: Done{Catalog{all, ns, sy, fs, ms, metadata}}
+    case Con{M.ClassFile{mi, ma, fl, name, parent, interfaces, +pool, +fields, +methods, attrs}, rest}:
       +oldFields = fs
       +oldMethods = ms
       +cid = owner
       do Result<&2, &2, String, Catalog>:
         newFields : +List<M.LoadedField> <- field_records(fields, cid, sy, M.length(M.LoadedField, oldFields))
         newMethods : +List<M.LoadedMethod> <- method_records(methods, cid, name, pool, sy, M.length(M.LoadedMethod, oldMethods))
-        collect(rest, all, ns, sy, M.append(M.LoadedField, oldFields, newFields), M.append(M.LoadedMethod, oldMethods, newMethods), (cid + 1 : U32))
+        +class_metadata : M.AnnotationMetadata <- AN.parse_attributes(attrs, pool)
+        field_metadata : +List<M.FieldMetadata> <- field_metadata_records(fields, cid, pool, M.length(M.LoadedField, oldFields))
+        method_metadata : +List<M.MethodMetadata> <- method_metadata_records(methods, cid, pool, M.length(M.LoadedMethod, oldMethods))
+        visible_names : +List<String> <- annotation_names(annotation_metadata_annotations(class_metadata), pool, Nil{})
+        next_metadata : M.Metadata = metadata_add(metadata, M.ClassMetadata{cid, fl, class_metadata, visible_names, pool}, field_metadata, method_metadata)
+        next : Catalog <- collect(rest, all, ns, sy, M.append(M.LoadedField, oldFields, newFields), M.append(M.LoadedMethod, oldMethods, newMethods), next_metadata, (cid + 1 : U32))
+        return next
+
+type AugmentedClasses is Data:
+  AugmentedClasses{classes: +List<M.ClassFile>, arrays: +List<M.ClassFile>}
+
+def reference_array_name(name: String) -> String:
+  match name:
+    case SCon{Chr{91}, rest}: ""
+    case _: "[L" ++ name ++ ";"
+
+def augmented_array(include: Bool, name: String, arrays: +List<M.ClassFile>) -> +List<M.ClassFile>:
+  match include:
+    case False{}: arrays
+    case True{}: Con{B.array_class(name), arrays}
+
+def augment_classes(+classes: +List<M.ClassFile>, +original: +List<M.ClassFile>, +arrays: +List<M.ClassFile>) -> AugmentedClasses:
+  match classes:
+    case Nil{}: AugmentedClasses{M.reverse(M.ClassFile, original), M.reverse(M.ClassFile, arrays)}
+    case Con{+head, rest}:
+      name : String = class_name(head)
+      array_name : String = reference_array_name(name)
+      augment_classes(rest, Con{head, original}, Con{B.array_class(array_name), arrays})
+
+def collect_all(+all: +List<M.ClassFile>) -> Result<&2, &2, String, Catalog>:
+  collect(all, all, names(all), symbols(all, Nil{}), Nil{}, Nil{}, M.empty_metadata(), 0)
+
+def build_augmented(value: AugmentedClasses) -> Result<&2, &2, String, Catalog>:
+  match value:
+    case AugmentedClasses{+classes, +arrays}:
+      collect_all(M.append(M.ClassFile, classes, arrays))
 
 def build(+classes: +List<M.ClassFile>) -> Result<&2, &2, String, Catalog>:
-  collect(classes, classes, names(classes), symbols(classes, Nil{}), Nil{}, Nil{}, 0)
+  build_augmented(augment_classes(classes, Nil{}, Nil{}))
+
 
 def own_method(methods: +List<M.LoadedMethod>, +owner: U32, +name: U32, +desc: U32) -> Maybe<&2, M.LoadedMethod>:
   match methods:
@@ -282,7 +385,7 @@ def resolve_method(fuel: Nat, +cat: Catalog, +owner: U32, +name: U32, +desc: U32
   match fuel:
     case 0n: Fail{"MissingMethod: unresolved method or cyclic hierarchy"}
     case 1n+p:
-      Catalog{+sources, +ns, sy, fields, methods} = cat
+      Catalog{+sources, +ns, sy, fields, methods, metadata} = cat
       Result.bind(&2, &2, String, U32, M.LoadedMethod, parent(sources, ns, owner), par =>
         resolve_found(own_method(methods, owner, name, desc), par, parentId => resolve_method(p, cat, parentId, name, desc)))
 def field_binding(+field: M.LoadedField) -> M.Binding:
@@ -331,5 +434,5 @@ def field_binding(+field: M.LoadedField) -> M.Binding:
 
 def loaded_classes(value: Catalog) -> Result<&2, &2, String, +List<M.LoadedClass>>:
   match value:
-    case Catalog{sources, +class_names, symbol_values, field_values, method_values}:
+    case Catalog{sources, +class_names, symbol_values, field_values, method_values, metadata}:
       classes_go(sources, class_names, class_names, symbol_values, field_values, method_values, 0, Nil{})

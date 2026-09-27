@@ -41,7 +41,6 @@ The project is designed around two boundaries:
 - **Bend owns JVM semantics and state.** Host C/JavaScript code is limited to launch I/O, file/TCP effects, and the generated-artifact adapter.
 - **The reference JVM is the oracle.** The differential test harness compiles the same Java fixture with `javac`, runs it with `java`, runs it with BendJVM, and compares observable output.
 
-The supported slice currently exercises:
 - Java 8 class files (major version 52)
 - ordered directory, JAR, and ZIP classpath sources
 - package-qualified class-name startup and standalone `.class` startup
@@ -58,6 +57,10 @@ The supported slice currently exercises:
 - blocking TCP client/server sockets, try-with-resources, and typed exception unwinding
 - class initialization, typed Java exceptions, and `System.out.println` for supported primitive types
 - instruction tracing, class dumps, disassembly, fuel limits, heap limits, and `--no-files`/`--no-net`
+- structured annotation attributes parsed and retained through linking, including visible/invisible declaration, parameter, type, default, and `Exceptions` metadata
+- `ldc` Class literals, cached mirrors for loaded classes/arrays, primitive and void mirrors, `Object.getClass`, `Class.forName(String)`, and `ClassLoader.loadClass(String)`
+- bounded `Class` introspection, declared `Field`/`Method`/`Constructor` discovery, annotation materialization/defaults/repeatable queries, field access, reflective invocation, and construction
+- interface dynamic proxies backed by Bend-owned handler callbacks, plus ordered classpath resource streams/URLs and bounded `Properties` parsing
 
 ## Getting started
 
@@ -94,12 +97,13 @@ Run a standalone class file:
 python3 scripts/run.py /tmp/bendjvm-classes/HelloWorld.class
 ```
 
-Run a package-qualified class from ordered directory/JAR/ZIP entries:
+Run a package-qualified class from an ordered directory/JAR/ZIP class path.
+After compiling the packaged example below:
 
 ```bash
 python3 scripts/run.py \
-  -cp /tmp/bendjvm-classes:/tmp/dependencies.jar \
-  examples.HelloWorld
+  -cp /tmp/bendjvm-app \
+  example.hello.Main Bend
 ```
 
 Launch an executable JAR. Its manifest supplies `Main-Class` and local
@@ -172,10 +176,25 @@ Standalone programs in `examples/` cover the MiniJRE slice:
 | `CollectionsAndText.java` | `ArrayList`/`HashMap` via interfaces, boxing cache, `valueOf` |
 | `FilesAndTryWithResources.java` | files, UTF-8 `readLine`, and try-with-resources |
 | `TcpLoopback.java` | blocking TCP client and single-connection server |
+| `ReflectionAndConfiguration.java` | direct runtime-visible annotation presence, private-field access, exact overload lookup, parameter mirrors, and `Properties` |
+
+Both example harnesses validate output as well as exit status:
+`python3 scripts/examples.py` runs the standalone corpus with selectable
+`--only` entries, while `python3 examples/run.py` also exercises the packaged
+directory and executable-JAR paths. The standalone reflection example focuses
+on field/method/configuration behavior; the differential fixture corpus also
+covers runtime annotation objects and dynamic proxies.
 
 `examples/packaged/` is a small application: `example.hello.Main` depends on
 `example.lib.Answer`, stores the argument and answer in an `ArrayList`, and
 reads `banner.txt` from the classpath.
+
+Run the standalone corpus with output assertions:
+
+```bash
+python3 scripts/examples.py
+python3 scripts/examples.py --only ReflectionAndConfiguration --only TcpLoopback
+```
 
 Compile the standalone samples:
 
@@ -187,6 +206,7 @@ python3 scripts/run.py /tmp/bendjvm-classes/HelloWorld.class 'spaced arg'
 python3 scripts/run.py /tmp/bendjvm-classes/CollectionsAndText.class
 python3 scripts/run.py /tmp/bendjvm-classes/TcpLoopback.class
 python3 scripts/run.py /tmp/bendjvm-classes/FilesAndTryWithResources.class /tmp/bendjvm-example.bin
+python3 scripts/run.py /tmp/bendjvm-classes/ReflectionAndConfiguration.class
 ```
 
 Compile and run the packaged application from a directory:
@@ -248,11 +268,9 @@ The harness requires Python 3.10+, a JDK, Bend 2, and Bun. It compiles sources a
 | `bendjvm/classfile/` | Big-endian reader, Java 8 class parser, constant pool, attributes, descriptors, and modified UTF-8. |
 | `bendjvm/bytecode/` | Instruction decoding, operand normalization, decoded program counters, and branch-target checks. |
 | `bendjvm/verifier/` | Stack contracts, local bounds, descriptor checks, and instruction validation. |
-| `bendjvm/loader/` | Symbol interning, class catalog/linking, bootstrap classes, intrinsic registration, and VM construction. |
-| `bendjvm/runtime/` | Explicit frames, locals, operand stacks, instruction stepping, method calls, returns, exceptions, resources, and VM status. |
+| `bendjvm/loader/` | Symbol interning, class catalog/linking, bootstrap classes, intrinsic registration, metadata retention, and VM construction. |
 | `bendjvm/heap/` | Object, primitive-array, reference-array, string, and resource-stream entries with bounded allocation. |
-| `bendjvm/java/` | MiniJRE intrinsics: objects/strings/collections, streams, files, TCP, throwables, and `println`. |
-| `bendjvm/model.bend` | Shared class-file, linked-runtime, heap, frame, resource, and VM data types. |
+| `bendjvm/java/` | MiniJRE intrinsics: objects/strings/collections, bounded class mirrors/member discovery, resources/URL/Properties, streams, files, TCP, throwables, and `println`. |
 | `scripts/classpath.py` | Ordered directory/JAR/ZIP sources, manifest expansion, bounded reads, and resource lookup. |
 | `scripts/run.py` | Builds cached Bend JavaScript artifacts and provides the structured practical command-line runner. |
 | `scripts/test.py` | Differential, classpath/JAR, file/TCP, malformed-input, limit, debug-mode, and generated-program tests. |
@@ -274,9 +292,47 @@ interface abstract (`0x0401`).
 | Collections | `ArrayList`/`List`/`Collection`/`Iterable`/`Iterator` and `HashMap`/`Map` as registered in bootstrap, including iterator `hasNext/next/remove` |
 | Streams | `InputStream.read()I`, `read([B)I`, `read([BII)I`, `close`; `OutputStream.write(I\|[B\|[BII)`, `flush`, `close`; `ByteArrayInputStream([B)`, `ByteArrayOutputStream` `toByteArray/size/reset` |
 | Files | `File(String)` `exists/isFile/isDirectory/getPath`; `FileInputStream(String)`; `FileOutputStream(String)` and `(String,Z)` |
+| Reflection / metadata | `Object.getClass()`, cached primitive/void/array/class mirrors and wrapper `TYPE` fields, `Class` name/superclass/modifier/array/interface/primitive/assignability/instance checks, annotation queries/materialization/defaults/repeatable expansion, `cast`, `forName(String)` and `forName(String,boolean,ClassLoader)`, `ClassLoader.loadClass(String)`, declared member arrays and exact name/parameter lookup, declaring-class/basic metadata accessors, per-handle `AccessibleObject.setAccessible/isAccessible`, `Field.get/set`, `Method.invoke`, and `Constructor.newInstance`; `Proxy`/`InvocationHandler` interface proxies, generated-class identity, category-one boxing, and handler lookup |
+| Resources / configuration | `Class`/`ClassLoader` relative/root lookup, ordered `getResources`, origin-bound `URL.openStream`, local URL path/protocol/string accessors, `Properties.load(InputStream)` and bounded UTF-8 `Properties.load(Reader)` for memory-backed `InputStreamReader`, `getProperty`/default getter/`setProperty`; lookup is ordered and first-match |
 | Text | `Reader.read()I`, `read([CII)I`, `close`; `Writer.write(I\|String\|[CII)`, `flush`, `close`; `InputStreamReader`/`OutputStreamWriter` `(stream, UTF-8)`; `BufferedReader.readLine` |
 | TCP | `InetSocketAddress(String,I)`; `Socket()V`, `(String,I)`, `connect(SocketAddress,I)`, `getInputStream`, `getOutputStream`, `setSoTimeout`, `close`; `ServerSocket(I)`, `getLocalPort`, `accept`, `setSoTimeout`, `close` |
-| Throwables | `Throwable` no-arg/message/cause/message+cause `<init>`, `getMessage`, `getCause`, `initCause`, `addSuppressed`, `getSuppressed`, `toString`; `IOException` has the four Java 8 constructors |
+| Throwables | `Throwable` no-arg/message/cause/message+cause `<init>`, `getMessage`, `getCause`, `initCause`, `addSuppressed`, `getSuppressed`, `toString`; `UndeclaredThrowableException` cause access; `IOException` has the four Java 8 constructors |
+
+The reflection slice is intentionally bounded. Class mirrors are cached for
+loaded class and array identities. Declared members expose basic metadata;
+`Field.get/set`, `Method.invoke`, and `Constructor.newInstance` cover the
+supported access path, including primitive wrapper arguments and results.
+Primitive/void mirrors and wrapper `TYPE` fields are supported. `setAccessible`
+is tracked per reflective handle for bounded private-member access. Runtime
+annotations materialize supported scalar/reference values, defaults,
+parameter metadata, defensive array results, and repeatable containers.
+`Class.forName(name, false, loader)` leaves a loaded class uninitialized;
+the `true` form runs its direct `<clinit>` once. Parent/complex initializer
+ordering and custom loader namespaces remain bounded.
+Interface proxies route supported calls to Java `InvocationHandler` objects,
+preserve generated proxy/interface checks, box category-one primitive arguments,
+and wrap undeclared checked throwables. Caller package/protected edge cases,
+wide annotation values, full proxy method-conflict/cache semantics, and
+complete OpenJDK formatting remain outside this bounded slice.
+
+Resources are root-relative for `ClassLoader` and package-relative for `Class`;
+relative class names normalize `./` and `..`, while single lookups preserve
+first-match classpath order. `getResources` enumerates every matching origin in
+order. Returned URLs retain the selected origin, reopen it independently, and
+expose local `file:`/`jar:file:` protocol and string forms. URL escaping is
+bounded to supported local paths.
+
+`Properties.load(InputStream)` handles ISO-8859-1 bytes, Unicode escapes,
+comments, separators, continuation lines, duplicate-key last-write behavior,
+default getters, and malformed Unicode escape rejection. `load(Reader)` is
+implemented for the bounded UTF-8 `InputStreamReader` over memory resources;
+other reader backends remain unsupported.
+
+The class-file metadata parser validates and links structured annotation data,
+then materializes supported runtime-visible annotations on demand. CLASS
+retention remains absent from runtime query results; category-two annotation
+values are parsed but fail explicitly when materialization would require
+unsupported wide execution.
 
 Host file and TCP effects use opaque handles scoped to one VM run. `--no-files`
 and `--no-net` deny those effects with `IOException`. `--max-heap` counts heap
@@ -285,13 +341,18 @@ closes remaining handles on every process exit, including fuel exhaustion and
 uncaught exceptions. This is a capability control, not a sandbox.
 
 ## Compatibility boundary
-BendJVM accepts Java 8 class files and ordered directory/JAR/ZIP classpaths, but intentionally does not provide full JVM compatibility. It does not yet promise:
+BendJVM accepts Java 8 class files and ordered directory/JAR/ZIP classpaths, but
+intentionally does not provide full JVM or OpenJDK compatibility. It does not
+yet promise:
 
-- modules, reflection, JNI, agents, or custom class loaders
+- full reflection access checks, generic/signature reflection, or complete
+  annotation/proxy validation and formatting
+- modules, JNI, agents, custom class loaders, or runtime class publication
 - `long` and `double` execution, or complete floating-point edge-case compatibility
-- `invokedynamic`, method handles, dynamic proxies, or full verifier compatibility
-- Java threads, monitors, `synchronized`, `volatile`, or complete synchronization semantics
-- garbage collection, JIT compilation, Spring Boot nested-JAR layouts, or OpenJDK library compatibility
+- `invokedynamic`, method handles, default-method special proxy invocation, or
+  full verifier compatibility
+- Java threads, monitors, `synchronized`, `volatile`, garbage collection, JIT
+  compilation, or Spring Boot nested-JAR layouts
 
 BendJVM is not a sandbox-grade security boundary. Java code only reaches host behavior through registered intrinsics, but untrusted bytecode should still be treated as untrusted input.
 
@@ -305,6 +366,7 @@ The project specification is documented in [`bendjvm-spec.md`](bendjvm-spec.md).
 4. Reject unsupported semantics instead of approximating them.
 5. Prove small interpreter invariants in Bend before optimizing representation or dispatch.
 
-Classpath, JAR/ZIP, manifest, MiniJRE streams, files, and blocking TCP are in place.
-The next milestones are reflection, broader bytecode coverage, and concurrency —
-not Spring Boot until those exist.
+Classpath, JAR/ZIP, manifest, MiniJRE streams, files, blocking TCP, bounded
+reflection, runtime annotation materialization, and interface proxies are in
+place. The next milestones are broader bytecode coverage, stronger edge-case
+compatibility, and concurrency — not Spring Boot until those exist.

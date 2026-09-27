@@ -88,7 +88,7 @@ def make_locals(n: Nat) -> +List<M.Slot>:
 
 def host_cont_of(h: M.Host) -> +List<M.Cont>:
   match h:
-    case M.Host{effect, cwd, caps, maxPayload, cont}: cont
+    case M.Host{effect, cwd, caps, maxPayload, cont, metadata}: cont
 
 def host_cont(vm: M.VM) -> +List<M.Cont>:
   host_cont_of(S.host(vm))
@@ -107,9 +107,85 @@ def push_return(+vm: M.VM, value: M.Slot) -> M.VM:
   return_frames(vm, value, S.frames(vm))
 
 
-def finish_return(vm: M.VM, value: M.Slot) -> M.VM:
-  push_return(vm, value)
+def finish_reflect_outcome(+vm: M.VM, result: Result<&2, &2, String, O.Outcome>) -> M.VM:
+  match result:
+    case Fail{error}: S.fail(vm, error)
+    case Done{O.Returned{+updated, Some{value}}}:
+      +frames = S.frames(updated)
+      return_frames(updated, value, frames)
+    case Done{O.Returned{+updated, None{}}}:
+      +frames = S.frames(updated)
+      return_frames(updated, M.Slot{3, 0}, frames)
+    case Done{O.ThrownRef{updated, reference}}: S.with_status(S.with_exception(updated, reference), 6)
+    case Done{O.ThrownName{updated, name}}: S.fail(updated, name)
+    case Done{O.Suspend{updated, effect}}: S.with_effect(updated, effect)
+    case Done{O.Call{updated, method, args}}: S.fail(updated, "VmError.Internal: nested reflection call")
 
+def reflected_marker(marker: U32) -> Maybe<&2, U32>:
+  +marker_ref : U32 = marker
+  take : Bool = U32.is_eq(marker_ref, 4294967294)
+  Bool.pick(Maybe<&2, U32>, take, Some{0}, None{})
+
+def reflected_descriptor(frame: M.Frame) -> Maybe<&2, U32>:
+  reflected_marker(S.initializing(frame))
+
+def reflected_method_descriptor_found(found: Maybe<&2, M.LoadedMethod>) -> U32:
+  match found:
+    case None{}: 0
+    case Some{method}: M.loaded_method_descriptor(method)
+
+def reflected_method_descriptor(vm: M.VM, frame: M.Frame) -> U32:
+  reflected_method_descriptor_found(M.nth(M.LoadedMethod, S.methods(vm), S.method_id(frame)))
+
+def finish_reflect_marked(+vm: M.VM, value: M.Slot, +current: M.Frame, +caller: M.Frame, +callers: +List<M.Frame>, descriptor: U32) -> M.VM:
+  +vm_ref : M.VM = vm
+  descriptor_id : U32 = reflected_method_descriptor(vm_ref, current)
+  clean : M.Frame = S.frame_initializing(caller, 4294967295)
+  +cleared : M.VM = S.with_cont(S.with_effect(vm, M.Idle{}), Nil{})
+  +updated : M.VM = S.with_frames(cleared, Con{current, Con{clean, callers}})
+  +text : String = Sy.text(S.symbols(updated), descriptor_id)
+  finish_reflect_outcome(updated, L.reflect_box_return(updated, text, value))
+
+def finish_return_found(+vm: M.VM, value: M.Slot, current: M.Frame, +caller: M.Frame, +callers: +List<M.Frame>, found: Maybe<&2, U32>) -> M.VM:
+  match found:
+    case None{}: push_return(vm, value)
+    case Some{descriptor}: finish_reflect_marked(vm, value, current, caller, callers, descriptor)
+
+def finish_return_marked(+vm: M.VM, value: M.Slot, +frames: +List<M.Frame>) -> M.VM:
+  match frames:
+    case Con{current, Con{+caller, callers}}:
+      finish_return_found(vm, value, current, caller, callers, reflected_descriptor(caller))
+    case _: push_return(vm, value)
+
+def proxy_return_frames(+vm: M.VM, value: M.Slot, +frames: +List<M.Frame>, +descriptor: String) -> M.VM:
+  match frames:
+    case Con{current, Con{+caller, callers}}:
+      M.Frame{method, pc, invoke, locals, +stack, initializing} = caller
+      +return_name : String = L.method_return_name(descriptor)
+      +next_stack : +List<M.Slot> = Bool.pick(+List<M.Slot>, String.eq(return_name, "void"), stack, Con{value, stack})
+      S.with_frames(vm, Con{M.Frame{method, pc, invoke, locals, next_stack, initializing}, callers})
+    case _: S.with_result(S.with_status(vm, 1), value)
+
+def finish_proxy_return(+vm: M.VM, value: M.Slot, +current: M.Frame, +caller: M.Frame, +callers: +List<M.Frame>, +descriptor: String) -> M.VM:
+  +clean : M.Frame = S.frame_initializing(caller, 4294967295)
+  +cleared : M.VM = S.with_cont(S.with_effect(vm, M.Idle{}), Nil{})
+  +updated : M.VM = S.with_frames(cleared, Con{current, Con{clean, callers}})
+  +unboxed : M.Slot = L.proxy_return_value(updated, descriptor, value)
+  proxy_return_frames(updated, unboxed, S.frames(updated), descriptor)
+
+def finish_proxy_return_frames(+vm: M.VM, value: M.Slot, +frames: +List<M.Frame>, +descriptor: String) -> M.VM:
+  match frames:
+    case Con{current, Con{+caller, callers}}: finish_proxy_return(vm, value, current, caller, callers, descriptor)
+    case _: push_return(vm, value)
+
+def finish_return_effect(+vm: M.VM, value: M.Slot, +frames: +List<M.Frame>, effect: M.Effect) -> M.VM:
+  match effect:
+    case M.ProxyCall{descriptor}: finish_proxy_return_frames(vm, value, frames, descriptor)
+    case _: finish_return_marked(vm, value, frames)
+
+def finish_return(+vm: M.VM, value: M.Slot) -> M.VM:
+  +frames = S.frames(vm)
+  finish_return_effect(vm, value, frames, S.host_effect(vm))
 def void_frames(+vm: M.VM, frames: +List<M.Frame>) -> M.VM:
   match frames:
     case Nil{}: S.with_status(vm, 1)
@@ -131,8 +207,70 @@ def finish_void_frames(+vm: M.VM, frames: +List<M.Frame>) -> M.VM:
     case Nil{}: S.with_status(vm, 1)
     case Con{current, rest}: finish_void_current(vm, current, rest)
 
+def finish_reflect_void(+vm: M.VM, +frames: +List<M.Frame>) -> M.VM:
+  match frames:
+    case Con{current, Con{+caller, callers}}:
+      +cleared : M.VM = S.with_effect(vm, M.Idle{})
+      return_frames(cleared, M.Slot{3, 0}, Con{current, Con{caller, callers}})
+    case _: S.fail(vm, "InvalidState: reflective void return")
+
+def finish_construct_frames(+vm: M.VM, reference: U32, +frames: +List<M.Frame>) -> M.VM:
+  match frames:
+    case Con{current, Con{+caller, callers}}:
+      +cleared : M.VM = S.with_effect(vm, M.Idle{})
+      return_frames(cleared, M.Slot{3, reference}, Con{current, Con{caller, callers}})
+    case _: S.fail(vm, "InvalidState: constructor return")
+
+def constructor_reference_marker(marker: U32) -> Maybe<&2, U32>:
+  +marker_ref : U32 = marker
+  take : Bool = U32.is_le(marker_ref, 4294967292)
+  Bool.pick(Maybe<&2, U32>, take, Some{U32.sub(4294967293, marker_ref)}, None{})
+
+def constructor_reference_frame(frame: M.Frame) -> Maybe<&2, U32>:
+  constructor_reference_marker(S.initializing(frame))
+
+def finish_class_for_name_alloc(+vm: M.VM, +frames: +List<M.Frame>, result: Result<&2, &2, String, H.Allocation>) -> M.VM:
+  match result:
+    case Fail{error}: S.fail(vm, error)
+    case Done{H.Allocation{vm, reference}}:
+      return_frames(S.with_effect(vm, M.Idle{}), M.Slot{3, reference}, frames)
+
+def finish_class_for_name_mirror(+vm: M.VM, target: U32, +frames: +List<M.Frame>, found: Maybe<&2, U32>) -> M.VM:
+  match found:
+    case Some{reference}: return_frames(vm, M.Slot{3, reference}, frames)
+    case None{}:
+      finish_class_for_name_alloc(vm, frames, H.allocate(vm, H.class_mirror_entry(H.named_class(S.classes(vm), S.symbols(vm), "java/lang/Class"), target)))
+
+def finish_class_for_name(+vm: M.VM, +frames: +List<M.Frame>) -> M.VM:
+  match frames:
+    case Con{current, rest}:
+      +target = S.initializing(current)
+      +ready = S.with_effect(S.set_class_state(vm, S.initializing(current), 2), M.Idle{})
+      finish_class_for_name_mirror(ready, target, frames, H.class_mirror(S.heap(ready), target))
+    case _: S.fail(vm, "InvalidState: Class.forName initializer return")
+
+def finish_void_effect(+vm: M.VM, +frames: +List<M.Frame>, effect: M.Effect) -> M.VM:
+  match effect:
+    case M.ReflectCall{}: finish_reflect_void(vm, frames)
+    case M.ReflectConstructor{reference}: finish_construct_frames(vm, reference, frames)
+    case M.ClassForName{}: finish_class_for_name(vm, frames)
+    case _: finish_void_frames(vm, frames)
+def finish_void_marked_found(+vm: M.VM, +frames: +List<M.Frame>, effect: M.Effect, current: M.Frame, +caller: M.Frame, +callers: +List<M.Frame>, found: Maybe<&2, U32>) -> M.VM:
+  match found:
+    case Some{reference}: finish_construct_frames(vm, reference, frames)
+    case None{}: finish_void_effect(vm, frames, effect)
+def finish_void_marked(+vm: M.VM, +frames: +List<M.Frame>, effect: M.Effect) -> M.VM:
+  match frames:
+    case Con{current, Con{+caller, callers}}:
+      finish_void_marked_found(vm, frames, effect, current, caller, callers, constructor_reference_frame(caller))
+    case _: finish_void_effect(vm, frames, effect)
+
+
+
 def finish_void(+vm: M.VM) -> M.VM:
-  finish_void_frames(vm, S.frames(vm))
+  +frames = S.frames(vm)
+  +effect = S.host_effect(vm)
+  finish_void_marked(vm, frames, effect)
 
 def invoke_frame(vm: M.VM, id: U32, maxLocals: U32, +caller: M.Frame, values: +List<M.Slot>, frames: +List<M.Frame>) -> M.VM:
   match frames:
@@ -147,6 +285,46 @@ def invoke_arguments(vm: M.VM, method: M.LoadedMethod, args: F.Arguments, frames
       match args:
         case F.Arguments{caller, values}:
           invoke_frame(vm, id, maxLocals, caller, values, frames)
+
+def invoke_reflect(+vm: M.VM, +method: M.LoadedMethod, +args: +List<M.Slot>, +caller: M.Frame) -> M.VM:
+  +method_ref : M.LoadedMethod = method
+  +caller_ref : M.Frame = caller
+  +marked : M.Frame = S.frame_initializing(caller_ref, 4294967294)
+  invoke_arguments(vm, method_ref, F.Arguments{marked, args}, S.frames(vm))
+
+def invoke_constructor(+vm: M.VM, method: M.LoadedMethod, +args: +List<M.Slot>, +caller: M.Frame, reference: U32) -> M.VM:
+  +caller_ref : M.Frame = caller
+  marked : M.Frame = S.frame_initializing(caller_ref, U32.sub(4294967293, reference))
+  +cleared : M.VM = S.with_effect(vm, M.Idle{})
+  invoke_arguments(cleared, method, F.Arguments{marked, args}, S.frames(cleared))
+
+def invoke_proxy(+vm: M.VM, method: M.LoadedMethod, +args: +List<M.Slot>, +caller: M.Frame) -> M.VM:
+  invoke_arguments(vm, method, F.Arguments{caller, args}, S.frames(vm))
+
+def invoke_class_initializer_frame(vm: M.VM, id: U32, maxLocals: U32, owner: U32, +caller: M.Frame, values: +List<M.Slot>, frames: +List<M.Frame>) -> M.VM:
+  match frames:
+    case Con{old, rest}:
+      S.with_frames(vm, Con{M.Frame{id, 0, S.pc(caller), copy_arguments(values, make_locals(U32.to_nat(maxLocals)), 0n), Nil{}, owner}, Con{S.advance(caller), rest}})
+    case Nil{}:
+      S.fail(vm, "InvalidState: initializer invocation without caller")
+
+def invoke_class_initializer(+vm: M.VM, method: M.LoadedMethod, +args: +List<M.Slot>, +caller: M.Frame) -> M.VM:
+  match method:
+    case M.LoadedMethod{id, owner, name, descriptor, flags, parameters, resultTag, maxStack, maxLocals, instructions, handlers, intrinsic}:
+      invoke_class_initializer_frame(vm, id, maxLocals, owner, caller, args, S.frames(vm))
+
+def invoke_outcome_effect(+vm: M.VM, method: M.LoadedMethod, +args: +List<M.Slot>, +caller: M.Frame, effect: M.Effect) -> M.VM:
+  match effect:
+    case M.ReflectConstructor{reference}: invoke_constructor(vm, method, args, caller, reference)
+    case M.ReflectCall{}: invoke_reflect(vm, method, args, caller)
+    case M.ProxyCall{descriptor}: invoke_proxy(vm, method, args, caller)
+    case M.ClassForName{}: invoke_class_initializer(vm, method, args, caller)
+    case _: invoke_arguments(vm, method, F.Arguments{caller, args}, S.frames(vm))
+
+def invoke_outcome(+vm: M.VM, method: M.LoadedMethod, +args: +List<M.Slot>, caller: M.Frame) -> M.VM:
+  +effect = S.host_effect(vm)
+  invoke_outcome_effect(vm, method, args, caller, effect)
+
 def intrinsic_value(+vm: M.VM, frame: M.Frame, value: Maybe<&2, M.Slot>, max: U32) -> Result<&2, &2, String, M.VM>:
   match value:
     case None{}:
@@ -167,7 +345,7 @@ def intrinsic_outcome(frame: M.Frame, max: U32, outcome: O.Outcome) -> Result<&2
     case O.Suspend{updated, effect}:
       Done{S.commit(updated, frame)}
     case O.Call{+updated, method, args}:
-      Done{invoke_arguments(updated, method, F.Arguments{frame, args}, S.frames(updated))}
+      Done{invoke_outcome(updated, method, args, frame)}
 
 def intrinsic_result(frame: M.Frame, max: U32, result: Result<&2, &2, String, O.Outcome>) -> Result<&2, &2, String, M.VM>:
   match result:
@@ -195,19 +373,58 @@ def receiver_slot(stack: +List<M.Slot>, count: Nat) -> Maybe<&2, M.Slot>:
       match count:
         case 0n: Some{receiver}
         case 1n+p: receiver_slot(rest, p)
+def dispatch_virtual_kind(kind: U32, +vm: M.VM, +method: M.LoadedMethod, frame: M.Frame, max: U32, +name: String, +descriptor: String, +values: +List<M.Slot>) -> Result<&2, &2, String, M.VM>:
+  match kind:
+    case 9: intrinsic_result(frame, max, L.annotation_invoke(vm, values, name, descriptor))
+    case 10: intrinsic_result(frame, max, L.proxy_invoke(vm, method, values, name, descriptor))
+    case _: dispatch_method(vm, method, F.Arguments{frame, values}, max)
+
+def dispatch_virtual_entry(result: Result<&2, &2, String, M.HeapEntry>, +vm: M.VM, +method: M.LoadedMethod, frame: M.Frame, max: U32, +name: String, +descriptor: String, +values: +List<M.Slot>) -> Result<&2, &2, String, M.VM>:
+  match result:
+    case Fail{error}: Fail{error}
+    case Done{entry}: dispatch_virtual_kind(L.entry_kind(entry), vm, method, frame, max, name, descriptor, values)
+
+def dispatch_virtual_loaded(+vm: M.VM, +method: M.LoadedMethod, args: F.Arguments, max: U32, +name: String, +descriptor: String) -> Result<&2, &2, String, M.VM>:
+  match args:
+    case F.Arguments{frame, +values}:
+      match values:
+        case Con{receiver, rest}: dispatch_virtual_entry(H.get(S.heap(vm), V.slot_bits(receiver)), vm, method, frame, max, name, descriptor, values)
+        case Nil{}: dispatch_method(vm, method, F.Arguments{frame, values}, max)
+
 def invoke_virtual_found(found: Maybe<&2, M.LoadedMethod>, +vm: M.VM, frame: M.Frame, count: U32, max: U32) -> Result<&2, &2, String, M.VM>:
   match found:
-    case None{}: Fail{"NoSuchMethodError"}
+    case None{}: Fail{"NoSuchMethodError: virtual-found"}
     case Some{+method}:
       do Result<&2, &2, String, M.VM>:
         args : F.Arguments <- F.arguments(frame, U32.add(method_parameters(method), count))
-        result : M.VM <- dispatch_method(vm, method, args, max)
+        result : M.VM <- dispatch_virtual_loaded(vm, method, args, max, Sy.text(S.symbols(vm), M.loaded_method_name(method)), Sy.text(S.symbols(vm), M.loaded_method_descriptor(method)))
         return result
+def invoke_virtual_annotation_args(args: F.Arguments, +vm: M.VM, max: U32, +name: String, +descriptor: String) -> Result<&2, &2, String, M.VM>:
+  match args:
+    case F.Arguments{frame, +values}: intrinsic_result(frame, max, L.annotation_invoke(vm, values, name, descriptor))
+
+
+def invoke_virtual_missing(found: Maybe<&2, M.LoadedMethod>, +vm: M.VM, frame: M.Frame, +name: U32, +descriptor: U32, max: U32, +name_text: String, +descriptor_text: String) -> Result<&2, &2, String, M.VM>:
+  match found:
+    case Some{+method}: invoke_virtual_found(Some{method}, vm, frame, 1, max)
+    case None{}:
+      match name_text:
+        case "annotationType":
+          do Result<&2, &2, String, M.VM>:
+            args : F.Arguments <- F.arguments(frame, 1)
+            result : M.VM <- invoke_virtual_annotation_args(args, vm, max, name_text, descriptor_text)
+            return result
+        case _: Fail{"NoSuchMethodError"}
+
+def virtual_method_entry_kind(kind: U32, +vm: M.VM, +owner: U32, +name: U32, +descriptor: U32, entry_class: U32) -> Maybe<&2, M.LoadedMethod>:
+  match kind:
+    case 10: find_method(S.classes(vm), S.methods(vm), owner, name, descriptor)
+    case _: find_method_id(Some{entry_class}, S.classes(vm), S.methods(vm), name, descriptor)
 
 def virtual_method_entry(result: Result<&2, &2, String, M.HeapEntry>, +vm: M.VM, +owner: U32, +name: U32, +descriptor: U32) -> Maybe<&2, M.LoadedMethod>:
   match result:
     case Fail{error}: find_method(S.classes(vm), S.methods(vm), owner, name, descriptor)
-    case Done{entry}: find_method_id(Some{H.entry_class(entry)}, S.classes(vm), S.methods(vm), name, descriptor)
+    case Done{M.HeapEntry{class_id, kind, element, fields, values, chars}}: virtual_method_entry_kind(kind, vm, owner, name, descriptor, class_id)
 
 def virtual_method_stack_found(found: Maybe<&2, M.Slot>, +vm: M.VM, +owner: U32, +name: U32, +descriptor: U32) -> Maybe<&2, M.LoadedMethod>:
   match found:
@@ -220,14 +437,13 @@ def virtual_method_stack_case(+vm: M.VM, +stack: +List<M.Slot>, +owner: U32, +na
 def invoke_virtual_method(found: Maybe<&2, M.LoadedMethod>, +vm: M.VM, +stack: +List<M.Slot>, +owner: U32, +name: U32, +descriptor: U32) -> Maybe<&2, M.LoadedMethod>:
   match found:
     case None{}: None{}
-    case Some{method}:
-      virtual_method_stack_case(vm, stack, owner, name, descriptor, U32.to_nat(method_parameters(method)))
+    case Some{method}: virtual_method_stack_case(vm, stack, owner, name, descriptor, U32.to_nat(method_parameters(method)))
 
 def virtual_method_stack(+vm: M.VM, +frame: M.Frame, +owner: U32, +name: U32, +descriptor: U32) -> Maybe<&2, M.LoadedMethod>:
   invoke_virtual_method(find_method(S.classes(vm), S.methods(vm), owner, name, descriptor), vm, S.stack(frame), owner, name, descriptor)
 
-def invoke_virtual(+vm: M.VM, +frame: M.Frame, owner: U32, name: U32, descriptor: U32, max: U32) -> Result<&2, &2, String, M.VM>:
-  invoke_virtual_found(virtual_method_stack(vm, frame, owner, name, descriptor), vm, frame, 1, max)
+def invoke_virtual(+vm: M.VM, +frame: M.Frame, owner: U32, +name: U32, +descriptor: U32, max: U32) -> Result<&2, &2, String, M.VM>:
+  invoke_virtual_missing(virtual_method_stack(vm, frame, owner, name, descriptor), vm, frame, name, descriptor, max, Sy.text(S.symbols(vm), name), Sy.text(S.symbols(vm), descriptor))
 def invoke_found(found: Maybe<&2, M.LoadedMethod>, +vm: M.VM, frame: M.Frame, max: U32) -> Result<&2, &2, String, M.VM>:
   match found:
     case None{}: Fail{"NoSuchMethodError"}
@@ -685,9 +901,19 @@ def ref_assignable_target(+vm: M.VM, reference: U32, +target: U32, cast: Bool, +
     case None{}: Bool.pick(Result<&2, &2, String, M.VM>, cast, Fail{"java/lang/ClassCastException"}, Done{S.commit(vm, S.frame_stack(S.advance(frame), Con{M.Slot{1, 0}, S.stack(frame)}))})
     case Some{+target_id}: ref_assignable_checked(vm, reference, target_id, cast, frame, H.assignable(S.classes(vm), S.symbols(vm), class, target_id))
 
+def ref_assignable_proxy_result(valid: Result<&2, &2, String, Bool>, +vm: M.VM, reference: U32, target: U32, cast: Bool, +frame: M.Frame) -> Result<&2, &2, String, M.VM>:
+  match valid:
+    case Fail{error}: Fail{error}
+    case Done{ok}: ref_assignable_checked(vm, reference, target, cast, frame, ok)
+
+def ref_assignable_kind(kind: U32, +vm: M.VM, +reference: U32, +target: U32, cast: Bool, +frame: M.Frame, class: U32, found: Maybe<&2, U32>) -> Result<&2, &2, String, M.VM>:
+  match kind:
+    case 10: ref_assignable_checked(vm, reference, target, cast, frame, True{})
+    case _: ref_assignable_target(vm, reference, target, cast, frame, class, found)
+
 def ref_assignable_frame(+vm: M.VM, reference: U32, +target: U32, cast: Bool, +frame: M.Frame, entry: M.HeapEntry) -> Result<&2, &2, String, M.VM>:
   match entry:
-    case M.HeapEntry{class, kind, element, fields, values, chars}: ref_assignable_target(vm, reference, target, cast, frame, class, class_id_by_name(S.classes(vm), target))
+    case M.HeapEntry{class, kind, element, fields, values, chars}: ref_assignable_kind(kind, vm, reference, target, cast, frame, class, class_id_by_name(S.classes(vm), target))
 
 def ref_assignable(+vm: M.VM, reference: U32, target: U32, cast: Bool, +popped: F.Popped, entry: M.HeapEntry) -> Result<&2, &2, String, M.VM>:
   match popped:
@@ -852,6 +1078,21 @@ def string_units(values: +List<Char>) -> +List<U32>:
     case Con{+head, tail}:
       Con{Char.to_u32(head), string_units(tail)}
 
+def literal_class_found(+vm: M.VM, +frame: M.Frame, class: U32, target: U32, found: Maybe<&2, U32>) -> Result<&2, &2, String, M.VM>:
+  match found:
+    case Some{reference}:
+      Done{S.commit(vm, S.frame_stack(S.advance(frame), Con{M.Slot{3, reference}, S.stack(frame)}))}
+    case None{}:
+      new_object_alloc(frame, H.allocate(vm, H.class_mirror_entry(class, target)))
+def literal_class(+vm: M.VM, +frame: M.Frame, +targetName: U32) -> Result<&2, &2, String, M.VM>:
+  do Result<&2, &2, String, M.VM>:
+    target_text : String <- S.require(String, M.nth(String, S.symbols(vm), targetName), "InvalidConstant")
+    +target : U32 = H.named_class(S.classes(vm), S.symbols(vm), target_text)
+    class : U32 = H.named_class(S.classes(vm), S.symbols(vm), "java/lang/Class")
+    found : Maybe<&2, U32> = H.class_mirror(S.heap(vm), target)
+    result : M.VM <- literal_class_found(vm, frame, class, target, found)
+    return result
+
 def literal_string_found(+vm: M.VM, +frame: M.Frame, symbol: U32, class: U32, found: Maybe<&2, U32>) -> Result<&2, &2, String, M.VM>:
   match found:
     case Some{reference}:
@@ -871,6 +1112,7 @@ def literal_string(+vm: M.VM, +frame: M.Frame, +symbol: U32) -> Result<&2, &2, S
     found : Maybe<&2, U32> = H.string_intern(S.heap(vm), chars)
     result : M.VM <- literal_string_found(vm, frame, symbol, class, found)
     return result
+
 def constant_push(+vm: M.VM, +frame: M.Frame, value: U32, tag: U32, max: U32) -> Result<&2, &2, String, M.VM>:
   do Result<&2, &2, String, M.VM>:
     +pushed : M.Frame <- F.push(frame, M.Slot{tag, value}, max)
@@ -879,6 +1121,7 @@ def constant_push(+vm: M.VM, +frame: M.Frame, value: U32, tag: U32, max: U32) ->
 def literal_push(+vm: M.VM, +frame: M.Frame, value: U32, tag: U32, max: U32) -> Result<&2, &2, String, M.VM>:
   match tag:
     case 3: literal_string(vm, frame, value)
+    case 4: literal_class(vm, frame, value)
     case _: constant_push(vm, frame, value, tag, max)
 
 def float_operation(op: U32, +a: F32, +b: F32) -> F32:
@@ -1348,9 +1591,38 @@ def exception_resume_found(error: String, +vm: M.VM, +frame: M.Frame, fuel: Nat,
     case None{}: exception_unwind(error, vm, S.frames(vm), fuel, continue)
     case Some{target}: enter_handler(vm, frame, target, fuel, continue)
 
+def proxy_exception_entry_found(original: U32, entry: M.HeapEntry) -> M.HeapEntry:
+  M.HeapEntry{kind_class, kind, element, fields, values, chars} = entry
+  M.HeapEntry{kind_class, kind, element, H.binding_set(fields, 1, M.Slot{3, original}), values, chars}
+
+def proxy_exception_entry(class: U32, original: U32) -> M.HeapEntry:
+  proxy_exception_entry_found(original, H.throwable_entry(class))
+
+def proxy_wrap_exception_alloc(+vm: M.VM, result: Result<&2, &2, String, H.Allocation>) -> M.VM:
+  match result:
+    case Fail{error}: S.fail(vm, error)
+    case Done{H.Allocation{vm, reference}}: S.with_exception(vm, reference)
+
+def proxy_wrap_exception_effect(effect: M.Effect, +vm: M.VM, +error: String) -> M.VM:
+  match effect:
+    case M.ProxyCall{descriptor}:
+      +thrown = thrown_class_of(vm)
+      +runtime = H.named_class(S.classes(vm), S.symbols(vm), "java/lang/RuntimeException")
+      +error_class = H.named_class(S.classes(vm), S.symbols(vm), "java/lang/Error")
+      unchecked : Bool = H.assignable(S.classes(vm), S.symbols(vm), thrown, runtime) || H.assignable(S.classes(vm), S.symbols(vm), thrown, error_class)
+      +original = S.exception(vm)
+      +wrapper_class = H.named_class(S.classes(vm), S.symbols(vm), "java/lang/reflect/UndeclaredThrowableException")
+      wrapper_entry : M.HeapEntry = proxy_exception_entry(wrapper_class, original)
+      Bool.pick(M.VM, unchecked, vm, proxy_wrap_exception_alloc(vm, H.allocate(vm, wrapper_entry)))
+    case _: vm
+
+def proxy_wrap_exception(+vm: M.VM, +error: String) -> M.VM:
+  proxy_wrap_exception_effect(S.host_effect(vm), vm, error)
+
 def exception_resume_java(+error: String, +vm: M.VM, +frame: M.Frame, method: M.LoadedMethod, fuel: Nat, continue: U32 -> Nat -> M.VM -> M.VM) -> M.VM:
   +ready = ensure_throw(vm, error)
-  exception_resume_found(error, ready, frame, fuel, continue, exception_handler(ready, S.pc(frame), thrown_class_of(ready), method_handlers(method)))
+  +wrapped = proxy_wrap_exception(ready, error)
+  exception_resume_found(error, wrapped, frame, fuel, continue, exception_handler(wrapped, S.pc(frame), thrown_class_of(wrapped), method_handlers(method)))
 
 def exception_resume_kind(java: Bool, error: String, +vm: M.VM, +frame: M.Frame, method: M.LoadedMethod, fuel: Nat, continue: U32 -> Nat -> M.VM -> M.VM) -> M.VM:
   match java:
@@ -1478,6 +1750,10 @@ def resume_read_bytes(values: +List<U32>, +vm: M.VM) -> M.VM:
 def resume_ok_effect(+vm: M.VM, +handle: U32, extra: U32, bytes: +List<U32>, effect: M.Effect) -> M.VM:
   match effect:
     case M.Idle{}: resume_clear(vm)
+    case M.ReflectCall{}: resume_clear(vm)
+    case M.ReflectConstructor{reference}: resume_clear(vm)
+    case M.ProxyCall{descriptor}: resume_clear(vm)
+    case M.ClassForName{}: resume_clear(vm)
     case M.OpenFile{path, mode, receiver}: resume_open_to(vm, handle, receiver)
     case M.StatPath{path, op}: resume_int(vm, extra)
     case M.ReadBytes{old, count, timeout}: resume_read_bytes(bytes, vm)

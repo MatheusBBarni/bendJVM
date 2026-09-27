@@ -143,6 +143,18 @@ class Source:
     def find_resource(self, name: str) -> SourceMatch | None:
         raise NotImplementedError
 
+    def class_matches(self) -> Iterator[SourceMatch]:
+        """Enumerate class entries without interpreting their bytecode."""
+        return iter(())
+
+    def open_match(self, match: SourceMatch) -> EntryStream | io.BytesIO | None:
+        """Reopen a match from this exact source and physical origin."""
+        if match.source is not self:
+            return None
+        _safe_name(match.name, self.origin)
+        return io.BytesIO(match.data)
+
+
     def read_class(self, binary_name: str) -> SourceMatch | None:
         return self.find_class(binary_name)
 
@@ -204,6 +216,35 @@ class DirectorySource(Source):
                 f"{self.origin}: cannot read resource {name!r}: {error}"
             ) from error
         return SourceMatch(name, data, str(candidate), self)
+
+    def class_matches(self) -> Iterator[SourceMatch]:
+        if not self.path.is_dir():
+            return iter(())
+        matches: list[SourceMatch] = []
+        for path in sorted(self.path.rglob("*.class")):
+            name = path.relative_to(self.path).as_posix()
+            match = self.find_resource(name)
+            if match is not None:
+                matches.append(match)
+        return iter(matches)
+    def open_match(self, match: SourceMatch) -> io.BytesIO | None:
+        if match.source is not self:
+            return None
+        _safe_name(match.name, self.origin)
+        candidate = Path(match.origin)
+        expected = self.path.joinpath(*match.name.split("/"))
+        if str(candidate) != str(expected):
+            return None
+        try:
+            if not candidate.is_file():
+                return None
+            data = candidate.read_bytes()
+        except OSError as error:
+            raise ClasspathError(
+                f"{self.origin}: cannot read resource {match.name!r}: {error}"
+            ) from error
+        return io.BytesIO(data)
+
 
 
 class ArchiveSource(Source):
@@ -286,6 +327,25 @@ class ArchiveSource(Source):
         if data is None:
             return None
         return SourceMatch(name, data, self.entry_origin(name), self)
+
+    def class_matches(self) -> Iterator[SourceMatch]:
+        if self._closed or self._zip is None:
+            return iter(())
+        matches: list[SourceMatch] = []
+        for name in sorted(self._entries):
+            if name.endswith(".class"):
+                match = self.find_resource(name)
+                if match is not None:
+                    matches.append(match)
+        return iter(matches)
+    def open_match(self, match: SourceMatch) -> EntryStream | None:
+        if match.source is not self:
+            return None
+        _safe_name(match.name, self.origin)
+        if match.origin != self.entry_origin(match.name):
+            return None
+        return self.open_entry(match.name, request=match.name)
+
 
     def manifest_attributes(self) -> dict[str, str]:
         if "META-INF/MANIFEST.MF" not in self._entries:
@@ -407,6 +467,22 @@ class Classpath:
             if found is not None:
                 return found
         return None
+    def find_resources(self, name: str) -> tuple[SourceMatch, ...]:
+        """Return all distinct physical matches in classpath order."""
+        _safe_name(name, "classpath")
+        matches: list[SourceMatch] = []
+        source_origins: set[str] = set()
+        match_origins: set[str] = set()
+        for source in self.sources:
+            if source.origin in source_origins:
+                continue
+            source_origins.add(source.origin)
+            found = source.find_resource(name)
+            if found is not None and found.origin not in match_origins:
+                match_origins.add(found.origin)
+                matches.append(found)
+        return tuple(matches)
+
 
     def read_class(self, binary_name: str) -> SourceMatch | None:
         return self.find_class(binary_name)
@@ -419,6 +495,13 @@ class Classpath:
 
     def lookup(self, name: str) -> SourceMatch | None:
         return self.find_resource(name)
+    def lookup_resources(self, name: str) -> tuple[SourceMatch, ...]:
+        return self.find_resources(name)
+
+    def read_resources(self, name: str) -> tuple[SourceMatch, ...]:
+        return self.find_resources(name)
+
+
 
     def read_resource(self, name: str) -> SourceMatch | None:
         return self.find_resource(name)
@@ -434,6 +517,11 @@ class Classpath:
                 found = source.find_resource(name)
                 if found is not None:
                     return io.BytesIO(found.data)
+        return None
+    def open_match(self, match: SourceMatch) -> EntryStream | io.BytesIO | None:
+        for source in self.sources:
+            if source is match.source:
+                return source.open_match(match)
         return None
 
     def close(self) -> None:

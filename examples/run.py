@@ -16,6 +16,22 @@ ROOT = Path(__file__).resolve().parents[1]
 EXAMPLES = Path(__file__).resolve().parent
 PACKAGED = EXAMPLES / "packaged"
 RUNNER = ROOT / "scripts" / "run.py"
+EXPECTED_OUTPUT = {
+    "ArithmeticAndBranches": "37\n55\n24\ntrue\n",
+    "ArraysAndStrings": "array sum\n14\ntrue\nBend\n",
+    "CollectionsAndText": "BendJVM\n2\ntrue\n2\ntrue\ntrue\n",
+    "Exceptions": "5\n0\n4\nbad\n",
+    "FilesAndTryWithResources": "true\n65\nhi\n-2\n",
+    "HelloWorld": "Hello from BendJVM\n42\narg=spaced arg\n",
+    "ObjectsAndDispatch": "10\n11\n4\ntrue\nfalse\n",
+    "ReflectionAndConfiguration": "true\ntrue\n12\n10\nBendJVM\n",
+    "StaticInitialization": "6\n12\n18\n",
+    "TcpLoopback": "66\ntrue\n",
+}
+
+PACKAGED_CLASSPATH_OUTPUT = "Bend\n42\n66\n"
+PACKAGED_JAR_OUTPUT = "from-jar\n42\n66\n"
+
 
 
 def require(condition: bool, message: str) -> None:
@@ -24,7 +40,24 @@ def require(condition: bool, message: str) -> None:
 
 
 def run(command: list[str], cwd: Path = ROOT) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(command, cwd=cwd, text=True, capture_output=True, check=False)
+    try:
+        return subprocess.run(
+            command,
+            cwd=cwd,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise SystemExit(f"command timed out after 120 seconds: {' '.join(command)}") from error
+
+
+def verify_output(label: str, result: subprocess.CompletedProcess[str], expected: str) -> None:
+    require(
+        result.stdout == expected,
+        f"{label} output mismatch\nexpected: {expected!r}\nactual:   {result.stdout!r}",
+    )
 
 
 def compile_java(output: Path, sources: list[Path]) -> None:
@@ -67,6 +100,9 @@ def main() -> int:
             elif source.stem == "HelloWorld":
                 extra = ["spaced arg"]
             result = launch(directory, str(standalone / f"{source.stem}.class"), *extra)
+            expected = EXPECTED_OUTPUT.get(source.stem)
+            require(expected is not None, f"missing expected output for {source.stem}")
+            verify_output(source.stem, result, expected)
             print(f"== {source.stem} ==")
             print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
 
@@ -77,12 +113,14 @@ def main() -> int:
         compile_java(packaged, sources)
         shutil.copyfile(PACKAGED / "banner.txt", packaged / "banner.txt")
         classpath = launch(directory, "-cp", str(packaged), "example.hello.Main", "Bend")
+        verify_output("packaged classpath", classpath, PACKAGED_CLASSPATH_OUTPUT)
         print("== packaged classpath ==")
         print(classpath.stdout, end="" if classpath.stdout.endswith("\n") else "\n")
 
         archive = directory / "hello.jar"
         write_jar(archive, packaged)
         jar = launch(directory, "-jar", str(archive), "from-jar")
+        verify_output("packaged -jar", jar, PACKAGED_JAR_OUTPUT)
         print("== packaged -jar ==")
         print(jar.stdout, end="" if jar.stdout.endswith("\n") else "\n")
     return 0

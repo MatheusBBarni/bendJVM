@@ -54,11 +54,15 @@ def ldc(entry: M.Constant, +pool: +List<M.Constant>) -> Result<&2, &2, String, R
   match entry:
     case M.Number{3, bits}: Done{Rule{0, 0, Nil{}, [1]}}
     case M.Number{4, bits}: Done{Rule{0, 0, Nil{}, [2]}}
+    case M.Index{7, index}:
+      do Result<&2, &2, String, Rule>:
+        +name : String <- CP.utf(pool, index)
+        return Rule{0, 0, Nil{}, [3]}
     case M.Index{8, index}:
       do Result<&2, &2, String, Rule>:
-        text : String <- CP.utf(pool, index)
+        +text : String <- CP.utf(pool, index)
         return Rule{0, 0, Nil{}, [3]}
-    case _: Fail{"VerifyError: ldc requires Integer, Float, or String constant"}
+    case _: Fail{"VerifyError: ldc requires Integer, Float, Class, or String constant"}
 
 def field_rule(op: U32, +tag: U32) -> Rule:
   match op:

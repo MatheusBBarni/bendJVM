@@ -181,6 +181,21 @@ def string_intern_scan(entries: +List<M.HeapEntry>, +chars: +List<U32>, +referen
 
 def string_intern(+heap: +List<M.HeapEntry>, +chars: +List<U32>) -> Maybe<&2, U32>:
   string_intern_scan(heap, chars, 1)
+def class_mirror_scan(entries: +List<M.HeapEntry>, +target: U32, +reference: U32) -> Maybe<&2, U32>:
+  match entries:
+    case Nil{}:
+      None{}
+    case Con{+entry, rest}:
+      match entry:
+        case M.HeapEntry{class, kind, element, fields, values, chars}:
+          Bool.pick(Maybe<&2, U32>, U32.is_eq(kind, 8) && U32.is_eq(element, target), Some{reference}, class_mirror_scan(rest, target, (reference + 1 : U32)))
+
+def class_mirror(heap: +List<M.HeapEntry>, +target: U32) -> Maybe<&2, U32>:
+  class_mirror_scan(heap, target, 1)
+
+def class_mirror_entry(mirror_class: U32, target: U32) -> M.HeapEntry:
+  M.HeapEntry{mirror_class, 8, target, Nil{}, Nil{}, Nil{}}
+
 def byte_slots(bytes: +List<U32>) -> +List<M.Slot>:
   match bytes:
     case Nil{}: Nil{}

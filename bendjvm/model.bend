@@ -13,6 +13,46 @@ type Constant is Data:
 
 type Attribute is Data:
   Attribute{name: String, bytes: +List<U32>}
+# Structured class-file metadata. Constant-pool references remain symbolic so
+# annotation Class and enum values can resolve lazily at materialization time.
+type AnnotationValue is Data:
+  AnnotationConst{tag: U32, index: U32}
+  AnnotationEnum{typeIndex: U32, nameIndex: U32}
+  AnnotationClass{descriptorIndex: U32}
+  AnnotationNested{typeIndex: U32, elements: +List<AnnotationValue>}
+  AnnotationElementValue{nameIndex: U32, value: AnnotationValue}
+  AnnotationArray{values: +List<AnnotationValue>}
+
+type AnnotationElement is Data:
+  AnnotationElement{nameIndex: U32, value: AnnotationValue}
+
+type Annotation is Data:
+  Annotation{typeIndex: U32, elements: +List<AnnotationElement>}
+
+type TypeAnnotation is Data:
+  TypeAnnotation{targetType: U32, targetInfo: +List<U32>, path: +List<U32>, annotation: Annotation}
+
+type AnnotationMetadata is Data:
+  AnnotationMetadata{flags: U32, exceptions: +List<U32>, annotations: +List<Annotation>, parameterAnnotations: +List<+List<Annotation>>, typeAnnotations: +List<TypeAnnotation>, defaultValue: Maybe<&2, AnnotationValue>}
+
+def empty_annotation_metadata() -> AnnotationMetadata:
+  AnnotationMetadata{0, Nil{}, Nil{}, Nil{}, Nil{}, None{}}
+
+type ClassMetadata is Data:
+  ClassMetadata{owner: U32, flags: U32, metadata: AnnotationMetadata, visibleAnnotations: +List<String>, pool: +List<Constant>}
+
+type FieldMetadata is Data:
+  FieldMetadata{owner: U32, field: U32, metadata: AnnotationMetadata}
+
+type MethodMetadata is Data:
+  MethodMetadata{owner: U32, method: U32, metadata: AnnotationMetadata}
+
+type Metadata is Data:
+  Metadata{classes: +List<ClassMetadata>, fields: +List<FieldMetadata>, methods: +List<MethodMetadata>}
+
+def empty_metadata() -> Metadata:
+  Metadata{Nil{}, Nil{}, Nil{}}
+
 
 type Handler is Data:
   Handler{start: U32, end: U32, target: U32, catch: U32}
@@ -133,11 +173,15 @@ type HeapEntry is Data:
   HeapEntry{class: U32, kind: U32, element: U32, fields: +List<Binding>, values: +List<Slot>, chars: +List<U32>}
 
 type Resource is Data:
-  Resource{name: String, bytes: +List<U32>}
+  Resource{name: String, bytes: +List<U32>, origin: String}
 
 # Host effects are opaque OS requests. Bend keeps Java-visible state only.
 type Effect is Data:
   Idle{}
+  ReflectCall{}
+  ReflectConstructor{reference: U32}
+  ProxyCall{descriptor: String}
+  ClassForName{}
   OpenFile{path: String, mode: U32, receiver: U32}
   StatPath{path: String, op: U32}
   ReadBytes{handle: U32, count: U32, timeout: U32}
@@ -154,12 +198,11 @@ type Cont is Data:
   NeedToString{op: U32, extra: U32}
   NeedEquals{op: U32, left: U32, right: U32}
   NeedListEq{list: U32, query: U32, index: U32, op: U32}
-
 type Host is Data:
-  Host{effect: Effect, cwd: String, caps: U32, maxPayload: U32, cont: +List<Cont>}
+  Host{effect: Effect, cwd: String, caps: U32, maxPayload: U32, cont: +List<Cont>, metadata: Metadata}
 
 def idle_host() -> Host:
-  Host{Idle{}, ".", 3, 16777216, Nil{}}
+  Host{Idle{}, ".", 3, 16777216, Nil{}, empty_metadata()}
 
 # pc is the next/current instruction. invokePc retains a caller's throwing location.
 # initializing=0xffffffff for ordinary calls; otherwise class initialized on return.

@@ -8,7 +8,7 @@ public class ArraysAndStrings {
             total += copy[index];
         }
         String text = "BendJVM";
-        System.out.println("pi digits");
+        System.out.println("array sum");
         System.out.println(total);
         System.out.println(copy[2] == 4);
         System.out.println(text.substring(0, 4));

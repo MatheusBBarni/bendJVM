@@ -106,7 +106,8 @@ does not support:
 * JNI.
 * Native libraries.
 * Java agents.
-* Reflection.
+* complete reflection access checks, generic/signature reflection, or the
+  complete OpenJDK reflection surface.
 * Method handles.
 * `invokedynamic`.
 * Java threads.
@@ -117,13 +118,19 @@ does not support:
 * `double`.
 * full floating-point edge-case compatibility.
 * class redefinition.
-* custom class loaders.
-* annotations.
-* generics at runtime.
-* dynamic proxies.
+* custom class loaders or runtime class publication.
+* generic type execution at runtime.
+* default-method special proxy invocation.
 * full verifier compatibility.
 * Java security manager.
 * JIT compilation.
+
+The delivered milestone-3 slice is bounded rather than full OpenJDK:
+Class literals, loaded-class/array/primitive mirrors, `Object.getClass`,
+`Class.forName(String)`/`ClassLoader.loadClass(String)`, declared member
+discovery, reflective field/method/constructor operations, runtime annotation
+materialization for supported values, interface dynamic proxies, and ordered
+resource lookup are implemented. Their documented limitations appear below.
 
 V1 operates on standalone `.class` files or ordered directory/JAR/ZIP
 classpath sources. Manifest `Main-Class`, local manifest `Class-Path`, and
@@ -3077,19 +3084,68 @@ fetched. Named manifest sections do not override main-section attributes.
 ---
 # 110. Java-visible Resources
 
-The supported resource slice is:
+The delivered resource slice is ordered and deliberately small:
 
-```text
 ClassLoader.getSystemResourceAsStream(String)
+ClassLoader.getSystemResource(String)
+ClassLoader.getResourceAsStream(String)
+ClassLoader.getResource(String)
+Class.getResourceAsStream(String)
+Class.getResource(String)
+URL.openStream()
+URL.getPath(), getProtocol(), toExternalForm(), toString()
 InputStream.read()
 InputStream.close()
-```
 
 Resource names are classpath-root-relative and case-sensitive. The first
-matching source wins; absence returns Java `null`, and an empty resource
-returns `-1` immediately. `read()` returns unsigned bytes `0..255` or `-1`.
-Each open has an independent position. Bend owns lookup, heap references,
-positions, and closed-stream behavior; the host supplies selected bytes only.
+matching directory/archive source wins; absence returns Java `null`, and an
+empty resource returns `-1` immediately. `read()` returns unsigned bytes
+`0..255` or `-1`, and each opened stream has an independent position.
+
+URL objects retain the selected resource name and physical origin.
+`openStream()` reopens that exact source. `getResources` and
+`getSystemResources` enumerate all matching origins in classpath order;
+archive URLs expose `jar:file:...!/entry` forms and directory URLs expose
+`file:...` forms. URL escaping is bounded to local paths.
+
+`Properties()` constructs a map-backed object. `load(InputStream)` parses
+ISO-8859-1 bytes, Unicode escapes, separators, comments, continuation lines,
+duplicate keys with last-write behavior, default getters, and malformed
+Unicode-escape rejection. `load(Reader)` is supported for bounded UTF-8
+`InputStreamReader` instances over memory resources; other reader backends
+remain unsupported.
+
+## Class literals, mirrors, and declared metadata
+
+The verifier and linker accept `CONSTANT_Class` values for `ldc`. Execution
+returns a canonical heap mirror for a loaded class, supported array class,
+primitive type, or void. Wrapper `TYPE` fields use those same primitive
+mirrors. `Object.getClass()`, both `Class.forName` overloads, and
+`ClassLoader.loadClass(String)` use the same loaded catalog and mirror cache;
+configuration-only application classes are enumerated from valid classpath
+entries, while host JDK classes are not published on demand. A missing name
+reports `ClassNotFoundException`.
+
+The supported `Class` methods are basic name, superclass, modifier, array,
+primitive, interface, assignability, instance, and cast queries plus declared
+field/method/constructor discovery and exact-name lookup. The wrappers expose
+bounded name/modifier/type and declaring-class metadata; `Field.get/set`,
+`Method.invoke`, and `Constructor.newInstance` execute supported members,
+including primitive wrapper conversion.
+Per-handle `AccessibleObject.setAccessible(boolean)` state permits bounded
+private-member access. Runtime-visible annotation instances expose supported
+scalar/reference values, defaults, parameter/type metadata, defensive arrays,
+recursive `@Inherited` lookup, repeatable containers, structural equality, and
+enum identity. Interface dynamic proxies route supported calls through
+`InvocationHandler`, retain generated proxy/interface identity in VM-managed
+mirrors, box category-one arguments, and wrap undeclared checked throwables.
+Category-two annotation values are retained but rejected at materialization.
+Complete Java access-edge compatibility, proxy method-conflict/default-method
+and loader-namespace rules, parent/complex static-initialization semantics,
+URL escaping, and exact annotation formatting remain bounded or unsupported.
+Structured annotation attributes are validated and
+retained through catalog linking, including visible/invisible declaration,
+parameter, type, default, and `Exceptions` records.
 
 
 # 111. Java Library Strategy
@@ -3123,10 +3179,13 @@ java/lang/RuntimeException
 ```
 
 The implemented MiniJRE slice also covers `Objects`, `StringBuilder`, `Integer`,
-`Math`, collection interfaces, `ArrayList`/`HashMap`, memory and file streams,
-UTF-8 readers/writers, blocking TCP sockets, try-with-resources, and supporting
-I/O exceptions. Unknown natives fail before execution; unsupported overloads
-are not implied by a class name.
+`Math`, collection interfaces, `ArrayList`/`HashMap`, bounded Class mirrors and
+declared member wrappers, runtime annotation instances and repeatable queries,
+interface `Proxy`/`InvocationHandler`, ordered resource streams/URLs, limited
+`Properties`, memory and file streams, UTF-8 readers/writers, blocking TCP
+sockets, try-with-resources, and supporting I/O exceptions. Unknown natives
+fail before execution; unsupported overloads are not implied by a class name.
+General OpenJDK library compatibility remains outside this MiniJRE.
 
 # 111. MiniJRE Representation
 
@@ -3637,13 +3696,11 @@ double
 
 threads
 
-reflection
+complete OpenJDK reflection/proxy compatibility
 
 JNI
 
 invokedynamic
-
-JAR files
 ```
 
 and when core interpreter invariants are protected by Bend laws.

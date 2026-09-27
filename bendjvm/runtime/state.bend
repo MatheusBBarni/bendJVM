@@ -57,9 +57,20 @@ def host(vm: M.VM) -> M.Host:
   M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
   host
 
+def metadata_of(h: M.Host) -> M.Metadata:
+  match h:
+    case M.Host{effect, cwd, caps, maxPayload, cont, metadata}: metadata
+
+def metadata(vm: M.VM) -> M.Metadata:
+  metadata_of(host(vm))
+
 def with_classes(vm: M.VM, value: +List<M.LoadedClass>) -> M.VM:
   M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
   M.VM{value, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host}
+
+def with_symbols(vm: M.VM, value: +List<String>) -> M.VM:
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
+  M.VM{cs, ms, fs, value, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host}
 
 def with_heap(vm: M.VM, value: +List<M.HeapEntry>) -> M.VM:
   M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
@@ -91,15 +102,15 @@ def with_exception(vm: M.VM, value: U32) -> M.VM:
 
 def host_cwd_of(h: M.Host) -> String:
   match h:
-    case M.Host{effect, cwd, caps, maxPayload, cont}: cwd
+    case M.Host{effect, cwd, caps, maxPayload, cont, metadata}: cwd
 
 def host_caps_of(h: M.Host) -> U32:
   match h:
-    case M.Host{effect, cwd, caps, maxPayload, cont}: caps
+    case M.Host{effect, cwd, caps, maxPayload, cont, metadata}: caps
 
 def host_effect_of(h: M.Host) -> M.Effect:
   match h:
-    case M.Host{effect, cwd, caps, maxPayload, cont}: effect
+    case M.Host{effect, cwd, caps, maxPayload, cont, metadata}: effect
 
 def host_effect(vm: M.VM) -> M.Effect:
   host_effect_of(host(vm))
@@ -107,7 +118,7 @@ def host_effect(vm: M.VM) -> M.Effect:
 
 def host_cont_of(h: M.Host) -> +List<M.Cont>:
   match h:
-    case M.Host{effect, cwd, caps, maxPayload, cont}: cont
+    case M.Host{effect, cwd, caps, maxPayload, cont, metadata}: cont
 
 def with_host(vm: M.VM, value: M.Host) -> M.VM:
   M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
@@ -115,24 +126,24 @@ def with_host(vm: M.VM, value: M.Host) -> M.VM:
 
 def with_effect_on(vm: M.VM, effect: M.Effect, h: M.Host) -> M.VM:
   match h:
-    case M.Host{old, cwd, caps, maxPayload, cont}:
-      with_host(vm, M.Host{effect, cwd, caps, maxPayload, cont})
+    case M.Host{old, cwd, caps, maxPayload, cont, metadata}:
+      with_host(vm, M.Host{effect, cwd, caps, maxPayload, cont, metadata})
 
 def with_effect(+vm: M.VM, effect: M.Effect) -> M.VM:
   with_effect_on(vm, effect, host(vm))
 
 def with_cont_on(vm: M.VM, cont: +List<M.Cont>, h: M.Host) -> M.VM:
   match h:
-    case M.Host{effect, cwd, caps, maxPayload, old}:
-      with_host(vm, M.Host{effect, cwd, caps, maxPayload, cont})
+    case M.Host{effect, cwd, caps, maxPayload, cont, metadata}:
+      with_host(vm, M.Host{effect, cwd, caps, maxPayload, cont, metadata})
 
 def with_cont(+vm: M.VM, cont: +List<M.Cont>) -> M.VM:
   with_cont_on(vm, cont, host(vm))
 
 def with_launch_on(vm: M.VM, cwd: String, caps: U32, h: M.Host) -> M.VM:
   match h:
-    case M.Host{effect, old_cwd, old_caps, maxPayload, cont}:
-      with_host(vm, M.Host{effect, cwd, caps, maxPayload, cont})
+    case M.Host{effect, old_cwd, old_caps, maxPayload, cont, metadata}:
+      with_host(vm, M.Host{effect, cwd, caps, maxPayload, cont, metadata})
 
 def with_launch(+vm: M.VM, cwd: String, caps: U32) -> M.VM:
   with_launch_on(vm, cwd, caps, host(vm))
@@ -172,6 +183,11 @@ def locals(frame: M.Frame) -> +List<M.Slot>:
 def initializing(frame: M.Frame) -> U32:
   M.Frame{method, pc0, invoke, ls, stk, init} = frame
   init
+
+def frame_initializing(frame: M.Frame, value: U32) -> M.Frame:
+  M.Frame{method, pc0, invoke, ls, stk, init} = frame
+  M.Frame{method, pc0, invoke, ls, stk, value}
+
 
 def frame_stack(frame: M.Frame, value: +List<M.Slot>) -> M.Frame:
   M.Frame{method, pc0, invoke, ls, stk, init} = frame

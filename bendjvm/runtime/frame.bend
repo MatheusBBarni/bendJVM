@@ -11,7 +11,7 @@ type Arguments is Data:
 
 def valid_slot(slot: M.Slot) -> Bool:
   M.Slot{+tag, bits} = slot
-  Bool.and(U32.is_ge(tag, 1), U32.is_le(tag, 3))
+  Bool.and(U32.is_ge(tag, 1), U32.is_le(tag, 5))
 
 def pop_stack(frame: M.Frame, +tag: U32, stack: +List<M.Slot>) -> Result<&2, &2, String, Popped>:
   match stack:

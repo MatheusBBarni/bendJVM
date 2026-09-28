@@ -799,18 +799,25 @@ class Suite:
         enumeration_source.write_text(
             "package fixture.resource; import java.io.InputStream; import java.net.URL; "
             "import java.util.Enumeration; "
-            "public class ResourceEnumerationConsumer { public static void main(String[] args) throws Exception { "
+            "public class ResourceEnumerationConsumer { "
+            "static boolean escaped(String text, char first, char second) { "
+            "for (int i = 0; i + 2 < text.length(); i++) "
+            "if (text.charAt(i) == '%' && text.charAt(i + 1) == first && text.charAt(i + 2) == second) return true; "
+            "return false; } "
+            "public static void main(String[] args) throws Exception { "
             "Enumeration<URL> resources = ClassLoader.getSystemResources(\"fixture-resource.bin\"); "
             "while (resources.hasMoreElements()) { URL url = resources.nextElement(); "
             "System.out.println(url.getProtocol().equals(\"jar\")); "
             "System.out.println(url.toExternalForm().charAt(0)); "
+            "System.out.println(escaped(url.toExternalForm(), '2', '0')); "
+            "System.out.println(escaped(url.toExternalForm(), 'C', '3')); "
             "InputStream stream = url.openStream(); System.out.println(stream.read()); stream.close(); } } }",
             encoding="utf-8",
         )
         enumeration = compile_sources(directory / "resource-enumeration-compiled", enumeration_source)
         enumeration_app = write_fixture_directory(directory / "resource-enumeration-app", enumeration)
         first_archive = write_fixture_jar(
-            directory / "resource-first.jar",
+            directory / "resource first é.jar",
             resources={"fixture-resource.bin": bytes((9,))},
         )
         second_archive = write_fixture_jar(
@@ -823,7 +830,7 @@ class Suite:
             "fixture.resource.ResourceEnumerationConsumer",
         )
         require(result.code == 0, f"classpath/resource enumeration failed\n{result.detail()}")
-        same_output("true\nj\n9\ntrue\nj\n8\n", result.stdout, result.detail())
+        same_output("true\nj\ntrue\ntrue\n9\ntrue\nj\nfalse\nfalse\n8\n", result.stdout, result.detail())
         properties_source = directory / "PropertiesConsumer.java"
         properties_source.write_text(
             "package fixture.resource; import java.io.InputStream; import java.io.InputStreamReader; import java.io.Reader; import java.util.Properties; "

@@ -180,8 +180,8 @@ type Effect is Data:
   Idle{}
   ReflectCall{}
   ReflectConstructor{reference: U32}
-  ProxyCall{descriptor: String}
-  ClassForName{}
+  ProxyCall{descriptor: String, exceptions: +List<U32>}
+  ClassForName{target: U32}
   OpenFile{path: String, mode: U32, receiver: U32}
   StatPath{path: String, op: U32}
   ReadBytes{handle: U32, count: U32, timeout: U32}
@@ -195,6 +195,7 @@ type Effect is Data:
 type Cont is Data:
   NeedHash{map: U32, key: U32, op: U32, extra: Slot}
   NeedEq{map: U32, key: U32, hash: U32, index: U32, op: U32, extra: Slot}
+  NeedThrowableMessage{receiver: U32, cause: U32}
   NeedToString{op: U32, extra: U32}
   NeedEquals{op: U32, left: U32, right: U32}
   NeedListEq{list: U32, query: U32, index: U32, op: U32}

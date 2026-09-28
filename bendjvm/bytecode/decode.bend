@@ -35,18 +35,25 @@ def format(op: U32) -> U32:
     case 7: 1
     case 8: 1
     case 11: 1
+    case 9: 1
+    case 10: 1
     case 12: 1
     case 13: 1
     case 16: 2
     case 17: 3
     case 18: 2
     case 19: 3
+    case 14: 1
+    case 15: 1
     case 21: 2
     case 23: 2
     case 25: 2
     case 26: 1
     case 27: 1
     case 28: 1
+    case 20: 3
+    case 22: 2
+    case 24: 2
     case 29: 1
     case 34: 1
     case 35: 1
@@ -63,6 +70,8 @@ def format(op: U32) -> U32:
     case 52: 1
     case 53: 1
     case 54: 2
+    case 55: 2
+    case 57: 2
     case 56: 2
     case 58: 2
     case 59: 1
@@ -134,7 +143,41 @@ def format(op: U32) -> U32:
     case 166: 3
     case 167: 3
     case 172: 1
+    case 97: 1
+    case 99: 1
+    case 101: 1
+    case 103: 1
+    case 105: 1
+    case 107: 1
+    case 109: 1
+    case 111: 1
+    case 113: 1
+    case 115: 1
+    case 117: 1
+    case 119: 1
+    case 121: 1
+    case 123: 1
+    case 125: 1
+    case 127: 1
+    case 129: 1
+    case 131: 1
+    case 133: 1
+    case 135: 1
+    case 136: 1
+    case 137: 1
+    case 138: 1
+    case 139: 1
+    case 140: 1
+    case 141: 1
+    case 142: 1
+    case 143: 1
+    case 144: 1
+    case 148: 1
+    case 151: 1
+    case 152: 1
+    case 173: 1
     case 174: 1
+    case 175: 1
     case 176: 1
     case 177: 1
     case 178: 3
@@ -156,6 +199,26 @@ def format(op: U32) -> U32:
     case 198: 3
     case 199: 3
     case 200: 7
+    case 30: 1
+    case 31: 1
+    case 32: 1
+    case 33: 1
+    case 38: 1
+    case 39: 1
+    case 40: 1
+    case 41: 1
+    case 47: 1
+    case 49: 1
+    case 63: 1
+    case 64: 1
+    case 65: 1
+    case 66: 1
+    case 71: 1
+    case 72: 1
+    case 73: 1
+    case 74: 1
+    case 80: 1
+    case 82: 1
     case _: 0
 
 def compact(op: U32) -> U32:
@@ -205,10 +268,14 @@ def operand16(op: U32, value: U32, offset: U32, relative: Bool) -> U32:
 def wide_local(op: U32) -> Bool:
   match op:
     case 21: True{}
+    case 22: True{}
     case 23: True{}
+    case 24: True{}
     case 25: True{}
     case 54: True{}
+    case 55: True{}
     case 56: True{}
+    case 57: True{}
     case 58: True{}
     case _: False{}
 
@@ -221,16 +288,25 @@ def mk_piece(op: U32, a: U32, b: U32, c: U32, offset: U32, rest: +List<U32>, wid
 def wide_iinc(+tail: +List<U32>, a: U32, b: U32, offset: U32) -> Result<&2, &2, String, Piece>:
   match tail:
     case Con{c, Con{d, rest}}:
-      Done{mk_piece(196, word(a, b), signed16(word(c, d)), 132, offset, rest, 6)}
+      Done{mk_piece(132, word(a, b), signed16(word(c, d)), 0, offset, rest, 6)}
     case _:
       Fail{"InvalidBytecode: truncated wide iinc"}
+def wide_local_piece(op: U32, a: U32, b: U32, +tail: +List<U32>, offset: U32) -> Result<&2, &2, String, Piece>:
+  Done{mk_piece(op, word(a, b), 0, 0, offset, tail, 4)}
+
+def wide_local_result(ok: Bool, op: U32, a: U32, b: U32, +tail: +List<U32>, offset: U32) -> Result<&2, &2, String, Piece>:
+  match ok:
+    case True{}:
+      wide_local_piece(op, a, b, tail, offset)
+    case False{}:
+      Fail{"UnsupportedOpcode: wide modified opcode " ++ U32.show(op)}
 
 def wide_parts(op: U32, a: U32, b: U32, +tail: +List<U32>, offset: U32) -> Result<&2, &2, String, Piece>:
   match op:
     case 132:
       wide_iinc(tail, a, b, offset)
-    case other:
-      Fail{"UnsupportedOpcode: wide modified opcode " ++ U32.show(other)}
+    case +local:
+      wide_local_result(wide_local(local), local, a, b, tail, offset)
 def wide(bytes: +List<U32>, offset: U32) -> Result<&2, &2, String, Piece>:
   match bytes:
     case Con{op, Con{a, Con{b, tail}}}:

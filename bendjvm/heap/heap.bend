@@ -254,3 +254,24 @@ def integer_intern_scan(entries: +List<M.HeapEntry>, +class: U32, +bits: U32, +r
 
 def integer_intern(+heap: +List<M.HeapEntry>, class: U32, bits: U32) -> Maybe<&2, U32>:
   integer_intern_scan(heap, class, bits, 1)
+def wide_entry(tag: U32, high: U32, low: U32) -> M.HeapEntry:
+  M.HeapEntry{0, 9, tag, [M.Binding{0, M.Slot{1, high}}, M.Binding{1, M.Slot{1, low}}], Nil{}, Nil{}}
+def wide_object_entry(class: U32, tag: U32, high: U32, low: U32) -> M.HeapEntry:
+  M.HeapEntry{class, 9, tag, [M.Binding{0, M.Slot{1, high}}, M.Binding{1, M.Slot{1, low}}], Nil{}, Nil{}}
+
+def wide_word_found(found: Maybe<&2, M.Slot>) -> U32:
+  match found:
+    case None{}:
+      0
+    case Some{M.Slot{tag, bits}}:
+      bits
+
+def wide_high(entry: M.HeapEntry) -> U32:
+  match entry:
+    case M.HeapEntry{class, kind, element, fields, values, chars}:
+      wide_word_found(binding_find(fields, 0))
+
+def wide_low(entry: M.HeapEntry) -> U32:
+  match entry:
+    case M.HeapEntry{class, kind, element, fields, values, chars}:
+      wide_word_found(binding_find(fields, 1))

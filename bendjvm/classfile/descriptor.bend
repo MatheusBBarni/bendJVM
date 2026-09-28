@@ -11,6 +11,10 @@ def slot_tag(value: M.JvmType) -> U32:
       0
     case M.Primitive{70}:
       2
+    case M.Primitive{74}:
+      4
+    case M.Primitive{68}:
+      5
     case M.Primitive{tag}:
       1
     case M.ObjectType{name}:

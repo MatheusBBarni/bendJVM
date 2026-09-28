@@ -2,6 +2,7 @@ import Base
 import ../model.bend as M
 import ../runtime/state.bend as S
 import ../runtime/frame.bend as F
+import ../runtime/wide.bend as W
 import ../runtime/value.bend as V
 import ../heap/heap.bend as H
 import ../loader/bootstrap.bend as B
@@ -80,11 +81,16 @@ def method_intrinsic(value: M.LoadedMethod) -> U32:
 def make_locals(n: Nat) -> +List<M.Slot>:
   M.zeros(n)
 
+def argument_width(value: M.Slot) -> Nat:
+  match value:
+    case M.Slot{+tag, bits}:
+      Bool.pick(Nat, Bool.or(U32.is_eq(tag, 4), U32.is_eq(tag, 5)), 2n, 1n)
+
 @unsafe def copy_arguments(values: +List<M.Slot>, +locals: +List<M.Slot>, +index: Nat) -> +List<M.Slot>:
   match values:
     case Nil{}: locals
-    case Con{value, rest}:
-      copy_arguments(rest, M.replace(M.Slot, locals, index, value), 1n+index)
+    case Con{+value, rest}:
+      copy_arguments(rest, M.replace(M.Slot, locals, index, value), Nat.add(index, argument_width(value)))
 
 def host_cont_of(h: M.Host) -> +List<M.Cont>:
   match h:
@@ -166,12 +172,32 @@ def proxy_return_frames(+vm: M.VM, value: M.Slot, +frames: +List<M.Frame>, +desc
       S.with_frames(vm, Con{M.Frame{method, pc, invoke, locals, next_stack, initializing}, callers})
     case _: S.with_result(S.with_status(vm, 1), value)
 
+def allocate_named_result(+vm: M.VM, name: String, result: Result<&2, &2, String, H.Allocation>) -> M.VM:
+  match result:
+    case Fail{error}: S.with_exception(vm, 2)
+    case Done{allocation}:
+      match allocation:
+        case H.Allocation{updated, reference}: S.with_exception(updated, reference)
+
+def allocate_named(+vm: M.VM, +name: String) -> M.VM:
+  allocate_named_result(vm, name, H.allocate(vm, H.throwable_entry(H.named_class(S.classes(vm), S.symbols(vm), name))))
+
+def ensure_throw(+vm: M.VM, error: String) -> M.VM:
+  Bool.pick(M.VM, U32.is_ne(S.exception(vm), 0), vm, allocate_named(vm, error))
+
+def proxy_return_failure(error: String, +vm: M.VM, +frames: +List<M.Frame>) -> M.VM:
+  S.with_status(ensure_throw(vm, error), 6)
+
+def finish_proxy_return_value(result: Result<&2, &2, String, M.Slot>, +vm: M.VM, +frames: +List<M.Frame>, +descriptor: String) -> M.VM:
+  match result:
+    case Fail{error}: proxy_return_failure(error, vm, frames)
+    case Done{unboxed}: proxy_return_frames(vm, unboxed, frames, descriptor)
+
 def finish_proxy_return(+vm: M.VM, value: M.Slot, +current: M.Frame, +caller: M.Frame, +callers: +List<M.Frame>, +descriptor: String) -> M.VM:
   +clean : M.Frame = S.frame_initializing(caller, 4294967295)
   +cleared : M.VM = S.with_cont(S.with_effect(vm, M.Idle{}), Nil{})
   +updated : M.VM = S.with_frames(cleared, Con{current, Con{clean, callers}})
-  +unboxed : M.Slot = L.proxy_return_value(updated, descriptor, value)
-  proxy_return_frames(updated, unboxed, S.frames(updated), descriptor)
+  finish_proxy_return_value(L.proxy_return_value(updated, descriptor, value), updated, S.frames(updated), descriptor)
 
 def finish_proxy_return_frames(+vm: M.VM, value: M.Slot, +frames: +List<M.Frame>, +descriptor: String) -> M.VM:
   match frames:
@@ -180,7 +206,7 @@ def finish_proxy_return_frames(+vm: M.VM, value: M.Slot, +frames: +List<M.Frame>
 
 def finish_return_effect(+vm: M.VM, value: M.Slot, +frames: +List<M.Frame>, effect: M.Effect) -> M.VM:
   match effect:
-    case M.ProxyCall{descriptor}: finish_proxy_return_frames(vm, value, frames, descriptor)
+    case M.ProxyCall{descriptor, exceptions}: finish_proxy_return_frames(vm, value, frames, descriptor)
     case _: finish_return_marked(vm, value, frames)
 
 def finish_return(+vm: M.VM, value: M.Slot) -> M.VM:
@@ -229,31 +255,56 @@ def constructor_reference_marker(marker: U32) -> Maybe<&2, U32>:
 def constructor_reference_frame(frame: M.Frame) -> Maybe<&2, U32>:
   constructor_reference_marker(S.initializing(frame))
 
-def finish_class_for_name_alloc(+vm: M.VM, +frames: +List<M.Frame>, result: Result<&2, &2, String, H.Allocation>) -> M.VM:
+def invoke_class_initializer_frame(vm: M.VM, id: U32, maxLocals: U32, owner: U32, +caller: M.Frame, values: +List<M.Slot>, frames: +List<M.Frame>) -> M.VM:
+  match frames:
+    case Con{old, rest}:
+      S.with_frames(vm, Con{M.Frame{id, 0, S.pc(caller), copy_arguments(values, make_locals(U32.to_nat(maxLocals)), 0n), Nil{}, owner}, Con{S.advance(caller), rest}})
+    case Nil{}:
+      S.fail(vm, "InvalidState: initializer invocation without caller")
+
+def invoke_class_initializer(+vm: M.VM, method: M.LoadedMethod, +args: +List<M.Slot>, +caller: M.Frame) -> M.VM:
+  match method:
+    case M.LoadedMethod{id, owner, name, descriptor, flags, parameters, resultTag, maxStack, maxLocals, instructions, handlers, intrinsic}:
+      invoke_class_initializer_frame(vm, id, maxLocals, owner, caller, args, S.frames(vm))
+def finish_class_for_name_call(+updated: M.VM, method: M.LoadedMethod, +args: +List<M.Slot>, +rest: +List<M.Frame>) -> M.VM:
+  match rest:
+    case Con{+caller, callers}:
+      invoke_class_initializer(S.with_frames(updated, rest), method, args, caller)
+    case Nil{}:
+      S.fail(updated, "InvalidState: Class.forName continuation without caller")
+
+def finish_class_for_name_outcome(+vm: M.VM, target: U32, +frames: +List<M.Frame>, +rest: +List<M.Frame>, outcome: O.Outcome) -> M.VM:
+  match outcome:
+    case O.Returned{+updated, Some{value}}:
+      return_frames(S.with_effect(updated, M.Idle{}), value, frames)
+    case O.Returned{updated, None{}}:
+      S.fail(vm, "InvalidState: Class.forName returned no mirror")
+    case O.Call{+updated, method, +args}: finish_class_for_name_call(updated, method, args, rest)
+    case O.ThrownName{updated, name}:
+      S.fail(updated, name)
+    case O.ThrownRef{updated, reference}:
+      S.with_status(S.with_exception(updated, reference), 6)
+    case O.Suspend{updated, effect}:
+      S.fail(updated, "InvalidState: Class.forName suspended")
+
+def finish_class_for_name_result(+ready: M.VM, +target: U32, +frames: +List<M.Frame>, +rest: +List<M.Frame>, result: Result<&2, &2, String, O.Outcome>) -> M.VM:
   match result:
-    case Fail{error}: S.fail(vm, error)
-    case Done{H.Allocation{vm, reference}}:
-      return_frames(S.with_effect(vm, M.Idle{}), M.Slot{3, reference}, frames)
+    case Fail{error}: S.fail(ready, error)
+    case Done{outcome}: finish_class_for_name_outcome(ready, target, frames, rest, outcome)
 
-def finish_class_for_name_mirror(+vm: M.VM, target: U32, +frames: +List<M.Frame>, found: Maybe<&2, U32>) -> M.VM:
-  match found:
-    case Some{reference}: return_frames(vm, M.Slot{3, reference}, frames)
-    case None{}:
-      finish_class_for_name_alloc(vm, frames, H.allocate(vm, H.class_mirror_entry(H.named_class(S.classes(vm), S.symbols(vm), "java/lang/Class"), target)))
-
-def finish_class_for_name(+vm: M.VM, +frames: +List<M.Frame>) -> M.VM:
+def finish_class_for_name(+vm: M.VM, +frames: +List<M.Frame>, +target: U32) -> M.VM:
   match frames:
     case Con{current, rest}:
-      +target = S.initializing(current)
-      +ready = S.with_effect(S.set_class_state(vm, S.initializing(current), 2), M.Idle{})
-      finish_class_for_name_mirror(ready, target, frames, H.class_mirror(S.heap(ready), target))
+      +ready : M.VM = S.set_class_state(vm, S.initializing(current), 2)
+      result : Result<&2, &2, String, O.Outcome> = L.class_for_name_continue(ready, target)
+      finish_class_for_name_result(ready, target, frames, rest, result)
     case _: S.fail(vm, "InvalidState: Class.forName initializer return")
 
 def finish_void_effect(+vm: M.VM, +frames: +List<M.Frame>, effect: M.Effect) -> M.VM:
   match effect:
     case M.ReflectCall{}: finish_reflect_void(vm, frames)
     case M.ReflectConstructor{reference}: finish_construct_frames(vm, reference, frames)
-    case M.ClassForName{}: finish_class_for_name(vm, frames)
+    case M.ClassForName{target}: finish_class_for_name(vm, frames, target)
     case _: finish_void_frames(vm, frames)
 def finish_void_marked_found(+vm: M.VM, +frames: +List<M.Frame>, effect: M.Effect, current: M.Frame, +caller: M.Frame, +callers: +List<M.Frame>, found: Maybe<&2, U32>) -> M.VM:
   match found:
@@ -301,24 +352,13 @@ def invoke_constructor(+vm: M.VM, method: M.LoadedMethod, +args: +List<M.Slot>, 
 def invoke_proxy(+vm: M.VM, method: M.LoadedMethod, +args: +List<M.Slot>, +caller: M.Frame) -> M.VM:
   invoke_arguments(vm, method, F.Arguments{caller, args}, S.frames(vm))
 
-def invoke_class_initializer_frame(vm: M.VM, id: U32, maxLocals: U32, owner: U32, +caller: M.Frame, values: +List<M.Slot>, frames: +List<M.Frame>) -> M.VM:
-  match frames:
-    case Con{old, rest}:
-      S.with_frames(vm, Con{M.Frame{id, 0, S.pc(caller), copy_arguments(values, make_locals(U32.to_nat(maxLocals)), 0n), Nil{}, owner}, Con{S.advance(caller), rest}})
-    case Nil{}:
-      S.fail(vm, "InvalidState: initializer invocation without caller")
-
-def invoke_class_initializer(+vm: M.VM, method: M.LoadedMethod, +args: +List<M.Slot>, +caller: M.Frame) -> M.VM:
-  match method:
-    case M.LoadedMethod{id, owner, name, descriptor, flags, parameters, resultTag, maxStack, maxLocals, instructions, handlers, intrinsic}:
-      invoke_class_initializer_frame(vm, id, maxLocals, owner, caller, args, S.frames(vm))
 
 def invoke_outcome_effect(+vm: M.VM, method: M.LoadedMethod, +args: +List<M.Slot>, +caller: M.Frame, effect: M.Effect) -> M.VM:
   match effect:
     case M.ReflectConstructor{reference}: invoke_constructor(vm, method, args, caller, reference)
     case M.ReflectCall{}: invoke_reflect(vm, method, args, caller)
-    case M.ProxyCall{descriptor}: invoke_proxy(vm, method, args, caller)
-    case M.ClassForName{}: invoke_class_initializer(vm, method, args, caller)
+    case M.ProxyCall{descriptor, exceptions}: invoke_proxy(vm, method, args, caller)
+    case M.ClassForName{target}: invoke_class_initializer(vm, method, args, caller)
     case _: invoke_arguments(vm, method, F.Arguments{caller, args}, S.frames(vm))
 
 def invoke_outcome(+vm: M.VM, method: M.LoadedMethod, +args: +List<M.Slot>, caller: M.Frame) -> M.VM:
@@ -403,6 +443,22 @@ def invoke_virtual_annotation_args(args: F.Arguments, +vm: M.VM, max: U32, +name
   match args:
     case F.Arguments{frame, +values}: intrinsic_result(frame, max, L.annotation_invoke(vm, values, name, descriptor))
 
+def invoke_virtual_reflect_default(args: F.Arguments, +vm: M.VM, max: U32) -> Result<&2, &2, String, M.VM>:
+  match args:
+    case F.Arguments{frame, +values}: intrinsic_result(frame, max, L.reflect_method_is_default(vm, values))
+def invoke_virtual_reflect_generic_return(args: F.Arguments, +vm: M.VM, max: U32) -> Result<&2, &2, String, M.VM>:
+  match args:
+    case F.Arguments{frame, +values}: intrinsic_result(frame, max, L.reflect_method_return_type(vm, values))
+
+def invoke_virtual_reflect_generic_parameters(args: F.Arguments, +vm: M.VM, max: U32) -> Result<&2, &2, String, M.VM>:
+  match args:
+    case F.Arguments{frame, +values}: intrinsic_result(frame, max, L.reflect_method_generic_parameter_types(vm, values))
+def invoke_virtual_reflect_generic_exceptions(args: F.Arguments, +vm: M.VM, max: U32) -> Result<&2, &2, String, M.VM>:
+  match args:
+    case F.Arguments{frame, +values}: intrinsic_result(frame, max, L.reflect_method_get_generic_exception_types(vm, values))
+
+
+
 
 def invoke_virtual_missing(found: Maybe<&2, M.LoadedMethod>, +vm: M.VM, frame: M.Frame, +name: U32, +descriptor: U32, max: U32, +name_text: String, +descriptor_text: String) -> Result<&2, &2, String, M.VM>:
   match found:
@@ -414,12 +470,43 @@ def invoke_virtual_missing(found: Maybe<&2, M.LoadedMethod>, +vm: M.VM, frame: M
             args : F.Arguments <- F.arguments(frame, 1)
             result : M.VM <- invoke_virtual_annotation_args(args, vm, max, name_text, descriptor_text)
             return result
-        case _: Fail{"NoSuchMethodError"}
+        case "isDefault":
+          do Result<&2, &2, String, M.VM>:
+            args : F.Arguments <- F.arguments(frame, 1)
+            result : M.VM <- invoke_virtual_reflect_default(args, vm, max)
+            return result
+        case "getGenericReturnType":
+          do Result<&2, &2, String, M.VM>:
+            args : F.Arguments <- F.arguments(frame, 1)
+            result : M.VM <- invoke_virtual_reflect_generic_return(args, vm, max)
+            return result
+        case "getGenericParameterTypes":
+          do Result<&2, &2, String, M.VM>:
+            args : F.Arguments <- F.arguments(frame, 1)
+            result : M.VM <- invoke_virtual_reflect_generic_parameters(args, vm, max)
+            return result
+        case "getGenericExceptionTypes":
+          do Result<&2, &2, String, M.VM>:
+            args : F.Arguments <- F.arguments(frame, 1)
+            result : M.VM <- invoke_virtual_reflect_generic_exceptions(args, vm, max)
+            return result
+        case _: Fail{"NoSuchMethodError: " ++ name_text ++ descriptor_text}
+
+def default_method(found: Maybe<&2, M.LoadedMethod>) -> Maybe<&2, M.LoadedMethod>:
+  match found:
+    case None{}: None{}
+    case Some{+method}:
+      Bool.pick(Maybe<&2, M.LoadedMethod>, U32.is_eq(U32.and(M.loaded_method_flags(method), 1024), 0), Some{method}, None{})
+
+def virtual_method_class(found: Maybe<&2, M.LoadedMethod>, +vm: M.VM, owner: U32, +name: U32, +descriptor: U32) -> Maybe<&2, M.LoadedMethod>:
+  match found:
+    case Some{method}: Some{method}
+    case None{}: default_method(find_method_id(Some{owner}, S.classes(vm), S.methods(vm), name, descriptor))
 
 def virtual_method_entry_kind(kind: U32, +vm: M.VM, +owner: U32, +name: U32, +descriptor: U32, entry_class: U32) -> Maybe<&2, M.LoadedMethod>:
   match kind:
     case 10: find_method(S.classes(vm), S.methods(vm), owner, name, descriptor)
-    case _: find_method_id(Some{entry_class}, S.classes(vm), S.methods(vm), name, descriptor)
+    case _: virtual_method_class(find_method_id(Some{entry_class}, S.classes(vm), S.methods(vm), name, descriptor), vm, owner, name, descriptor)
 
 def virtual_method_entry(result: Result<&2, &2, String, M.HeapEntry>, +vm: M.VM, +owner: U32, +name: U32, +descriptor: U32) -> Maybe<&2, M.LoadedMethod>:
   match result:
@@ -726,12 +813,12 @@ def static_initializer_found(+vm: M.VM, +frame: M.Frame, +owner: U32, found: May
 
 def static_initializer_or_get(+vm: M.VM, +frame: M.Frame, +field: M.LoadedField, id: U32, initializer: U32) -> Result<&2, &2, String, M.VM>:
   match initializer:
-    case 4294967295: static_get_found(vm, frame, Some{field})
+    case 4294967295: static_get_found(S.set_class_state(vm, id, 2), frame, Some{field})
     case _: static_initializer_found(vm, frame, id, M.nth(M.LoadedMethod, S.methods(vm), initializer))
 
 def static_initializer_parent_method(+vm: M.VM, +frame: M.Frame, +field: M.LoadedField, +id: U32, +initializer: U32, parent_id: U32, parent_initializer: U32) -> Result<&2, &2, String, M.VM>:
   match parent_initializer:
-    case 4294967295: static_initializer_or_get(vm, frame, field, id, initializer)
+    case 4294967295: static_initializer_or_get(S.set_class_state(vm, parent_id, 2), frame, field, id, initializer)
     case _: static_initializer_found(vm, frame, parent_id, M.nth(M.LoadedMethod, S.methods(vm), parent_initializer))
 
 def static_initializer_parent_class(+vm: M.VM, +frame: M.Frame, +field: M.LoadedField, +id: U32, +initializer: U32, found: Maybe<&2, M.LoadedClass>) -> Result<&2, &2, String, M.VM>:
@@ -831,10 +918,14 @@ def array_entry(kind: U32, id: U32, element: U32, +values: +List<M.Slot>) -> M.H
     case 1: H.primitive_array_entry(id, element, values)
     case _: H.reference_array_entry(id, element, values)
 
-def array_default_slot(kind: U32, element: U32, symbols: +List<String>) -> M.Slot:
+def array_default_slot(kind: U32, +element: U32, symbols: +List<String>) -> M.Slot:
   match kind:
-    case 1: Bool.pick(M.Slot, U32.is_eq(element, 6), M.Slot{2, 0}, M.Slot{1, 0})
-    case _: M.Slot{3, 0}
+    case 1:
+      Bool.pick(M.Slot, U32.is_eq(element, 11), M.Slot{4, 0},
+        Bool.pick(M.Slot, U32.is_eq(element, 7), M.Slot{5, 0},
+          Bool.pick(M.Slot, U32.is_eq(element, 6), M.Slot{2, 0}, M.Slot{1, 0})))
+    case _:
+      M.Slot{3, 0}
 
 def new_array_entry(+vm: M.VM, +frame: M.Frame, id: U32, +element: U32, +kind: U32, count: U32) -> Result<&2, &2, String, M.VM>:
   do Result<&2, &2, String, M.VM>:
@@ -1007,6 +1098,8 @@ def array_store_value(frame: M.Frame, expected: U32) -> Result<&2, &2, String, F
   match expected:
     case 2: F.pop(frame, 0)
     case 3: F.pop(frame, 2)
+    case 4: F.pop(frame, 4)
+    case 5: F.pop(frame, 5)
     case _: F.pop(frame, 1)
 
 def array_store_start(+vm: M.VM, popped: F.Popped, expected: U32) -> Result<&2, &2, String, M.VM>:
@@ -1113,6 +1206,162 @@ def literal_string(+vm: M.VM, +frame: M.Frame, +symbol: U32) -> Result<&2, &2, S
     result : M.VM <- literal_string_found(vm, frame, symbol, class, found)
     return result
 
+def wide_read_entry(tag: U32, result: Result<&2, &2, String, M.HeapEntry>) -> Result<&2, &2, String, W.Words>:
+  match result:
+    case Fail{error}:
+      Fail{error}
+    case Done{+entry}:
+      match entry:
+        case M.HeapEntry{class, kind, element, fields, values, chars}:
+          do Result<&2, &2, String, W.Words>:
+            valid_kind : Unit <- S.check(U32.is_eq(kind, 9), "InvalidWideValue")
+            valid_tag : Unit <- S.check(U32.is_eq(element, tag), "InvalidWideValue")
+            return W.Words{H.wide_high(entry), H.wide_low(entry)}
+
+def wide_read_bits(+vm: M.VM, tag: U32, +bits: U32) -> Result<&2, &2, String, W.Words>:
+  Bool.pick(Result<&2, &2, String, W.Words>, U32.is_eq(bits, 0), Done{W.Words{0, 0}}, wide_read_entry(tag, H.get(S.heap(vm), bits)))
+
+def wide_read(+vm: M.VM, +tag: U32, slot: M.Slot) -> Result<&2, &2, String, W.Words>:
+  match slot:
+    case M.Slot{slot_tag, bits}:
+      do Result<&2, &2, String, W.Words>:
+        valid_tag : Unit <- S.check(U32.is_eq(slot_tag, tag), "InvalidWideValue")
+        value : W.Words <- wide_read_bits(vm, tag, bits)
+        return value
+
+def wide_alloc(+vm: M.VM, tag: U32, value: W.Words) -> Result<&2, &2, String, H.Allocation>:
+  match value:
+    case W.Words{+high, +low}:
+      zero : Bool = U32.is_eq(high, 0) && U32.is_eq(low, 0)
+      Bool.pick(Result<&2, &2, String, H.Allocation>, zero, Done{H.Allocation{vm, 0}}, H.allocate(vm, H.wide_entry(tag, high, low)))
+
+def wide_push_alloc(+vm: M.VM, +frame: M.Frame, tag: U32, max: U32, result: Result<&2, &2, String, H.Allocation>) -> Result<&2, &2, String, M.VM>:
+  match result:
+    case Fail{error}:
+      Fail{error}
+    case Done{H.Allocation{updated, reference}}:
+      do Result<&2, &2, String, M.VM>:
+        +pushed : M.Frame <- F.push(S.advance(frame), M.Slot{tag, reference}, max)
+        return S.commit(updated, S.frame_stack(pushed, S.stack(pushed)))
+
+def wide_constant(+vm: M.VM, +frame: M.Frame, high: U32, low: U32, +tag: U32, max: U32) -> Result<&2, &2, String, M.VM>:
+  wide_push_alloc(vm, frame, tag, max, wide_alloc(vm, tag, W.Words{high, low}))
+
+def wide_binary_value(op: U32, left: W.Words, right: W.Words) -> W.Words:
+  match op:
+    case 97: W.add(left, right)
+    case 101: W.sub(left, right)
+    case 105: W.mul(left, right)
+    case 109: W.signed_divide(left, right)
+    case 113: W.signed_remainder(left, right)
+    case 103: W.double_sub(left, right)
+    case 121: W.shl(left, W.long_to_int(right))
+    case 125: W.sar(left, W.long_to_int(right))
+    case 127: W.bit_and(left, right)
+    case 129: W.bit_or(left, right)
+    case 131: W.bit_xor(left, right)
+    case _: W.Words{0, 0}
+
+def wide_binary_finish(+vm: M.VM, +op: U32, +tag: U32, first_value: M.Slot, second: F.Popped, max: U32) -> Result<&2, &2, String, M.VM>:
+  match second:
+    case F.Popped{+second_frame, second_value}:
+      do Result<&2, &2, String, M.VM>:
+        +right : W.Words <- wide_read(vm, tag, first_value)
+        left : W.Words <- wide_read(vm, tag, second_value)
+        zero : Unit <- S.check(Bool.not(U32.is_eq(op, 109) && W.long_zero(right)) && Bool.not(U32.is_eq(op, 113) && W.long_zero(right)), "java/lang/ArithmeticException")
+        result : Result<&2, &2, String, H.Allocation> = wide_alloc(vm, tag, wide_binary_value(op, left, right))
+        output : M.VM <- wide_push_alloc(vm, second_frame, tag, max, result)
+        return output
+
+def wide_binary_second(frame: M.Frame, vm: M.VM, op: U32, +tag: U32, first: F.Popped, max: U32) -> Result<&2, &2, String, M.VM>:
+  match first:
+    case F.Popped{first_frame, first_value}:
+      do Result<&2, &2, String, M.VM>:
+        second : F.Popped <- F.pop(first_frame, tag)
+        result : M.VM <- wide_binary_finish(vm, op, tag, first_value, second, max)
+        return result
+
+def wide_binary(+frame: M.Frame, vm: M.VM, op: U32, +tag: U32, max: U32) -> Result<&2, &2, String, M.VM>:
+  do Result<&2, &2, String, M.VM>:
+    first : F.Popped <- F.pop(frame, tag)
+    result : M.VM <- wide_binary_second(frame, vm, op, tag, first, max)
+    return result
+
+def wide_double_unary_finish(+vm: M.VM, popped: F.Popped, max: U32) -> Result<&2, &2, String, M.VM>:
+  match popped:
+    case F.Popped{+next, value}:
+      do Result<&2, &2, String, M.VM>:
+        words : W.Words <- wide_read(vm, 5, value)
+        result : Result<&2, &2, String, H.Allocation> = wide_alloc(vm, 5, W.double_neg(words))
+        output : M.VM <- wide_push_alloc(vm, next, 5, max, result)
+        return output
+
+def wide_double_unary(+vm: M.VM, frame: M.Frame, max: U32) -> Result<&2, &2, String, M.VM>:
+  do Result<&2, &2, String, M.VM>:
+    popped : F.Popped <- F.pop(frame, 5)
+    result : M.VM <- wide_double_unary_finish(vm, popped, max)
+    return result
+
+def wide_unary_finish(+vm: M.VM, popped: F.Popped, +tag: U32, max: U32) -> Result<&2, &2, String, M.VM>:
+  match popped:
+    case F.Popped{+next, value}:
+      do Result<&2, &2, String, M.VM>:
+        words : W.Words <- wide_read(vm, tag, value)
+        result : Result<&2, &2, String, H.Allocation> = wide_alloc(vm, tag, W.neg(words))
+        output : M.VM <- wide_push_alloc(vm, next, tag, max, result)
+        return output
+
+def wide_unary(+vm: M.VM, frame: M.Frame, +tag: U32, max: U32) -> Result<&2, &2, String, M.VM>:
+  do Result<&2, &2, String, M.VM>:
+    popped : F.Popped <- F.pop(frame, tag)
+    result : M.VM <- wide_unary_finish(vm, popped, tag, max)
+    return result
+
+def wide_compare_finish(+vm: M.VM, first_value: M.Slot, second: F.Popped) -> Result<&2, &2, String, M.VM>:
+  match second:
+    case F.Popped{+second_frame, second_value}:
+      do Result<&2, &2, String, M.VM>:
+        right : W.Words <- wide_read(vm, 4, first_value)
+        left : W.Words <- wide_read(vm, 4, second_value)
+        return S.commit(vm, S.frame_stack(S.advance(second_frame), Con{M.Slot{1, W.long_cmp(left, right)}, S.stack(second_frame)}))
+
+def wide_compare_start(vm: M.VM, first: F.Popped) -> Result<&2, &2, String, M.VM>:
+  match first:
+    case F.Popped{first_frame, first_value}:
+      do Result<&2, &2, String, M.VM>:
+        second : F.Popped <- F.pop(first_frame, 4)
+        result : M.VM <- wide_compare_finish(vm, first_value, second)
+        return result
+
+def wide_compare(+frame: M.Frame, vm: M.VM) -> Result<&2, &2, String, M.VM>:
+  do Result<&2, &2, String, M.VM>:
+    first : F.Popped <- F.pop(frame, 4)
+    result : M.VM <- wide_compare_start(vm, first)
+    return result
+def convert_i2l_finish(+vm: M.VM, popped: F.Popped, max: U32) -> Result<&2, &2, String, M.VM>:
+  match popped:
+    case F.Popped{+next, value}:
+      wide_push_alloc(vm, next, 4, max, wide_alloc(vm, 4, W.int_to_long(V.slot_bits(value))))
+
+def convert_i2l(+vm: M.VM, frame: M.Frame, max: U32) -> Result<&2, &2, String, M.VM>:
+  do Result<&2, &2, String, M.VM>:
+    popped : F.Popped <- F.pop(frame, 1)
+    result : M.VM <- convert_i2l_finish(vm, popped, max)
+    return result
+
+def convert_l2i_finish(+vm: M.VM, popped: F.Popped) -> Result<&2, &2, String, M.VM>:
+  match popped:
+    case F.Popped{+next, value}:
+      do Result<&2, &2, String, M.VM>:
+        words : W.Words <- wide_read(vm, 4, value)
+        return S.commit(vm, S.frame_stack(S.advance(next), Con{M.Slot{1, W.long_to_int(words)}, S.stack(next)}))
+
+def convert_l2i(+vm: M.VM, frame: M.Frame) -> Result<&2, &2, String, M.VM>:
+  do Result<&2, &2, String, M.VM>:
+    popped : F.Popped <- F.pop(frame, 4)
+    result : M.VM <- convert_l2i_finish(vm, popped)
+    return result
+
 def constant_push(+vm: M.VM, +frame: M.Frame, value: U32, tag: U32, max: U32) -> Result<&2, &2, String, M.VM>:
   do Result<&2, &2, String, M.VM>:
     +pushed : M.Frame <- F.push(frame, M.Slot{tag, value}, max)
@@ -1217,6 +1466,17 @@ def narrow(vm: M.VM, frame: M.Frame, op: U32) -> Result<&2, &2, String, M.VM>:
     result : M.VM <- narrow_finish(vm, popped, op)
     return result
 
+def load_local(+vm: M.VM, +frame: M.Frame, index: U32, tag: U32) -> Result<&2, &2, String, M.VM>:
+  do Result<&2, &2, String, M.VM>:
+    slot : M.Slot <- F.local(frame, index, tag)
+    return S.commit(vm, S.frame_stack(S.advance(frame), Con{slot, S.stack(frame)}))
+
+def store_local(+vm: M.VM, +frame: M.Frame, index: U32, tag: U32) -> Result<&2, &2, String, M.VM>:
+  do Result<&2, &2, String, M.VM>:
+    popped : F.Popped <- F.pop(frame, tag)
+    result : M.VM <- store_popped(vm, popped, index)
+    return result
+
 def step(+vm: M.VM, +frame: M.Frame, +method: M.LoadedMethod, instruction: M.Instruction) -> Result<&2, &2, String, M.VM>:
 
 
@@ -1224,12 +1484,16 @@ def step(+vm: M.VM, +frame: M.Frame, +method: M.LoadedMethod, instruction: M.Ins
   match op:
     case 0: Done{S.commit(vm, S.advance(frame))}
     case 79: array_store(vm, frame, 1)
+    case 80: array_store(vm, frame, 4)
+    case 82: array_store(vm, frame, 5)
     case 81: array_store(vm, frame, 3)
     case 83: array_store(vm, frame, 2)
     case 84: array_store(vm, frame, 1)
     case 85: array_store(vm, frame, 1)
     case 1: constant_push(vm, frame, 0, 3, method_max_stack(method))
     case 46: array_load(vm, frame, 1)
+    case 47: array_load(vm, frame, 4)
+    case 49: array_load(vm, frame, 5)
     case 48: array_load(vm, frame, 1)
     case 50: array_load(vm, frame, 2)
     case 51: array_load(vm, frame, 1)
@@ -1241,6 +1505,10 @@ def step(+vm: M.VM, +frame: M.Frame, +method: M.LoadedMethod, instruction: M.Ins
     case 6: constant_push(vm, frame, 3, 1, method_max_stack(method))
     case 7: constant_push(vm, frame, 4, 1, method_max_stack(method))
     case 8: constant_push(vm, frame, 5, 1, method_max_stack(method))
+    case 9: wide_constant(vm, frame, 0, 0, 4, method_max_stack(method))
+    case 10: wide_constant(vm, frame, 0, 1, 4, method_max_stack(method))
+    case 14: wide_constant(vm, frame, 0, 0, 5, method_max_stack(method))
+    case 15: wide_constant(vm, frame, 1072693248, 0, 5, method_max_stack(method))
     case 25:
       do Result<&2, &2, String, M.VM>:
         slot : M.Slot <- F.local(frame, a, 3)
@@ -1267,12 +1535,23 @@ def step(+vm: M.VM, +frame: M.Frame, +method: M.LoadedMethod, instruction: M.Ins
     case 12: constant_push(vm, frame, 1065353216, 2, method_max_stack(method))
     case 13: constant_push(vm, frame, 1073741824, 2, method_max_stack(method))
     case 18: literal_push(vm, frame, a, b, method_max_stack(method))
+    case 20: wide_constant(vm, frame, a, b, c, method_max_stack(method))
     case 19: literal_push(vm, frame, a, b, method_max_stack(method))
 
     case 21:
       do Result<&2, &2, String, M.VM>:
         slot : M.Slot <- F.local(frame, a, 1)
         return S.commit(vm, S.frame_stack(S.advance(frame), Con{slot, S.stack(frame)}))
+    case 22: load_local(vm, frame, a, 4)
+    case 24: load_local(vm, frame, a, 5)
+    case 30: load_local(vm, frame, 0, 4)
+    case 31: load_local(vm, frame, 1, 4)
+    case 32: load_local(vm, frame, 2, 4)
+    case 33: load_local(vm, frame, 3, 4)
+    case 38: load_local(vm, frame, 0, 5)
+    case 39: load_local(vm, frame, 1, 5)
+    case 40: load_local(vm, frame, 2, 5)
+    case 41: load_local(vm, frame, 3, 5)
     case 26:
       do Result<&2, &2, String, M.VM>:
         slot : M.Slot <- F.local(frame, 0, 1)
@@ -1314,6 +1593,16 @@ def step(+vm: M.VM, +frame: M.Frame, +method: M.LoadedMethod, instruction: M.Ins
         popped : F.Popped <- F.pop(frame, 1)
         result : M.VM <- store_popped(vm, popped, a)
         return result
+    case 55: store_local(vm, frame, a, 4)
+    case 57: store_local(vm, frame, a, 5)
+    case 63: store_local(vm, frame, 0, 4)
+    case 64: store_local(vm, frame, 1, 4)
+    case 65: store_local(vm, frame, 2, 4)
+    case 66: store_local(vm, frame, 3, 4)
+    case 71: store_local(vm, frame, 0, 5)
+    case 72: store_local(vm, frame, 1, 5)
+    case 73: store_local(vm, frame, 2, 5)
+    case 74: store_local(vm, frame, 3, 5)
     case 132: iinc(vm, frame, a, b)
     case 59:
       do Result<&2, &2, String, M.VM>:
@@ -1385,6 +1674,19 @@ def step(+vm: M.VM, +frame: M.Frame, +method: M.LoadedMethod, instruction: M.Ins
         popped : F.Popped <- F.pop(frame, 3)
         result : M.VM <- store_popped(vm, popped, 3)
         return result
+    case 103: wide_binary(frame, vm, 103, 5, method_max_stack(method))
+    case 119: wide_double_unary(vm, frame, method_max_stack(method))
+    case 101: wide_binary(frame, vm, 101, 4, method_max_stack(method))
+    case 105: wide_binary(frame, vm, 105, 4, method_max_stack(method))
+    case 109: wide_binary(frame, vm, 109, 4, method_max_stack(method))
+    case 113: wide_binary(frame, vm, 113, 4, method_max_stack(method))
+    case 121: wide_binary(frame, vm, 121, 4, method_max_stack(method))
+    case 123: wide_binary(frame, vm, 123, 4, method_max_stack(method))
+    case 125: wide_binary(frame, vm, 125, 4, method_max_stack(method))
+    case 127: wide_binary(frame, vm, 127, 4, method_max_stack(method))
+    case 129: wide_binary(frame, vm, 129, 4, method_max_stack(method))
+    case 131: wide_binary(frame, vm, 131, 4, method_max_stack(method))
+    case 117: wide_unary(vm, frame, 4, method_max_stack(method))
 
     case 120: binary_int(frame, vm, 120)
     case 98: float_binary(frame, vm, 98)
@@ -1397,6 +1699,8 @@ def step(+vm: M.VM, +frame: M.Frame, +method: M.LoadedMethod, instruction: M.Ins
     case 126: binary_int(frame, vm, 126)
     case 128: binary_int(frame, vm, 128)
     case 130: binary_int(frame, vm, 130)
+    case 133: convert_i2l(vm, frame, method_max_stack(method))
+    case 136: convert_l2i(vm, frame)
     case 134:
       do Result<&2, &2, String, M.VM>:
         popped : F.Popped <- F.pop(frame, 1)
@@ -1463,9 +1767,20 @@ def step(+vm: M.VM, +frame: M.Frame, +method: M.LoadedMethod, instruction: M.Ins
     case 164: branch_compare(frame, vm, a, 164)
     case 149: float_compare(frame, vm, 149)
     case 150: float_compare(frame, vm, 150)
-    case 175:
+    case 148: wide_compare(frame, vm)
+    case 173:
+      do Result<&2, &2, String, M.VM>:
+        popped : F.Popped <- F.pop(frame, 4)
+        result : M.VM <- return_popped(vm, popped)
+        return result
+    case 174:
       do Result<&2, &2, String, M.VM>:
         popped : F.Popped <- F.pop(frame, 2)
+        result : M.VM <- return_popped(vm, popped)
+        return result
+    case 175:
+      do Result<&2, &2, String, M.VM>:
+        popped : F.Popped <- F.pop(frame, 5)
         result : M.VM <- return_popped(vm, popped)
         return result
     case 176:
@@ -1533,6 +1848,32 @@ def enter_handler(+vm: M.VM, frame: M.Frame, target: U32, fuel: Nat, continue: U
   +resumed = S.tick(S.with_status(S.commit(vm, S.frame_stack(S.frame_pc(frame, target), Con{M.Slot{3, S.exception(vm)}, Nil{}})), 0))
   +cleared = S.with_exception(resumed, 0)
   continue(S.status(cleared), fuel, cleared)
+def reflective_exception_fill(+entry: M.HeapEntry, original: U32) -> M.HeapEntry:
+  match entry:
+    case M.HeapEntry{kind_class, kind, element, +fields, values, chars}:
+      M.HeapEntry{kind_class, kind, element, H.binding_set(fields, 1, M.Slot{3, original}), values, chars}
+
+def reflective_exception_entry(class: U32, original: U32) -> M.HeapEntry:
+  reflective_exception_fill(H.throwable_entry(class), original)
+
+def reflective_exception_wrap_alloc(+vm: M.VM, result: Result<&2, &2, String, H.Allocation>) -> M.VM:
+  match result:
+    case Fail{error}: S.fail(vm, error)
+    case Done{H.Allocation{vm, reference}}: S.with_exception(vm, reference)
+
+def reflective_exception_wrap(+vm: M.VM, effect: M.Effect, caller: M.Frame) -> M.VM:
+  match effect:
+    case M.ReflectCall{}:
+      Bool.pick(M.VM, U32.is_eq(S.initializing(caller), 4294967294),
+        reflective_exception_wrap_alloc(vm, H.allocate(vm, reflective_exception_entry(H.named_class(S.classes(vm), S.symbols(vm), "java/lang/reflect/InvocationTargetException"), S.exception(vm)))),
+        vm)
+    case M.ReflectConstructor{reference}:
+      Bool.pick(M.VM, U32.is_le(S.initializing(caller), 4294967292),
+        reflective_exception_wrap_alloc(vm, H.allocate(vm, reflective_exception_entry(H.named_class(S.classes(vm), S.symbols(vm), "java/lang/reflect/InvocationTargetException"), S.exception(vm)))),
+        vm)
+    case _:
+      vm
+
 
 def fail_initializer_state(+vm: M.VM, owner: U32) -> M.VM:
   match owner:
@@ -1554,8 +1895,10 @@ def handler_target(found: Maybe<&2, U32>) -> U32:
     case Nil{}: uncaught(fail_initializer(vm, caller), error)
     case Con{+next_caller, +next_callers}:
       +next = S.with_frames(fail_initializer(vm, caller), Con{next_caller, next_callers})
-      +target = handler_target(frame_exception_handler(next, next_caller, S.invoke_pc(caller)))
-      Bool.pick(M.VM, U32.is_eq(target, 4294967295), exception_unwind_miss(error, next, next_caller, next_callers, fuel, k), enter_handler(next, next_caller, target, fuel, k))
+      +wrapped = reflective_exception_wrap(next, S.host_effect(next), next_caller)
+      +target = handler_target(frame_exception_handler(wrapped, next_caller, S.invoke_pc(caller)))
+      Bool.pick(M.VM, U32.is_eq(target, 4294967295), exception_unwind_miss(error, wrapped, next_caller, next_callers, fuel, k), enter_handler(wrapped, next_caller, target, fuel, k))
+
 
 def exception_unwind_choice(miss: Bool, error: String, +vm: M.VM, +frame: M.Frame, frames: +List<M.Frame>, fuel: Nat, k: U32 -> Nat -> M.VM -> M.VM, target: U32) -> M.VM:
   match miss:
@@ -1570,21 +1913,10 @@ def exception_unwind(+error: String, +vm: M.VM, +frames: +List<M.Frame>, +fuel: 
         case Nil{}: uncaught(fail_initializer(vm, current), error)
         case Con{+caller, callers}:
           +next = S.with_frames(fail_initializer(vm, current), Con{caller, callers})
-          +target = handler_target(frame_exception_handler(next, caller, S.invoke_pc(current)))
-          exception_unwind_choice(U32.is_eq(target, 4294967295), error, next, caller, callers, fuel, k, target)
+          +wrapped = reflective_exception_wrap(next, S.host_effect(next), caller)
+          +target = handler_target(frame_exception_handler(wrapped, caller, S.invoke_pc(current)))
+          exception_unwind_choice(U32.is_eq(target, 4294967295), error, wrapped, caller, callers, fuel, k, target)
 
-def allocate_named_result(+vm: M.VM, name: String, result: Result<&2, &2, String, H.Allocation>) -> M.VM:
-  match result:
-    case Fail{error}: S.with_exception(vm, 2)
-    case Done{allocation}:
-      match allocation:
-        case H.Allocation{updated, reference}: S.with_exception(updated, reference)
-
-def allocate_named(+vm: M.VM, +name: String) -> M.VM:
-  allocate_named_result(vm, name, H.allocate(vm, H.throwable_entry(H.named_class(S.classes(vm), S.symbols(vm), name))))
-
-def ensure_throw(+vm: M.VM, error: String) -> M.VM:
-  Bool.pick(M.VM, U32.is_ne(S.exception(vm), 0), vm, allocate_named(vm, error))
 
 def exception_resume_found(error: String, +vm: M.VM, +frame: M.Frame, fuel: Nat, continue: U32 -> Nat -> M.VM -> M.VM, found: Maybe<&2, U32>) -> M.VM:
   match found:
@@ -1603,17 +1935,25 @@ def proxy_wrap_exception_alloc(+vm: M.VM, result: Result<&2, &2, String, H.Alloc
     case Fail{error}: S.fail(vm, error)
     case Done{H.Allocation{vm, reference}}: S.with_exception(vm, reference)
 
+def proxy_declared_exception(fuel: Nat, +thrown: U32, +exceptions: +List<U32>, +classes: +List<M.LoadedClass>, +symbols: +List<String>) -> Bool:
+  match fuel exceptions:
+    case 0n _: False{}
+    case 1n+remaining Nil{}: False{}
+    case 1n+remaining Con{declared, rest}:
+      H.assignable(classes, symbols, thrown, declared) || proxy_declared_exception(remaining, thrown, rest, classes, symbols)
+
 def proxy_wrap_exception_effect(effect: M.Effect, +vm: M.VM, +error: String) -> M.VM:
   match effect:
-    case M.ProxyCall{descriptor}:
+    case M.ProxyCall{descriptor, +exceptions}:
       +thrown = thrown_class_of(vm)
       +runtime = H.named_class(S.classes(vm), S.symbols(vm), "java/lang/RuntimeException")
       +error_class = H.named_class(S.classes(vm), S.symbols(vm), "java/lang/Error")
       unchecked : Bool = H.assignable(S.classes(vm), S.symbols(vm), thrown, runtime) || H.assignable(S.classes(vm), S.symbols(vm), thrown, error_class)
+      declared : Bool = proxy_declared_exception(256n, thrown, exceptions, S.classes(vm), S.symbols(vm))
       +original = S.exception(vm)
       +wrapper_class = H.named_class(S.classes(vm), S.symbols(vm), "java/lang/reflect/UndeclaredThrowableException")
       wrapper_entry : M.HeapEntry = proxy_exception_entry(wrapper_class, original)
-      Bool.pick(M.VM, unchecked, vm, proxy_wrap_exception_alloc(vm, H.allocate(vm, wrapper_entry)))
+      Bool.pick(M.VM, unchecked || declared, vm, proxy_wrap_exception_alloc(vm, H.allocate(vm, wrapper_entry)))
     case _: vm
 
 def proxy_wrap_exception(+vm: M.VM, +error: String) -> M.VM:
@@ -1752,8 +2092,8 @@ def resume_ok_effect(+vm: M.VM, +handle: U32, extra: U32, bytes: +List<U32>, eff
     case M.Idle{}: resume_clear(vm)
     case M.ReflectCall{}: resume_clear(vm)
     case M.ReflectConstructor{reference}: resume_clear(vm)
-    case M.ProxyCall{descriptor}: resume_clear(vm)
-    case M.ClassForName{}: resume_clear(vm)
+    case M.ProxyCall{descriptor, exceptions}: resume_clear(vm)
+    case M.ClassForName{target}: resume_clear(vm)
     case M.OpenFile{path, mode, receiver}: resume_open_to(vm, handle, receiver)
     case M.StatPath{path, op}: resume_int(vm, extra)
     case M.ReadBytes{old, count, timeout}: resume_read_bytes(bytes, vm)

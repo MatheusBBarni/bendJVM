@@ -6,6 +6,11 @@ import ../heap/heap.bend as H
 import ../loader/symbols.bend as Sy
 import ./outcome.bend as O
 import ./library.bend as L
+import ../runtime/wide.bend as W
+type LongState is Data:
+  Pending{division: W.Division}
+  Ready{quotient: W.Words, remainder: W.Words, zero: Bool}
+
 
 
 
@@ -57,6 +62,37 @@ def float_special(+bits: U32, special: Bool) -> String:
 
 def float_show(+bits: U32) -> String:
   float_special(bits, U32.is_eq(U32.and(bits, 2139095040), 2139095040))
+@unsafe def long_digits(n: Nat, +value: W.Words, +acc: String, state: Maybe<&2, LongState>) -> String:
+  match n state:
+    case 0n _:
+      acc
+    case 1n+p None{}:
+      long_digits(n, value, acc, Some{Pending{W.unsigned_divide(value, W.Words{0, 10})}})
+    case 1n+p Some{Pending{division}}:
+      match division:
+        case W.Division{+quotient, remainder}:
+          long_digits(n, value, acc, Some{Ready{quotient, remainder, W.long_zero(quotient)}})
+    case 1n+p Some{Ready{quotient, remainder, zero}}:
+      match zero:
+        case True{}:
+          SCon{Chr{U32.add(48, W.long_to_int(remainder))}, acc}
+        case False{}:
+          long_digits(p, quotient, SCon{Chr{U32.add(48, W.long_to_int(remainder))}, acc}, None{})
+
+def long_show_words(+value: W.Words) -> String:
+  +negative = W.sign_bit(value)
+  +magnitude = Bool.pick(W.Words, negative, W.neg(value), value)
+  +digits = long_digits(128n, magnitude, "", None{})
+  Bool.pick(String, negative, "-" ++ digits, digits)
+
+def long_show(+heap: +List<M.HeapEntry>, bits: U32) -> Result<&2, &2, String, String>:
+  do Result<&2, &2, String, String>:
+    +entry : M.HeapEntry <- H.get(heap, bits)
+    return long_show_words(W.Words{H.wide_high(entry), H.wide_low(entry)})
+def double_show(+heap: +List<M.HeapEntry>, bits: U32) -> Result<&2, &2, String, String>:
+  do Result<&2, &2, String, String>:
+    +entry : M.HeapEntry <- H.get(heap, bits)
+    return W.double_show(W.Words{H.wide_high(entry), H.wide_low(entry)})
 
 
 def argument(args: +List<M.Slot>, tag: U32) -> Result<&2, &2, String, U32>:
@@ -105,6 +141,16 @@ def execute(id: U32, +heap: +List<M.HeapEntry>, +args: +List<M.Slot>) -> Result<
       do Result<&2, &2, String, Maybe<&2, String>>:
         bits : U32 <- argument(args, 1)
         return Some{Char.show(Chr{bits})}
+    case 281:
+      do Result<&2, &2, String, Maybe<&2, String>>:
+        bits : U32 <- argument(args, 4)
+        text : String <- long_show(heap, bits)
+        return Some{text}
+    case 282:
+      do Result<&2, &2, String, Maybe<&2, String>>:
+        bits : U32 <- argument(args, 5)
+        text : String <- double_show(heap, bits)
+        return Some{text}
     case 6:
       do Result<&2, &2, String, Maybe<&2, String>>:
         bits : U32 <- argument(args, 1)
@@ -719,6 +765,8 @@ def execute_vm(id: U32, +vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, Strin
     case 4: println_out(vm, args, 4)
     case 5: println_out(vm, args, 5)
     case 6: println_out(vm, args, 6)
+    case 281: println_out(vm, args, 281)
+    case 282: println_out(vm, args, 282)
     case 9: open_resource(vm, args)
     case 10: read_stream(vm, args)
     case 11: close_stream(vm, args)
@@ -778,6 +826,12 @@ def execute_vm(id: U32, +vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, Strin
     case 166: L.float_value_of(vm, args)
     case 167: L.float_unbox(vm, args)
     case 168: L.primitive_to_string(vm, args)
+    case 275: L.wide_box(vm, args, "java/lang/Long", 4)
+    case 276: L.wide_value(vm, args, 4)
+    case 277: L.long_to_string(vm, args)
+    case 278: L.wide_box(vm, args, "java/lang/Double", 5)
+    case 279: L.wide_value(vm, args, 5)
+    case 280: L.double_to_string(vm, args)
     case 127: L.class_declared_fields(vm, args)
     case 128: L.class_declared_methods(vm, args)
     case 129: L.class_declared_constructors(vm, args)
@@ -788,6 +842,12 @@ def execute_vm(id: U32, +vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, Strin
     case 134: L.reflect_method_modifiers(vm, args)
     case 135: L.reflect_method_return_type(vm, args)
     case 136: L.reflect_method_parameter_types(vm, args)
+    case 288: L.reflect_method_is_default(vm, args)
+    case 289: L.reflect_method_return_type(vm, args)
+    case 290: L.reflect_method_generic_parameter_types(vm, args)
+    case 291: L.reflect_method_get_generic_exception_types(vm, args)
+    case 292: L.reflect_annotated_type_get_owner(vm, args)
+    case 293: L.reflect_annotated_type_get_actuals(vm, args)
     case 137: L.reflect_constructor_name(vm, args)
     case 138: L.reflect_constructor_modifiers(vm, args)
     case 139: L.reflect_constructor_parameter_types(vm, args)
@@ -848,6 +908,9 @@ def execute_vm(id: U32, +vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, Strin
     case 241: L.reflect_annotated_type_get_annotation(vm, args)
     case 242: L.reflect_annotated_type_get_annotations(vm, args)
     case 243: L.reflect_annotated_type_get_annotations(vm, args)
+    case 286: L.reflect_annotated_type_get_type(vm, args)
+    case 287: L.type_get_type_name(vm, args)
+    case 249: L.proxy_init(vm, args)
     case 245: L.proxy_new_instance(vm, args)
     case 246: L.proxy_get_proxy_class(vm, args)
     case 247: L.proxy_is_proxy_class(vm, args)
@@ -976,6 +1039,7 @@ def execute_vm(id: U32, +vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, Strin
     case 113: L.throwable_get_suppressed(vm, args)
     case 114: L.throwable_to_string(vm, args)
     case 273: L.throwable_get_cause(vm, args)
+    case 283: L.throwable_get_cause(vm, args)
     case 211: L.throwable_init0(vm, args)
     case 212: L.throwable_init_s(vm, args)
     case 213: L.throwable_init_t(vm, args)

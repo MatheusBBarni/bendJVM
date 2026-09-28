@@ -80,27 +80,55 @@ def method_locals(value: M.LoadedMethod) -> +List<M.Slot>:
     case M.LoadedMethod{id, owner, name, descriptor, flags, parameters, resultTag, maxStack, maxLocals, instructions, handlers, intrinsic}:
       M.replace(M.Slot, M.zeros(U32.to_nat(maxLocals)), 0n, M.Slot{1, 0})
 
-def start_initializer_found(vm: M.VM, mainFrame: M.Frame, owner: U32, found: Maybe<&2, M.LoadedMethod>) -> M.VM:
-  match found:
-    case None{}: S.with_frames(vm, [mainFrame])
+def start_class_chain_parent(fuel: Nat, +vm: M.VM, parent: U32, +tail: +List<M.Frame>, next: M.VM -> U32 -> +List<M.Frame> -> M.VM) -> M.VM:
+  match parent:
+    case 4294967295: S.with_frames(vm, tail)
+    case parent_id: next(vm, parent_id, tail)
+
+def start_class_chain_method(fuel: Nat, +vm: M.VM, +id: U32, parent: U32, +tail: +List<M.Frame>, result: Maybe<&2, M.LoadedMethod>, next: M.VM -> U32 -> +List<M.Frame> -> M.VM) -> M.VM:
+  match result:
+    case None{}: S.fail(vm, "NoSuchMethodError: <clinit>")
     case Some{+method}:
-      +id = M.loaded_method_id(method)
-      S.with_frames(vm, [M.Frame{id, 0, 0, method_locals(method), Nil{}, owner}, mainFrame])
+      +updated : M.VM = S.set_class_state(vm, id, 1)
+      +frame : M.Frame = M.Frame{M.loaded_method_id(method), 0, 0, method_locals(method), Nil{}, id}
+      +next_tail : +List<M.Frame> = Con{frame, tail}
+      start_class_chain_parent(fuel, updated, parent, next_tail, next)
 
-def start_initializer_method(+vm: M.VM, mainFrame: M.Frame, owner: U32, initializer: U32) -> M.VM:
-  start_initializer_found(vm, mainFrame, owner, M.nth(M.LoadedMethod, S.methods(vm), initializer))
+def start_class_chain_initializer(fuel: Nat, +vm: M.VM, id: U32, parent: U32, initializer: U32, +tail: +List<M.Frame>, next: M.VM -> U32 -> +List<M.Frame> -> M.VM) -> M.VM:
+  match initializer:
+    case 4294967295:
+      +updated : M.VM = S.set_class_state(vm, id, 2)
+      start_class_chain_parent(fuel, updated, parent, tail, next)
+    case method_id:
+      start_class_chain_method(fuel, vm, id, parent, tail, M.nth(M.LoadedMethod, S.methods(vm), method_id), next)
 
-def start_class_found(+vm: M.VM, mainFrame: M.Frame, found: Maybe<&2, M.LoadedClass>) -> M.VM:
+def start_class_chain_state(fuel: Nat, +vm: M.VM, id: U32, +parent: U32, initializer: U32, +state: U32, +tail: +List<M.Frame>, next: M.VM -> U32 -> +List<M.Frame> -> M.VM) -> M.VM:
+  +failed : Bool = U32.is_eq(state, 3)
+  +ready : Bool = U32.is_eq(state, 1) || U32.is_eq(state, 2)
+  +fresh : Bool = U32.is_eq(state, 0)
+  Bool.pick(M.VM, failed, S.fail(vm, "NoClassDefFoundError"),
+    Bool.pick(M.VM, ready, S.with_frames(vm, tail),
+      Bool.pick(M.VM, fresh, start_class_chain_initializer(fuel, vm, id, parent, initializer, tail, next), S.fail(vm, "NoClassDefFoundError"))))
+
+def start_class_chain_class(fuel: Nat, +vm: M.VM, +tail: +List<M.Frame>, class: M.LoadedClass, next: M.VM -> U32 -> +List<M.Frame> -> M.VM) -> M.VM:
+  match class:
+    case M.LoadedClass{id, name, parent, interfaces, fields, methods, initializer, state}:
+      start_class_chain_state(fuel, vm, id, parent, initializer, state, tail, next)
+
+def start_class_chain_found(fuel: Nat, +vm: M.VM, owner: U32, +tail: +List<M.Frame>, found: Maybe<&2, M.LoadedClass>, next: M.VM -> U32 -> +List<M.Frame> -> M.VM) -> M.VM:
   match found:
-    case None{}: S.with_frames(vm, [mainFrame])
-    case Some{class}:
-      M.LoadedClass{id, name, parent, interfaces, fields, methods, initializer, state} = class
-      match initializer:
-        case 4294967295: S.with_frames(vm, [mainFrame])
-        case value: start_initializer_method(vm, mainFrame, id, value)
+    case None{}: S.fail(vm, "NoClassDefFoundError")
+    case Some{class}: start_class_chain_class(fuel, vm, tail, class, next)
+
+def start_class_chain(fuel: Nat, +vm: M.VM, +owner: U32, +tail: +List<M.Frame>) -> M.VM:
+  match fuel:
+    case 0n: S.fail(vm, "NoClassDefFoundError")
+    case 1n+ +remaining:
+      start_class_chain_found(remaining, vm, owner, tail, M.nth(M.LoadedClass, S.classes(vm), owner),
+        next_vm => next_owner => +next_tail => start_class_chain(remaining, next_vm, next_owner, next_tail))
 
 def start_class(+vm: M.VM, mainFrame: M.Frame, owner: U32) -> M.VM:
-  start_class_found(vm, mainFrame, M.nth(M.LoadedClass, S.classes(vm), owner))
+  start_class_chain(256n, vm, owner, [mainFrame])
 
 
 def start_found(+vm: M.VM, found: Maybe<&2, M.LoadedMethod>) -> M.VM:

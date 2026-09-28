@@ -2,6 +2,7 @@ import Base
 import ../model.bend as M
 import ./reader.bend as R
 import ./constant_pool.bend as CP
+import ./attribute.bend as A
 import ./descriptor.bend as D
 
 # Annotation attributes are deliberately kept symbolic.  In particular, a
@@ -38,6 +39,36 @@ def word_reader(word: R.RWord) -> R.Reader:
   match word:
     case R.RWord{reader, value}:
       reader
+
+def code_attributes_checked(value: A.Attributes) -> Result<&2, &2, String, +List<M.Attribute>>:
+  match value:
+    case A.Attributes{+reader, +values}:
+      do Result<&2, &2, String, +List<M.Attribute>>:
+        R.finish(reader)
+        return values
+
+@unsafe def skip_code_exceptions_go(count: Nat, reader: R.Reader) -> Result<&2, &2, String, R.Reader>:
+  match count:
+    case 0n:
+      Done{reader}
+    case 1n+p:
+      do Result<&2, &2, String, R.Reader>:
+        next : R.Reader <- R.skip(reader, 8)
+        result : R.Reader <- skip_code_exceptions_go(p, next)
+        return result
+
+@unsafe def code_nested_attributes(bytes: +List<U32>, +pool: +List<M.Constant>) -> Result<&2, &2, String, +List<M.Attribute>>:
+  reader = R.new(bytes)
+  do Result<&2, &2, String, +List<M.Attribute>>:
+    +stack : R.RWord <- R.read_u2(reader)
+    +locals : R.RWord <- R.read_u2(word_reader(stack))
+    +length : R.RWord <- R.read_u4(word_reader(locals))
+    after_code : R.Reader <- R.skip(word_reader(length), word_value(length))
+    +exception_count : R.RWord <- R.read_u2(after_code)
+    after_exceptions : R.Reader <- skip_code_exceptions_go(U32.to_nat(word_value(exception_count)), word_reader(exception_count))
+    attributes : A.Attributes <- A.parse(after_exceptions, pool)
+    values : +List<M.Attribute> <- code_attributes_checked(attributes)
+    return values
 
 def invalid_annotation(message: String) -> Result<&2, &2, String, Unit>:
   Fail{"VmError.InvalidAnnotation: " ++ message}
@@ -1020,3 +1051,37 @@ def parse_attributes(attributes: +List<M.Attribute>, +pool: +List<M.Constant>) -
   do Result<&2, &2, String, M.AnnotationMetadata>:
     state : MetaState <- attributes_go(max_attributes(), attributes, pool, meta_empty())
     return meta_result(state)
+
+def classify_code(+name: String) -> AttrKind:
+  Bool.pick(AttrKind, String.eq(name, "RuntimeVisibleTypeAnnotations"), VisibleTypes{}, Bool.pick(AttrKind, String.eq(name, "RuntimeInvisibleTypeAnnotations"), InvisibleTypes{}, Unknown{}))
+
+@unsafe def code_attributes_go(fuel: Nat, attributes: +List<M.Attribute>, +pool: +List<M.Constant>, state: MetaState) -> Result<&2, &2, String, MetaState>:
+  match fuel attributes:
+    case 0n Nil{}:
+      Done{state}
+    case 0n Con{head, tail}:
+      Fail{"VmError.InvalidAnnotation: too many attributes"}
+    case 1n+p Nil{}:
+      Done{state}
+    case 1n+p Con{M.Attribute{name, +bytes}, tail}:
+      do Result<&2, &2, String, MetaState>:
+        +parsed : ParsedAttribute <- parse_one(classify_code(name), bytes, pool)
+        next_state : MetaState <- add_parsed(parsed, state)
+        next : MetaState <- code_attributes_go(p, tail, pool, next_state)
+        return next
+
+def parse_code_metadata_bytes(bytes: +List<U32>, +pool: +List<M.Constant>) -> Result<&2, &2, String, M.AnnotationMetadata>:
+  do Result<&2, &2, String, M.AnnotationMetadata>:
+    attributes : +List<M.Attribute> <- code_nested_attributes(bytes, pool)
+    state : MetaState <- code_attributes_go(max_attributes(), attributes, pool, meta_empty())
+    return meta_result(state)
+
+def parse_code_metadata_attributes(attributes: +List<M.Attribute>, +pool: +List<M.Constant>) -> Result<&2, &2, String, M.AnnotationMetadata>:
+  do Result<&2, &2, String, M.AnnotationMetadata>:
+    state : MetaState <- code_attributes_go(max_attributes(), attributes, pool, meta_empty())
+    return meta_result(state)
+
+def merge_code_metadata(base: M.AnnotationMetadata, code: M.AnnotationMetadata) -> M.AnnotationMetadata:
+  match base code:
+    case M.AnnotationMetadata{+flags, +exceptions, +annotations, +parameters, +types, +defaultValue} M.AnnotationMetadata{codeFlags, codeExceptions, codeAnnotations, codeParameters, +codeTypes, codeDefault}:
+      M.AnnotationMetadata{U32.or(flags, codeFlags), exceptions, annotations, parameters, M.append(M.TypeAnnotation, types, codeTypes), defaultValue}

@@ -25,11 +25,13 @@ def primitive_mirror_entries(+names: +List<String>) -> +List<M.HeapEntry>:
 
 def bootstrap_heap(+names: +List<String>) -> +List<M.HeapEntry>:
   M.append(M.HeapEntry,
-    [M.HeapEntry{S.find(names, "java/io/PrintStream"), 0, 0, Nil{}, Nil{}, Nil{}},
-     M.HeapEntry{S.find(names, "java/lang/OutOfMemoryError"), 0, 0, [M.Binding{0, M.Slot{3, 0}}, M.Binding{1, M.Slot{3, 0}}, M.Binding{2, M.Slot{3, 0}}, M.Binding{3, M.Slot{1, 0}}], Nil{}, Nil{}},
-     M.HeapEntry{S.find(names, "java/lang/Boolean"), 0, 0, [M.Binding{0, M.Slot{1, 1}}], Nil{}, Nil{}},
-     M.HeapEntry{S.find(names, "java/lang/Boolean"), 0, 0, [M.Binding{0, M.Slot{1, 0}}], Nil{}, Nil{}}],
-    primitive_mirror_entries(names))
+    M.append(M.HeapEntry,
+      [M.HeapEntry{S.find(names, "java/io/PrintStream"), 0, 0, Nil{}, Nil{}, Nil{}},
+       M.HeapEntry{S.find(names, "java/lang/OutOfMemoryError"), 0, 0, [M.Binding{0, M.Slot{3, 0}}, M.Binding{1, M.Slot{3, 0}}, M.Binding{2, M.Slot{3, 0}}, M.Binding{3, M.Slot{1, 0}}], Nil{}, Nil{}},
+       M.HeapEntry{S.find(names, "java/lang/Boolean"), 0, 0, [M.Binding{0, M.Slot{1, 1}}], Nil{}, Nil{}},
+       M.HeapEntry{S.find(names, "java/lang/Boolean"), 0, 0, [M.Binding{0, M.Slot{1, 0}}], Nil{}, Nil{}}],
+      primitive_mirror_entries(names)),
+    [M.HeapEntry{S.find(names, "java/lang/ClassLoader"), 0, 0, Nil{}, Nil{}, Nil{}}])
 
 def set_static(xs: +List<M.Binding>, +id: U32, +value: M.Slot) -> +List<M.Binding>:
   match xs:

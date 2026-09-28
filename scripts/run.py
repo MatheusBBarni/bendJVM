@@ -30,24 +30,25 @@ CACHE = Path(os.environ.get("BENDJVM_CACHE", "/tmp/bendjvm-cache"))
 # remains the class-file parser and linker; this only prevents malformed input
 # from reaching the generated host with an obviously invalid control flow.
 OPCODE_WIDTH = {
-    16: 2, 17: 3, 18: 2, 19: 3, 21: 2, 23: 2, 25: 2, 54: 2,
-    56: 2, 58: 2, 132: 3, 153: 3, 154: 3, 155: 3, 156: 3,
-    157: 3, 158: 3, 159: 3, 160: 3, 161: 3, 162: 3, 163: 3,
-    164: 3, 165: 3, 166: 3, 167: 3, 178: 3, 179: 3, 180: 3,
-    181: 3, 182: 3, 183: 3, 184: 3, 185: 5, 187: 3, 188: 2,
-    189: 3, 192: 3, 193: 3, 196: 6, 198: 3, 199: 3, 200: 5,
+    16: 2, 17: 3, 18: 2, 19: 3, 20: 3, 21: 2, 22: 2, 23: 2, 24: 2, 25: 2,
+    54: 2, 55: 2, 56: 2, 57: 2, 58: 2, 132: 3, 153: 3, 154: 3, 155: 3,
+    156: 3, 157: 3, 158: 3, 159: 3, 160: 3, 161: 3, 162: 3, 163: 3,
+    164: 3, 165: 3, 166: 3, 167: 3, 178: 3, 179: 3, 180: 3, 181: 3,
+    182: 3, 183: 3, 184: 3, 185: 5, 187: 3, 188: 2, 189: 3, 192: 3,
+    193: 3, 196: 6, 198: 3, 199: 3, 200: 5,
 }
 STACK_EFFECTS = {
-    **{opcode: (0, 1) for opcode in (1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 13, 16, 17, 18, 19)},
-    **{opcode: (0, 1) for opcode in (21, 23, 25, 26, 27, 28, 29, 32, 33, 34, 35, 36, 37, 42, 43, 44, 45)},
-    **{opcode: (2, 1) for opcode in (46, 48, 50)},
-    **{opcode: (1, 0) for opcode in (54, 56, 58, 59, 60, 61, 62, 67, 68, 69, 70, 75, 76, 77, 78, 87)},
-    **{opcode: (3, 0) for opcode in (79, 81, 83)},
+    **{opcode: (0, 1) for opcode in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20)},
+    **{opcode: (0, 1) for opcode in (21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45)},
+    **{opcode: (2, 1) for opcode in (46, 47, 48, 49, 50)},
+    **{opcode: (1, 0) for opcode in (54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 87)},
+    **{opcode: (3, 0) for opcode in (79, 80, 81, 82, 83, 84, 85, 86)},
     **{opcode: (1, 2) for opcode in (89,)},
-    **{opcode: (1, 1) for opcode in (116, 118, 134, 139, 145, 146, 147, 190, 192, 193)},
-    **{opcode: (1, 0) for opcode in (153, 154, 155, 156, 157, 158, 172, 174, 175, 176, 191, 198, 199)},
-    **{opcode: (2, 0) for opcode in (159, 160, 161, 162, 163, 164, 165, 166)},
-    0: (0, 0), 9: (0, 1), 10: (0, 1), 167: (0, 0), 177: (0, 0),
+    **{opcode: (1, 1) for opcode in (116, 117, 118, 119, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 190, 192, 193)},
+    **{opcode: (2, 1) for opcode in (97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 127, 128, 129, 130, 131)},
+    **{opcode: (1, 0) for opcode in (153, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 172, 173, 174, 175, 176, 191, 198, 199)},
+    **{opcode: (2, 0) for opcode in (148, 149, 150, 151, 152, 165, 166)},
+    0: (0, 0), 167: (0, 0), 177: (0, 0),
     178: (0, 1), 179: (1, 0), 180: (1, 1), 181: (2, 0),
     187: (0, 1), 188: (1, 1), 189: (1, 1),
 }
@@ -77,16 +78,16 @@ class Launch:
 
 BOOTSTRAP_NAMES = {
     "java/lang/Object", "java/lang/String", "java/lang/StringBuilder", "java/lang/Integer",
+    "java/lang/Long", "java/lang/Double",
     "java/lang/Math", "java/util/Objects", "java/lang/System", "java/io/PrintStream",
-    "java/lang/Integer", "java/lang/Byte", "java/lang/Short", "java/lang/Character", "java/lang/Float", "java/lang/Void",
     "java/lang/Boolean", "java/lang/Enum", "java/util/Enumeration", "java/util/ResourceEnumeration",
     "java/lang/ClassLoader", "java/lang/Class", "java/net/URL",
     "java/lang/reflect/AccessibleObject", "java/lang/reflect/Field", "java/lang/reflect/Method",
-    "java/lang/reflect/Constructor", "java/lang/reflect/AnnotatedType", "java/lang/reflect/InvocationHandler", "java/lang/reflect/Proxy", "java/lang/annotation/Annotation", "[Ljava/lang/annotation/Annotation;", "[[Ljava/lang/annotation/Annotation;", "java/lang/annotation/Retention", "java/lang/annotation/Target", "java/lang/annotation/Inherited", "java/lang/annotation/Documented", "java/lang/annotation/Repeatable",
+    "java/lang/reflect/Constructor", "java/lang/reflect/Type", "java/lang/reflect/AnnotatedType", "java/lang/reflect/InvocationHandler", "java/lang/reflect/Proxy", "java/lang/annotation/Annotation", "[Ljava/lang/annotation/Annotation;", "[[Ljava/lang/annotation/Annotation;", "java/lang/annotation/Retention", "java/lang/annotation/Target", "java/lang/annotation/Inherited", "java/lang/annotation/Documented", "java/lang/annotation/Repeatable",
     "java/lang/annotation/RetentionPolicy", "java/lang/AnnotationEnumCache", "java/lang/annotation/ElementType",
     "java/lang/AssertionError",
     "java/lang/Cloneable", "java/io/Serializable",
-    "java/lang/Throwable", "java/lang/Exception", "java/lang/ReflectiveOperationException",
+    "java/lang/Throwable", "java/lang/Exception", "java/lang/ReflectiveOperationException", "java/lang/reflect/InvocationTargetException",
     "java/lang/IllegalAccessException", "java/lang/InstantiationException",
     "java/lang/ClassNotFoundException", "java/lang/NoSuchFieldException", "java/lang/NoSuchMethodException",
     "java/lang/RuntimeException", "java/lang/reflect/UndeclaredThrowableException", "java/lang/Error",
@@ -116,9 +117,9 @@ BOOTSTRAP_NAMES = {
     "java/net/SocketAddress", "java/net/InetSocketAddress", "java/net/Socket",
     "java/net/ServerSocket", "java/io/SocketInputStream", "java/io/SocketOutputStream",
     "[Ljava/lang/String;", "[B", "[C", "[Ljava/lang/Object;", "[Ljava/lang/Throwable;",
-    "[Z", "[S", "[I", "[F",
+    "[Z", "[S", "[I", "[F", "[J", "[D",
     "[Ljava/lang/reflect/Field;", "[Ljava/lang/reflect/Method;", "[Ljava/lang/reflect/Constructor;",
-    "[Ljava/lang/Class;", "[Ljava/lang/reflect/AnnotatedType;", "[Ljava/lang/annotation/Annotation;", "[[Ljava/lang/annotation/Annotation;",
+    "[Ljava/lang/Class;", "[Ljava/lang/reflect/AnnotatedType;", "[Ljava/lang/reflect/Type;", "[Ljava/lang/annotation/Annotation;", "[[Ljava/lang/annotation/Annotation;",
 }
 
 
@@ -206,7 +207,7 @@ def verify_code_stack(code: bytes, max_stack: int) -> None:
             successors.extend((branch_target, pc + width))
         elif opcode in (167, 200):
             successors.append(branch_target)
-        elif opcode not in (172, 174, 175, 176, 177, 191):
+        elif opcode not in (172, 173, 174, 175, 176, 177, 191):
             successors.append(pc + width)
         for successor in successors:
             if successor not in instructions:
@@ -499,7 +500,7 @@ const mnemonic = {{
   11: "fconst_0", 12: "fconst_1", 13: "fconst_2", 16: "bipush", 17: "sipush", 18: "ldc", 19: "ldc_w", 21: "iload", 23: "fload",
   26: "iload_0", 27: "iload_1", 28: "iload_2", 29: "iload_3", 46: "iaload", 50: "aaload", 54: "istore", 59: "istore_0", 60: "istore_1", 61: "istore_2", 62: "istore_3",
   79: "iastore", 83: "aastore", 87: "pop", 89: "dup", 96: "iadd", 100: "isub", 104: "imul", 108: "idiv", 112: "irem", 116: "ineg", 120: "ishl", 122: "ishr", 124: "iushr", 126: "iand", 128: "ior", 130: "ixor", 132: "iinc",
-  134: "i2f", 139: "f2i", 153: "ifeq", 154: "ifne", 155: "iflt", 156: "ifge", 157: "ifgt", 158: "ifle", 159: "if_icmpeq", 160: "if_icmpne", 161: "if_icmplt", 162: "if_icmpge", 163: "if_icmpgt", 164: "if_icmple", 167: "goto", 172: "ireturn", 174: "dreturn", 175: "freturn", 176: "areturn", 177: "return",
+  134: "i2f", 139: "f2i", 153: "ifeq", 154: "ifne", 155: "iflt", 156: "ifge", 157: "ifgt", 158: "ifle", 159: "if_icmpeq", 160: "if_icmpne", 161: "if_icmplt", 162: "if_icmpge", 163: "if_icmpgt", 164: "if_icmple", 167: "goto", 172: "ireturn", 173: "lreturn", 174: "freturn", 175: "dreturn", 176: "areturn", 177: "return",
   178: "getstatic", 179: "putstatic", 180: "getfield", 181: "putfield", 182: "invokevirtual", 183: "invokespecial", 184: "invokestatic", 187: "new", 188: "newarray", 189: "anewarray", 190: "arraylength", 191: "athrow", 192: "checkcast", 193: "instanceof", 196: "wide"
 }};
 const opName = op => mnemonic[op] || `opcode_${{op}}`;

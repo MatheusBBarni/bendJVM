@@ -1,5 +1,6 @@
 import Base
 import ../model.bend as M
+import ./symbols.bend as S
 
 # Only these native signatures cross into the explicitly registered intrinsics.
 def native(name: String, descriptor: String) -> M.Method:
@@ -23,19 +24,19 @@ def exception(name: String, parent: String) -> M.ClassFile:
 
 def exception4(name: String, parent: String) -> M.ClassFile:
   cls(name, parent, [native("<init>", "()V"), native("<init>", "(Ljava/lang/String;)V"), native("<init>", "(Ljava/lang/Throwable;)V"), native("<init>", "(Ljava/lang/String;Ljava/lang/Throwable;)V")])
-
-def throwable_methods() -> +List<M.Method>:
-  [native("<init>", "()V"), native("<init>", "(Ljava/lang/String;)V"), native("<init>", "(Ljava/lang/Throwable;)V"), native("<init>", "(Ljava/lang/String;Ljava/lang/Throwable;)V"), native("getMessage", "()Ljava/lang/String;"), native("getCause", "()Ljava/lang/Throwable;"), native("initCause", "(Ljava/lang/Throwable;)Ljava/lang/Throwable;"), native("addSuppressed", "(Ljava/lang/Throwable;)V"), native("getSuppressed", "()[Ljava/lang/Throwable;"), native("toString", "()Ljava/lang/String;")]
-
 def throwables() -> +List<M.ClassFile>:
-  [cls("java/lang/Throwable", "java/lang/Object", throwable_methods()),
-   exception4("java/lang/Exception", "java/lang/Throwable"),
+  [cls("java/lang/Throwable", "java/lang/Object",
+       [native("<init>", "()V"), native("<init>", "(Ljava/lang/String;)V"), native("<init>", "(Ljava/lang/Throwable;)V"), native("<init>", "(Ljava/lang/String;Ljava/lang/Throwable;)V"),
+        native("getMessage", "()Ljava/lang/String;"), native("getCause", "()Ljava/lang/Throwable;"), native("initCause", "(Ljava/lang/Throwable;)Ljava/lang/Throwable;"),
+        native("addSuppressed", "(Ljava/lang/Throwable;)V"), native("getSuppressed", "()[Ljava/lang/Throwable;"), native("toString", "()Ljava/lang/String;")]),
+   exception("java/lang/Exception", "java/lang/Throwable"),
    exception("java/lang/ReflectiveOperationException", "java/lang/Exception"),
    exception("java/lang/IllegalAccessException", "java/lang/ReflectiveOperationException"),
    exception("java/lang/InstantiationException", "java/lang/ReflectiveOperationException"),
    exception("java/lang/NoSuchFieldException", "java/lang/ReflectiveOperationException"),
    exception("java/lang/ClassNotFoundException", "java/lang/ReflectiveOperationException"),
    exception("java/lang/NoSuchMethodException", "java/lang/ReflectiveOperationException"),
+   cls("java/lang/reflect/InvocationTargetException", "java/lang/ReflectiveOperationException", [native("<init>", "(Ljava/lang/Throwable;)V"), native("<init>", "(Ljava/lang/String;Ljava/lang/Throwable;)V"), native("getTargetException", "()Ljava/lang/Throwable;")]),
    exception4("java/lang/RuntimeException", "java/lang/Exception"),
    cls("java/lang/reflect/UndeclaredThrowableException", "java/lang/RuntimeException", [native("<init>", "(Ljava/lang/Throwable;)V"), native("<init>", "(Ljava/lang/String;Ljava/lang/Throwable;)V"), native("getUndeclaredThrowable", "()Ljava/lang/Throwable;")]),
    exception4("java/lang/Error", "java/lang/Throwable"),
@@ -97,6 +98,10 @@ def float_methods() -> +List<M.Method>:
   [native_static("valueOf", "(F)Ljava/lang/Float;"), native("floatValue", "()F"), native("toString", "()Ljava/lang/String;")]
 def boolean_class() -> M.ClassFile:
   M.ClassFile{0, 52, 1, "java/lang/Boolean", "java/lang/Object", Nil{}, [M.Unused{}], [M.Field{9, "TYPE", "Ljava/lang/Class;", 0, Nil{}}, M.Field{25, "TRUE", "Ljava/lang/Boolean;", 0, Nil{}}, M.Field{25, "FALSE", "Ljava/lang/Boolean;", 0, Nil{}}], [native_static("valueOf", "(Z)Ljava/lang/Boolean;"), native("booleanValue", "()Z"), native("toString", "()Ljava/lang/String;")], Nil{}}
+def long_methods() -> +List<M.Method>:
+  [native_static("valueOf", "(J)Ljava/lang/Long;"), native("longValue", "()J"), native("toString", "()Ljava/lang/String;")]
+def double_methods() -> +List<M.Method>:
+  [native_static("valueOf", "(D)Ljava/lang/Double;"), native("doubleValue", "()D"), native("toString", "()Ljava/lang/String;")]
 def primitive_wrapper(name: String, methods: +List<M.Method>) -> M.ClassFile:
   M.ClassFile{0, 52, 1, name, "java/lang/Object", Nil{}, [M.Unused{}], [M.Field{9, "TYPE", "Ljava/lang/Class;", 0, Nil{}}], methods, Nil{}}
 
@@ -122,14 +127,16 @@ def array_class(name: String) -> M.ClassFile:
   M.ClassFile{0, 52, 17, name, "java/lang/Object", ["java/lang/Cloneable", "java/io/Serializable"], [M.Unused{}], Nil{}, Nil{}, Nil{}}
 
 def primitive_arrays() -> +List<M.ClassFile>:
-  [array_class("[Z"), array_class("[C"), array_class("[F"), array_class("[B"), array_class("[S"), array_class("[I")]
+  [array_class("[Z"), array_class("[C"), array_class("[F"), array_class("[B"), array_class("[S"), array_class("[I"), array_class("[J"), array_class("[D")]
 def classes() -> +List<M.ClassFile>:
   M.append(M.ClassFile,
     [cls("java/lang/Object", "", object_methods()),
      cls("java/lang/String", "java/lang/Object", string_methods()),
-     cls("java/lang/Class", "java/lang/Object", class_methods()),
+     cls_if("java/lang/Class", "java/lang/Object", ["java/lang/reflect/Type"], class_methods()),
      cls("java/lang/StringBuilder", "java/lang/Object", builder_methods()),
      primitive_wrapper("java/lang/Integer", integer_methods()),
+     primitive_wrapper("java/lang/Long", long_methods()),
+     primitive_wrapper("java/lang/Double", double_methods()),
      cls("java/lang/Math", "java/lang/Object", [native_static("abs", "(I)I"), native_static("min", "(II)I"), native_static("max", "(II)I")]),
      primitive_wrapper("java/lang/Byte", byte_methods()),
      primitive_wrapper("java/lang/Short", short_methods()),
@@ -147,7 +154,8 @@ def classes() -> +List<M.ClassFile>:
      primitive_class("double"),
      primitive_class("void"),
      cls("java/lang/Enum", "java/lang/Object", [native("<init>", "(Ljava/lang/String;I)V"), native("name", "()Ljava/lang/String;"), native("ordinal", "()I"), native_static("valueOf", "(Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/Enum;")]),
-     iface("java/lang/reflect/AnnotatedType", Nil{}, [native("isAnnotationPresent", "(Ljava/lang/Class;)Z"), native("getAnnotation", "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;"), native("getDeclaredAnnotation", "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;"), native("getAnnotations", "()[Ljava/lang/annotation/Annotation;"), native("getDeclaredAnnotations", "()[Ljava/lang/annotation/Annotation;")]),
+     iface("java/lang/reflect/Type", Nil{}, [native("getTypeName", "()Ljava/lang/String;")]),
+     iface("java/lang/reflect/AnnotatedType", Nil{}, [native("getType", "()Ljava/lang/reflect/Type;"), native("getAnnotatedOwnerType", "()Ljava/lang/reflect/AnnotatedType;"), native("getAnnotatedActualTypeArguments", "()[Ljava/lang/reflect/AnnotatedType;"), native("isAnnotationPresent", "(Ljava/lang/Class;)Z"), native("getAnnotation", "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;"), native("getDeclaredAnnotation", "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;"), native("getAnnotations", "()[Ljava/lang/annotation/Annotation;"), native("getDeclaredAnnotations", "()[Ljava/lang/annotation/Annotation;")]),
      iface("java/lang/reflect/InvocationHandler", Nil{}, [abs_m("invoke", "(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;")]),
      cls("java/lang/reflect/Proxy", "java/lang/Object", [native("<init>", "(Ljava/lang/reflect/InvocationHandler;)V"), native_static("newProxyInstance", "(Ljava/lang/ClassLoader;[Ljava/lang/Class;Ljava/lang/reflect/InvocationHandler;)Ljava/lang/Object;"), native_static("getProxyClass", "(Ljava/lang/ClassLoader;[Ljava/lang/Class;)Ljava/lang/Class;"), native_static("isProxyClass", "(Ljava/lang/Class;)Z"), native_static("getInvocationHandler", "(Ljava/lang/Object;)Ljava/lang/reflect/InvocationHandler;")]),
      iface("java/lang/annotation/Annotation", Nil{}, Nil{}),
@@ -164,10 +172,10 @@ def classes() -> +List<M.ClassFile>:
      cls("java/net/URL", "java/lang/Object", [native("openStream", "()Ljava/io/InputStream;"), native("getPath", "()Ljava/lang/String;"), native("getProtocol", "()Ljava/lang/String;"), native("toExternalForm", "()Ljava/lang/String;"), native("toString", "()Ljava/lang/String;")]),
      cls("java/lang/reflect/AccessibleObject", "java/lang/Object", [native("setAccessible", "(Z)V"), native("isAccessible", "()Z")]),
      cls("java/lang/reflect/Field", "java/lang/reflect/AccessibleObject", [native("getName", "()Ljava/lang/String;"), native("getModifiers", "()I"), native("getDeclaringClass", "()Ljava/lang/Class;"), native("getType", "()Ljava/lang/Class;"), native("get", "(Ljava/lang/Object;)Ljava/lang/Object;"), native("set", "(Ljava/lang/Object;Ljava/lang/Object;)V"), native("getInt", "(Ljava/lang/Object;)I"), native("setInt", "(Ljava/lang/Object;I)V"), native("isSynthetic", "()Z"), native("isEnumConstant", "()Z"), native("equals", "(Ljava/lang/Object;)Z"), native("hashCode", "()I"), native("isAnnotationPresent", "(Ljava/lang/Class;)Z"), native("getAnnotation", "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;"), native("getDeclaredAnnotation", "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;"), native("getAnnotations", "()[Ljava/lang/annotation/Annotation;"), native("getDeclaredAnnotations", "()[Ljava/lang/annotation/Annotation;"), native("getAnnotationsByType", "(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;"), native("getDeclaredAnnotationsByType", "(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;")]),
-     cls("java/lang/reflect/Method", "java/lang/reflect/AccessibleObject", [native("getName", "()Ljava/lang/String;"), native("getModifiers", "()I"), native("getDeclaringClass", "()Ljava/lang/Class;"), native("getReturnType", "()Ljava/lang/Class;"), native("getParameterTypes", "()[Ljava/lang/Class;"), native("getExceptionTypes", "()[Ljava/lang/Class;"), native("isBridge", "()Z"), native("isSynthetic", "()Z"), native("isVarArgs", "()Z"), native("equals", "(Ljava/lang/Object;)Z"), native("hashCode", "()I"), native("invoke", "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;"), native("isAnnotationPresent", "(Ljava/lang/Class;)Z"), native("getAnnotation", "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;"), native("getDeclaredAnnotation", "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;"), native("getAnnotations", "()[Ljava/lang/annotation/Annotation;"), native("getDeclaredAnnotations", "()[Ljava/lang/annotation/Annotation;"), native("getParameterAnnotations", "()[[Ljava/lang/annotation/Annotation;"), native("getDefaultValue", "()Ljava/lang/Object;"), native("getAnnotatedParameterTypes", "()[Ljava/lang/reflect/AnnotatedType;"), native("getAnnotatedReturnType", "()Ljava/lang/reflect/AnnotatedType;"), native("getAnnotationsByType", "(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;"), native("getDeclaredAnnotationsByType", "(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;")]),
+     cls("java/lang/reflect/Method", "java/lang/reflect/AccessibleObject", [native("getName", "()Ljava/lang/String;"), native("getModifiers", "()I"), native("getDeclaringClass", "()Ljava/lang/Class;"), native("getReturnType", "()Ljava/lang/Class;"), native("getParameterTypes", "()[Ljava/lang/Class;"), native("getExceptionTypes", "()[Ljava/lang/Class;"), native("isBridge", "()Z"), native("isSynthetic", "()Z"), native("isVarArgs", "()Z"), native("equals", "(Ljava/lang/Object;)Z"), native("hashCode", "()I"), native("invoke", "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;"), native("isAnnotationPresent", "(Ljava/lang/Class;)Z"), native("getAnnotation", "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;"), native("getDeclaredAnnotation", "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;"), native("getAnnotations", "()[Ljava/lang/annotation/Annotation;"), native("getDeclaredAnnotations", "()[Ljava/lang/annotation/Annotation;"), native("getParameterAnnotations", "()[[Ljava/lang/annotation/Annotation;"), native("getDefaultValue", "()Ljava/lang/Object;"), native("getAnnotatedParameterTypes", "()[Ljava/lang/reflect/AnnotatedType;"), native("getAnnotatedReturnType", "()Ljava/lang/reflect/AnnotatedType;"), native("getAnnotationsByType", "(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;"), native("getDeclaredAnnotationsByType", "(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;"), native("isDefault", "()Z"), native("getGenericReturnType", "()Ljava/lang/reflect/Type;"), native("getGenericParameterTypes", "()[Ljava/lang/reflect/Type;"), native("getGenericExceptionTypes", "()[Ljava/lang/reflect/Type;")]),
      cls("java/lang/reflect/Constructor", "java/lang/reflect/AccessibleObject", [native("getName", "()Ljava/lang/String;"), native("getModifiers", "()I"), native("getDeclaringClass", "()Ljava/lang/Class;"), native("getParameterTypes", "()[Ljava/lang/Class;"), native("getExceptionTypes", "()[Ljava/lang/Class;"), native("isSynthetic", "()Z"), native("isVarArgs", "()Z"), native("equals", "(Ljava/lang/Object;)Z"), native("hashCode", "()I"), native("newInstance", "([Ljava/lang/Object;)Ljava/lang/Object;"), native("isAnnotationPresent", "(Ljava/lang/Class;)Z"), native("getAnnotation", "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;"), native("getDeclaredAnnotation", "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;"), native("getAnnotations", "()[Ljava/lang/annotation/Annotation;"), native("getDeclaredAnnotations", "()[Ljava/lang/annotation/Annotation;"), native("getParameterAnnotations", "()[[Ljava/lang/annotation/Annotation;"), native("getAnnotationsByType", "(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;"), native("getDeclaredAnnotationsByType", "(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;")]),
      M.ClassFile{0, 52, 1, "java/lang/System", "java/lang/Object", Nil{}, [M.Unused{}], [M.Field{9, "out", "Ljava/io/PrintStream;", 0, Nil{}}], [native_static("arraycopy", "(Ljava/lang/Object;ILjava/lang/Object;II)V")], Nil{}},
-     cls("java/io/PrintStream", "java/lang/Object", [native("println", "(I)V"), native("println", "(Ljava/lang/String;)V"), native("println", "()V"), native("println", "(F)V"), native("println", "(Z)V"), native("println", "(C)V")]),
+     cls("java/io/PrintStream", "java/lang/Object", [native("println", "(I)V"), native("println", "(Ljava/lang/String;)V"), native("println", "()V"), native("println", "(F)V"), native("println", "(Z)V"), native("println", "(C)V"), native("println", "(J)V"), native("println", "(D)V")]),
      iface("java/lang/AutoCloseable", Nil{}, [abs_m("close", "()V")]),
      iface("java/io/Closeable", ["java/lang/AutoCloseable"], [abs_m("close", "()V")]),
      iface("java/io/Flushable", Nil{}, [abs_m("flush", "()V")]),
@@ -211,6 +219,7 @@ def classes() -> +List<M.ClassFile>:
      M.ClassFile{0, 52, 17, "[Ljava/lang/reflect/Constructor;", "java/lang/Object", ["java/lang/Cloneable", "java/io/Serializable"], [M.Unused{}], Nil{}, Nil{}, Nil{}},
      M.ClassFile{0, 52, 17, "[Ljava/lang/Class;", "java/lang/Object", ["java/lang/Cloneable", "java/io/Serializable"], [M.Unused{}], Nil{}, Nil{}, Nil{}},
      M.ClassFile{0, 52, 17, "[Ljava/lang/reflect/AnnotatedType;", "java/lang/Object", ["java/lang/Cloneable", "java/io/Serializable"], [M.Unused{}], Nil{}, Nil{}, Nil{}},
+     M.ClassFile{0, 52, 17, "[Ljava/lang/reflect/Type;", "java/lang/Object", ["java/lang/Cloneable", "java/io/Serializable"], [M.Unused{}], Nil{}, Nil{}, Nil{}},
      M.ClassFile{0, 52, 17, "[Ljava/lang/annotation/Annotation;", "java/lang/Object", ["java/lang/Cloneable", "java/io/Serializable"], [M.Unused{}], Nil{}, Nil{}, Nil{}},
      M.ClassFile{0, 52, 17, "[[Ljava/lang/annotation/Annotation;", "java/lang/Object", ["java/lang/Cloneable", "java/io/Serializable"], [M.Unused{}], Nil{}, Nil{}, Nil{}},
      M.ClassFile{0, 52, 17, "[Ljava/lang/Throwable;", "java/lang/Object", ["java/lang/Cloneable", "java/io/Serializable"], [M.Unused{}], Nil{}, Nil{}, Nil{}}],
@@ -225,9 +234,11 @@ def atype_name(atype: U32) -> String:
     case 4: "[Z"
     case 5: "[C"
     case 6: "[F"
+    case 7: "[D"
     case 8: "[B"
     case 9: "[S"
     case 10: "[I"
+    case 11: "[J"
     case _: "<unsupported-array>"
 
 type Sig is Data:
@@ -278,6 +289,8 @@ def signatures() -> +List<Sig>:
    Sig{"java/io/PrintStream", "println", "(F)V", 5},
    Sig{"java/io/PrintStream", "println", "(Z)V", 6},
    Sig{"java/io/PrintStream", "println", "(C)V", 170},
+   Sig{"java/io/PrintStream", "println", "(J)V", 281},
+   Sig{"java/io/PrintStream", "println", "(D)V", 282},
    Sig{"java/lang/ClassLoader", "getSystemResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;", 9},
    Sig{"java/io/InputStream", "read", "()I", 10},
    Sig{"java/io/InputStream", "close", "()V", 11},
@@ -378,6 +391,12 @@ def signatures() -> +List<Sig>:
    Sig{"java/lang/Integer", "equals", "(Ljava/lang/Object;)Z", 41},
    Sig{"java/lang/Integer", "hashCode", "()I", 42},
    Sig{"java/lang/Integer", "toString", "()Ljava/lang/String;", 43},
+   Sig{"java/lang/Long", "valueOf", "(J)Ljava/lang/Long;", 275},
+   Sig{"java/lang/Long", "longValue", "()J", 276},
+   Sig{"java/lang/Long", "toString", "()Ljava/lang/String;", 277},
+   Sig{"java/lang/Double", "valueOf", "(D)Ljava/lang/Double;", 278},
+   Sig{"java/lang/Double", "doubleValue", "()D", 279},
+   Sig{"java/lang/Double", "toString", "()Ljava/lang/String;", 280},
    Sig{"java/lang/Math", "abs", "(I)I", 44},
    Sig{"java/lang/Math", "min", "(II)I", 45},
    Sig{"java/lang/Math", "max", "(II)I", 46},
@@ -548,6 +567,8 @@ def signatures() -> +List<Sig>:
    Sig{"java/lang/reflect/AnnotatedType", "getDeclaredAnnotation", "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;", 241},
    Sig{"java/lang/reflect/AnnotatedType", "getAnnotations", "()[Ljava/lang/annotation/Annotation;", 242},
    Sig{"java/lang/reflect/AnnotatedType", "getDeclaredAnnotations", "()[Ljava/lang/annotation/Annotation;", 243},
+   Sig{"java/lang/reflect/AnnotatedType", "getType", "()Ljava/lang/reflect/Type;", 286},
+   Sig{"java/lang/reflect/Type", "getTypeName", "()Ljava/lang/String;", 287},
    Sig{"java/lang/reflect/Method", "getExceptionTypes", "()[Ljava/lang/Class;", 244},
    Sig{"java/lang/reflect/Proxy", "newProxyInstance", "(Ljava/lang/ClassLoader;[Ljava/lang/Class;Ljava/lang/reflect/InvocationHandler;)Ljava/lang/Object;", 245},
    Sig{"java/lang/reflect/Proxy", "getProxyClass", "(Ljava/lang/ClassLoader;[Ljava/lang/Class;)Ljava/lang/Class;", 246},
@@ -575,7 +596,13 @@ def signatures() -> +List<Sig>:
    Sig{"java/lang/reflect/Method", "getAnnotationsByType", "(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;", 269},
    Sig{"java/lang/reflect/Method", "getDeclaredAnnotationsByType", "(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;", 270},
    Sig{"java/lang/reflect/Constructor", "getAnnotationsByType", "(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;", 271},
-   Sig{"java/lang/reflect/Constructor", "getDeclaredAnnotationsByType", "(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;", 272}]
+   Sig{"java/lang/reflect/Constructor", "getDeclaredAnnotationsByType", "(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;", 272},
+   Sig{"java/lang/reflect/Method", "isDefault", "()Z", 288},
+   Sig{"java/lang/reflect/Method", "getGenericReturnType", "()Ljava/lang/reflect/Type;", 289},
+   Sig{"java/lang/reflect/Method", "getGenericParameterTypes", "()[Ljava/lang/reflect/Type;", 290},
+   Sig{"java/lang/reflect/Method", "getGenericExceptionTypes", "()[Ljava/lang/reflect/Type;", 291},
+   Sig{"java/lang/reflect/AnnotatedType", "getAnnotatedOwnerType", "()Ljava/lang/reflect/AnnotatedType;", 292},
+   Sig{"java/lang/reflect/AnnotatedType", "getAnnotatedActualTypeArguments", "()[Ljava/lang/reflect/AnnotatedType;", 293}]
 
 def throwable_inherited(+owner: String, +name: String, +desc: String) -> U32:
   Bool.pick(U32, is_throwable(owner) && String.eq(name, "getMessage") && String.eq(desc, "()Ljava/lang/String;"), 109,
@@ -584,8 +611,9 @@ def throwable_inherited(+owner: String, +name: String, +desc: String) -> U32:
   Bool.pick(U32, is_throwable(owner) && String.eq(name, "addSuppressed") && String.eq(desc, "(Ljava/lang/Throwable;)V"), 112,
   Bool.pick(U32, is_throwable(owner) && String.eq(name, "getSuppressed") && String.eq(desc, "()[Ljava/lang/Throwable;"), 113,
   Bool.pick(U32, is_throwable(owner) && String.eq(name, "toString") && String.eq(desc, "()Ljava/lang/String;"), 114,
+  Bool.pick(U32, String.eq(owner, "java/lang/reflect/InvocationTargetException") && String.eq(name, "getTargetException") && String.eq(desc, "()Ljava/lang/Throwable;"), 283,
   Bool.pick(U32, String.eq(owner, "java/lang/reflect/UndeclaredThrowableException") && String.eq(name, "getUndeclaredThrowable") && String.eq(desc, "()Ljava/lang/Throwable;"), 273,
-  0)))))))
+  0))))))))
 
 def intrinsic_desc(+owner: String, +name: String, +desc: String) -> U32:
   +found = sig_id(signatures(), owner, name, desc)

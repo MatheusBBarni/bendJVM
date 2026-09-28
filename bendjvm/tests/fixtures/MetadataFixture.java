@@ -16,6 +16,8 @@ public class MetadataFixture {
         float ratio() default 1.25f;
         long wide() default 123456789L;
         double precise() default 2.5d;
+        long[] wideArray() default {123456789L};
+        double[] preciseArray() default {2.5d};
         String text() default "default";
         Class<?> type() default Object.class;
         Kind kind() default Kind.ALPHA;
@@ -51,7 +53,8 @@ public class MetadataFixture {
     }
 
     @Visible(text = "class", labels = {"class", "metadata"},
-            nested = @Nested(name = "class-nested"), kind = Kind.BETA)
+            nested = @Nested(name = "class-nested"), kind = Kind.BETA,
+            wide = 123456789L, precise = 2.5d)
     @Invisible("class-hidden")
     public static class Annotated {
         @Visible(text = "field")
@@ -74,7 +77,8 @@ public class MetadataFixture {
                 @VisibleType("parameter-type")
                 @InvisibleType("parameter-type-hidden") String input)
                 throws java.io.IOException, IllegalArgumentException {
-            return value + input;
+            @VisibleType("local") String local = value;
+            return local + input;
         }
     }
 
@@ -114,6 +118,16 @@ public class MetadataFixture {
             if (!Integer.valueOf(7).equals(Visible.class.getMethod("count").getDefaultValue())
                     || !Boolean.TRUE.equals(Visible.class.getMethod("enabled").getDefaultValue())) {
                 throw new AssertionError("annotation defaults");
+            }
+            Object wideDefault = Visible.class.getMethod("wide").getDefaultValue();
+            Object preciseDefault = Visible.class.getMethod("precise").getDefaultValue();
+            Object wideArrayDefault = Visible.class.getMethod("wideArray").getDefaultValue();
+            Object preciseArrayDefault = Visible.class.getMethod("preciseArray").getDefaultValue();
+            if (wideDefault == null || wideDefault.getClass() != Long.class
+                    || preciseDefault == null || preciseDefault.getClass() != Double.class
+                    || wideArrayDefault == null || wideArrayDefault.getClass() != long[].class
+                    || preciseArrayDefault == null || preciseArrayDefault.getClass() != double[].class) {
+                throw new AssertionError("wide annotation defaults");
             }
             System.out.println("metadata-probe");
         }

@@ -7,6 +7,7 @@ import ../loader/symbols.bend as Sy
 import ../classfile/constant_pool.bend as CP
 import ./outcome.bend as O
 import ../classfile/descriptor.bend as D
+import ../runtime/wide.bend as W
 
 type ReflectRefs is Data:
   ReflectRefs{vm: M.VM, refs: +List<U32>}
@@ -27,9 +28,13 @@ type ProxyBoxedArgs is Data:
 
 type ProxyBoxedValue is Data:
   ProxyBoxedValue{vm: M.VM, slot: M.Slot}
+type ProxyMethodSig is Data:
+  ProxyMethodSig{name: String, parameters: String, result: String}
+type ProxyCallPlan is Data:
+  ProxyCallPlan{allocation: H.Allocation, exceptions: +List<U32>}
 
 type ClassForNameArgs is Data:
-  ClassForNameArgs{name: M.Slot, shouldInit: Bool}
+  ClassForNameArgs{name: M.Slot, shouldInit: Bool, loader: U32}
 
 type ClassForNameAction is Data:
   Initialize{}
@@ -249,8 +254,6 @@ def proxy_handler_method(+vm: M.VM, handler: U32) -> Result<&2, &2, String, M.Lo
     method : M.LoadedMethod <- S.require(M.LoadedMethod, proxy_method_hierarchy(256n, S.classes(vm), S.methods(vm), S.symbols(vm), H.entry_class(entry), "invoke", "(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;"), "java/lang/AbstractMethodError")
     return method
 
-def proxy_method_mirror_alloc(+vm: M.VM, +method: M.LoadedMethod) -> Result<&2, &2, String, H.Allocation>:
-  H.allocate(vm, H.object_entry(class_id(vm, "java/lang/reflect/Method"), [M.Binding{0, M.Slot{1, M.loaded_method_owner(method)}}, M.Binding{1, M.Slot{1, M.loaded_method_id(method)}}, M.Binding{2, M.Slot{1, 0}}]))
 
 def proxy_box_alloc_result(result: Result<&2, &2, String, H.Allocation>) -> Result<&2, &2, String, ProxyBoxedValue>:
   match result:
@@ -291,31 +294,76 @@ def proxy_box_args(+types: +List<M.JvmType>, +values: +List<M.Slot>, +vm: M.VM, 
         return result
     case _ _: Fail{"java/lang/IllegalArgumentException"}
 
-def proxy_call_array_after(boxed: ProxyBoxedArgs, +handler: U32, +proxy: U32, handler_method: M.LoadedMethod, method_ref: U32, +descriptor: String) -> Result<&2, &2, String, O.Outcome>:
+def proxy_class_pool_found(found: Maybe<&2, M.ClassMetadata>) -> Result<&2, &2, String, +List<M.Constant>>:
+  match found:
+    case None{}: Fail{"InvalidState: missing class metadata"}
+    case Some{M.ClassMetadata{owner, flags, metadata, visibleAnnotations, +pool}}: Done{pool}
+
+def proxy_class_pool(metadata: M.Metadata, owner: U32) -> Result<&2, &2, String, +List<M.Constant>>:
+  match metadata:
+    case M.Metadata{+classes, fields, methods}: proxy_class_pool_found(M.nth(M.ClassMetadata, classes, owner))
+
+def proxy_annotation_exceptions(value: M.AnnotationMetadata) -> +List<U32>:
+  match value:
+    case M.AnnotationMetadata{+flags, +exceptions, annotations, parameterAnnotations, typeAnnotations, defaultValue}: exceptions
+
+def proxy_method_exceptions_found(found: Maybe<&2, M.MethodMetadata>) -> Result<&2, &2, String, +List<U32>>:
+  match found:
+    case None{}: Fail{"InvalidState: missing method metadata"}
+    case Some{M.MethodMetadata{owner, method, metadata}}: Done{proxy_annotation_exceptions(metadata)}
+
+def proxy_metadata_exceptions(metadata: M.Metadata, method: U32) -> Result<&2, &2, String, +List<U32>>:
+  match metadata:
+    case M.Metadata{classes, fields, +methods}: proxy_method_exceptions_found(M.nth(M.MethodMetadata, methods, method))
+
+def proxy_exception_ids(+vm: M.VM, +pool: +List<M.Constant>, +values: +List<U32>, +acc: +List<U32>) -> Result<&2, &2, String, +List<U32>>:
+  match values:
+    case Nil{}: Done{M.reverse(U32, acc)}
+    case Con{index, rest}:
+      do Result<&2, &2, String, +List<U32>>:
+        name : String <- CP.class_name(pool, index)
+        tail : +List<U32> <- proxy_exception_ids(vm, pool, rest, Con{class_id(vm, name), acc})
+        return tail
+
+def proxy_call_plan(+vm: M.VM, method: M.LoadedMethod) -> Result<&2, &2, String, ProxyCallPlan>:
+  match method:
+    case M.LoadedMethod{+id, +owner, name, descriptor, flags, parameters, resultTag, maxStack, maxLocals, instructions, handlers, intrinsic}:
+      do Result<&2, &2, String, ProxyCallPlan>:
+        pool : +List<M.Constant> <- proxy_class_pool(S.metadata(vm), owner)
+        raw : +List<U32> <- proxy_metadata_exceptions(S.metadata(vm), id)
+        exceptions : +List<U32> <- proxy_exception_ids(vm, pool, raw, Nil{})
+        allocation : H.Allocation <- H.allocate(vm, H.object_entry(class_id(vm, "java/lang/reflect/Method"), [M.Binding{0, M.Slot{1, owner}}, M.Binding{1, M.Slot{1, id}}, M.Binding{2, M.Slot{1, 0}}]))
+        return ProxyCallPlan{allocation, exceptions}
+
+def proxy_call_array_after(boxed: ProxyBoxedArgs, +handler: U32, +proxy: U32, handler_method: M.LoadedMethod, method_ref: U32, +descriptor: String, +exceptions: +List<U32>) -> Result<&2, &2, String, O.Outcome>:
   match boxed:
     case ProxyBoxedArgs{+vm, +values}:
       alloc_result(H.allocate(vm, H.reference_array_entry(class_id(vm, "[Ljava/lang/Object;"), class_id(vm, "java/lang/Object"), values)),
-        array_vm => array_ref => Done{O.Call{S.with_effect(array_vm, M.ProxyCall{descriptor}), handler_method, [M.Slot{3, handler}, M.Slot{3, proxy}, M.Slot{3, method_ref}, M.Slot{3, array_ref}]}})
+        array_vm => array_ref => Done{O.Call{S.with_effect(array_vm, M.ProxyCall{descriptor, exceptions}), handler_method, [M.Slot{3, handler}, M.Slot{3, proxy}, M.Slot{3, method_ref}, M.Slot{3, array_ref}]}})
 
-def proxy_call_array_values(+vm: M.VM, +handler: U32, +proxy: U32, handler_method: M.LoadedMethod, method_ref: U32, +descriptor: String, +values: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+def proxy_call_array_values(+vm: M.VM, +handler: U32, +proxy: U32, handler_method: M.LoadedMethod, method_ref: U32, +descriptor: String, +exceptions: +List<U32>, +values: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
     parsed : M.Descriptor <- D.parse_method(descriptor)
     boxed : ProxyBoxedArgs <- proxy_box_args(D.parameter_types(parsed), values, vm, Nil{})
-    result : O.Outcome <- proxy_call_array_after(boxed, handler, proxy, handler_method, method_ref, descriptor)
+    result : O.Outcome <- proxy_call_array_after(boxed, handler, proxy, handler_method, method_ref, descriptor, exceptions)
     return result
 
-def proxy_call_array(+vm: M.VM, +handler: U32, +proxy: U32, handler_method: M.LoadedMethod, method_ref: U32, +descriptor: String, +values: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
-  proxy_call_array_values(vm, handler, proxy, handler_method, method_ref, descriptor, M.drop(M.Slot, values, 1n))
+def proxy_call_array(+vm: M.VM, +handler: U32, +proxy: U32, handler_method: M.LoadedMethod, method_ref: U32, +descriptor: String, +exceptions: +List<U32>, +values: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  proxy_call_array_values(vm, handler, proxy, handler_method, method_ref, descriptor, exceptions, M.drop(M.Slot, values, 1n))
 
-def proxy_call_method_alloc(allocation: H.Allocation, +handler: U32, +proxy: U32, handler_method: M.LoadedMethod, +descriptor: String, +values: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+def proxy_call_method_alloc(allocation: H.Allocation, +handler: U32, +proxy: U32, handler_method: M.LoadedMethod, +descriptor: String, +exceptions: +List<U32>, +values: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   match allocation:
-    case H.Allocation{+vm, reference}: proxy_call_array(vm, handler, proxy, handler_method, reference, descriptor, values)
+    case H.Allocation{+vm, reference}: proxy_call_array(vm, handler, proxy, handler_method, reference, descriptor, exceptions, values)
+
+def proxy_call_plan_ready(plan: ProxyCallPlan, +handler: U32, +proxy: U32, handler_method: M.LoadedMethod, +descriptor: String, +values: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  match plan:
+    case ProxyCallPlan{+allocation, +exceptions}: proxy_call_method_alloc(allocation, handler, proxy, handler_method, descriptor, exceptions, values)
 
 def proxy_call_ready(+vm: M.VM, +handler: U32, +proxy: U32, method: M.LoadedMethod, +descriptor: String, +values: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
     handler_method : M.LoadedMethod <- proxy_handler_method(vm, handler)
-    method_allocation : H.Allocation <- proxy_method_mirror_alloc(vm, method)
-    result : O.Outcome <- proxy_call_method_alloc(method_allocation, handler, proxy, handler_method, descriptor, values)
+    plan : ProxyCallPlan <- proxy_call_plan(vm, method)
+    result : O.Outcome <- proxy_call_plan_ready(plan, handler, proxy, handler_method, descriptor, values)
     return result
 
 def proxy_binding_set(xs: +List<M.Binding>, +id: U32, +value: M.Slot) -> +List<M.Binding>:
@@ -330,7 +378,7 @@ def proxy_hash_slots(values: +List<M.Slot>, acc: U32) -> U32:
     case Con{M.Slot{tag, bits}, rest}: proxy_hash_slots(rest, U32.add(U32.mul(31, acc), U32.add(tag, bits)))
 
 def proxy_cache_key(loader: U32, values: +List<M.Slot>) -> U32:
-  U32.add(1073741824, U32.add(U32.mul(65537, loader), proxy_hash_slots(values, 0)))
+  U32.add(1073741824, U32.and(U32.add(U32.mul(65537, loader), proxy_hash_slots(values, 0)), 1048575))
 
 def proxy_interface_ids(fuel: Nat, +vm: M.VM, values: +List<M.Slot>, +acc: +List<U32>) -> Result<&2, &2, String, +List<U32>>:
   match fuel values:
@@ -357,23 +405,149 @@ def proxy_id_seen(ids: +List<U32>, +target: U32) -> Bool:
     case Nil{}: False{}
     case Con{head, rest}: Bool.or(U32.is_eq(head, target), proxy_id_seen(rest, target))
 
-def proxy_validate_ids(ids: +List<U32>, +metadata: M.Metadata, +seen: +List<U32>) -> Result<&2, &2, String, Unit>:
+def proxy_package_scan(chars: +List<Char>, +before: String, +segment: +List<Char>) -> String:
+  match chars:
+    case Nil{}: before
+    case Con{Chr{47}, tail}: proxy_package_scan(tail, before ++ String.from_list(M.reverse(Char, segment)) ++ "/", Nil{})
+    case Con{head, tail}: proxy_package_scan(tail, before, Con{head, segment})
+
+def proxy_class_package(+vm: M.VM, target: U32) -> String:
+  proxy_package_scan(String.to_list(class_name_text(vm, target)), "", Nil{})
+
+def proxy_validate_ids(ids: +List<U32>, +vm: M.VM, +metadata: M.Metadata, +seen: +List<U32>, +nonpublic: Bool, +package: String) -> Result<&2, &2, String, Unit>:
   match ids:
     case Nil{}: Done{Unit{}}
     case Con{target, rest}:
       do Result<&2, &2, String, Unit>:
         +target_ref : U32 = target
         +flags : U32 = proxy_class_flags(metadata, target_ref)
-        checked : Unit <- S.check(U32.is_ne(U32.and(flags, 512), 0) && Bool.not(proxy_id_seen(seen, target_ref)), "java/lang/IllegalArgumentException")
-        result : Unit <- proxy_validate_ids(rest, metadata, Con{target_ref, seen})
+        +is_interface : Bool = U32.is_ne(U32.and(flags, 512), 0)
+        +is_public : Bool = U32.is_ne(U32.and(flags, 1), 0)
+        +target_package : String = proxy_class_package(vm, target_ref)
+        +package_ok : Bool = is_public || Bool.not(nonpublic) || String.eq(package, target_package)
+        checked : Unit <- S.check(is_interface && Bool.not(proxy_id_seen(seen, target_ref)) && package_ok, "java/lang/IllegalArgumentException")
+        +next_nonpublic : Bool = Bool.pick(Bool, nonpublic, True{}, Bool.not(is_public))
+        +next_package : String = Bool.pick(String, nonpublic || is_public, package, target_package)
+        result : Unit <- proxy_validate_ids(rest, vm, metadata, Con{target_ref, seen}, next_nonpublic, next_package)
         return result
 
+def proxy_method_owner_ids(ids: +List<U32>, +classes: +List<M.LoadedClass>, +owner: U32) -> Bool:
+  match ids:
+    case Nil{}: False{}
+    case Con{target, rest}: Bool.or(H.hierarchy(classes, target, owner), proxy_method_owner_ids(rest, classes, owner))
+
+def proxy_descriptor_parameters(+chars: +List<Char>, +acc: +List<Char>) -> String:
+  match chars:
+    case Nil{}: String.from_list(M.reverse(Char, acc))
+    case Con{Chr{41}, tail}: String.from_list(M.reverse(Char, acc))
+    case Con{head, tail}: proxy_descriptor_parameters(tail, Con{head, acc})
+
+def proxy_descriptor_return(+chars: +List<Char>) -> String:
+  match chars:
+    case Nil{}: ""
+    case Con{Chr{41}, tail}: String.from_list(tail)
+    case Con{head, tail}: proxy_descriptor_return(tail)
+
+def proxy_method_sig(+vm: M.VM, method: M.LoadedMethod) -> ProxyMethodSig:
+  match method:
+    case M.LoadedMethod{id, owner, +name, +descriptor, flags, parameters, resultTag, maxStack, maxLocals, instructions, handlers, intrinsic}:
+      +descriptor_text : String = Sy.text(S.symbols(vm), descriptor)
+      ProxyMethodSig{Sy.text(S.symbols(vm), name), proxy_descriptor_parameters(String.to_list(descriptor_text), Nil{}), proxy_descriptor_return(String.to_list(descriptor_text))}
+
+def proxy_reference_result(+descriptor: String) -> Bool:
+  String.starts_with(descriptor, "L") || String.starts_with(descriptor, "[")
+
+def proxy_results_compatible(+vm: M.VM, +left: String, +right: String) -> Bool:
+  String.eq(left, right) || (proxy_reference_result(left) && proxy_reference_result(right) &&
+    (H.descriptor_assignable(left, right, S.classes(vm), S.symbols(vm)) || H.descriptor_assignable(right, left, S.classes(vm), S.symbols(vm))))
+
+def proxy_sig_conflict(+vm: M.VM, left: ProxyMethodSig, right: ProxyMethodSig) -> Bool:
+  match left right:
+    case ProxyMethodSig{+left_name, +left_parameters, +left_result} ProxyMethodSig{+right_name, +right_parameters, +right_result}:
+      String.eq(left_name, right_name) && String.eq(left_parameters, right_parameters) && Bool.not(proxy_results_compatible(vm, left_result, right_result))
+
+def proxy_sig_check(+vm: M.VM, +value: ProxyMethodSig, +rest: +List<ProxyMethodSig>) -> Result<&2, &2, String, Unit>:
+  match rest:
+    case Nil{}: Done{Unit{}}
+    case Con{head, tail}:
+      do Result<&2, &2, String, Unit>:
+        checked : Unit <- S.check(Bool.not(proxy_sig_conflict(vm, value, head)), "java/lang/IllegalArgumentException")
+        result : Unit <- proxy_sig_check(vm, value, tail)
+        return result
+
+def proxy_validate_methods(fuel: Nat, +methods: +List<M.LoadedMethod>, +ids: +List<U32>, +vm: M.VM, +sigs: +List<ProxyMethodSig>) -> Result<&2, &2, String, Unit>:
+  match fuel methods:
+    case 0n _: Fail{"java/lang/IllegalArgumentException"}
+    case 1n+remaining Nil{}: Done{Unit{}}
+    case 1n+remaining Con{+method, rest}:
+      match method:
+        case M.LoadedMethod{+id, +owner, +name, +descriptor, +flags, parameters, resultTag, maxStack, maxLocals, instructions, handlers, intrinsic}:
+          do Result<&2, &2, String, Unit>:
+            +method_name : String = Sy.text(S.symbols(vm), name)
+            +descriptor_text : String = Sy.text(S.symbols(vm), descriptor)
+            +ordinary : Bool = Bool.not(String.eq(method_name, "<init>")) && Bool.not(String.eq(method_name, "<clinit>"))
+            +object_owner : Bool = U32.is_eq(owner, class_id(vm, "java/lang/Object"))
+            +candidate : Bool = ordinary && Bool.not(object_owner) && U32.is_ne(U32.and(flags, 1), 0) && proxy_method_owner_ids(ids, S.classes(vm), owner)
+            +sig : ProxyMethodSig = ProxyMethodSig{method_name, proxy_descriptor_parameters(String.to_list(descriptor_text), Nil{}), proxy_descriptor_return(String.to_list(descriptor_text))}
+            checked : Unit <- Bool.pick(Result<&2, &2, String, Unit>, candidate, proxy_sig_check(vm, sig, sigs), Done{Unit{}})
+            +next_sigs : +List<ProxyMethodSig> = Bool.pick(+List<ProxyMethodSig>, candidate, Con{sig, sigs}, sigs)
+            result : Unit <- proxy_validate_methods(remaining, rest, ids, vm, next_sigs)
+            return result
+
+def proxy_cache_slot_bits(found: Maybe<&2, M.Slot>) -> U32:
+  match found:
+    case None{}: 0
+    case Some{M.Slot{tag, bits}}: bits
 def proxy_catalog_found(found: Maybe<&2, M.Slot>) -> Maybe<&2, U32>:
   match found:
     case None{}: None{}
     case Some{M.Slot{tag, bits}}: Some{bits}
 
-def proxy_catalog_append(+vm: M.VM, +ids: +List<U32>, key: U32) -> Result<&2, &2, String, ProxyClassResult>:
+
+def proxy_slots_equal(left: +List<M.Slot>, right: +List<M.Slot>) -> Bool:
+  match left right:
+    case Nil{} Nil{}: True{}
+    case Con{M.Slot{left_tag, left_bits}, left_rest} Con{M.Slot{right_tag, right_bits}, right_rest}:
+      U32.is_eq(left_tag, right_tag) && U32.is_eq(left_bits, right_bits) && proxy_slots_equal(left_rest, right_rest)
+    case _ _: False{}
+
+def proxy_cache_node_match(+vm: M.VM, reference: U32, loader: U32, +values: +List<M.Slot>) -> Result<&2, &2, String, Bool>:
+  do Result<&2, &2, String, Bool>:
+    +entry : M.HeapEntry <- H.get(S.heap(vm), reference)
+    checked : Unit <- S.check(U32.is_eq(entry_kind(entry), 0), "java/lang/IllegalArgumentException")
+    +node_loader : M.Slot <- S.require(M.Slot, H.binding_find(entry_fields(entry), 0), "java/lang/IllegalArgumentException")
+    +node_array : M.Slot <- S.require(M.Slot, H.binding_find(entry_fields(entry), 1), "java/lang/IllegalArgumentException")
+    +array : M.HeapEntry <- H.get(S.heap(vm), bits_of(node_array))
+    array_checked : Unit <- S.check(U32.is_eq(entry_kind(array), 2), "java/lang/IllegalArgumentException")
+    return U32.is_eq(bits_of(node_loader), loader) && proxy_slots_equal(entry_values(array), values)
+
+def proxy_cache_lookup_continue(fuel: Nat, +vm: M.VM, +head: U32, +loader: U32, +values: +List<M.Slot>) -> Result<&2, &2, String, Maybe<&2, U32>>:
+  match fuel:
+    case 0n: Done{None{}}
+    case 1n+remaining:
+      Bool.pick(Result<&2, &2, String, Maybe<&2, U32>>, U32.is_eq(head, 0), Done{None{}},
+        do Result<&2, &2, String, Maybe<&2, U32>>:
+          same : Bool <- proxy_cache_node_match(vm, head, loader, values)
+          +entry : M.HeapEntry <- H.get(S.heap(vm), head)
+          +next_slot : M.Slot <- S.require(M.Slot, H.binding_find(entry_fields(entry), 3), "java/lang/IllegalArgumentException")
+          +next : U32 = bits_of(next_slot)
+          result : Maybe<&2, U32> <- Bool.pick(Result<&2, &2, String, Maybe<&2, U32>>, same, Done{Some{head}}, proxy_cache_lookup_continue(remaining, vm, next, loader, values))
+          return result
+      )
+
+def proxy_cache_lookup(fuel: Nat, +vm: M.VM, head: U32, +loader: U32, +values: +List<M.Slot>) -> Result<&2, &2, String, Maybe<&2, U32>>:
+  match fuel:
+    case 0n: Done{None{}}
+    case 1n+remaining: proxy_cache_lookup_continue(remaining, vm, head, loader, values)
+
+def proxy_cache_node_result(result: Result<&2, &2, String, H.Allocation>, +class_id_value: U32, key: U32) -> Result<&2, &2, String, ProxyClassResult>:
+  match result:
+    case Fail{error}: Fail{error}
+    case Done{H.Allocation{+vm, +reference}}:
+      +updated : M.VM = S.with_statics(vm, proxy_binding_set(S.statics(vm), key, M.Slot{3, reference}))
+      Done{ProxyClassResult{updated, class_id_value}}
+
+def proxy_catalog_append(+vm: M.VM, +ids: +List<U32>, key: U32, loader: U32, interface_array: U32, head: U32) -> Result<&2, &2, String, ProxyClassResult>:
   do Result<&2, &2, String, ProxyClassResult>:
     +class_id_value : U32 = M.length(M.LoadedClass, S.classes(vm))
     +name : String = "$Proxy" ++ V.int_show(class_id_value)
@@ -383,24 +557,30 @@ def proxy_catalog_append(+vm: M.VM, +ids: +List<U32>, key: U32) -> Result<&2, &2
     +with_symbols : M.VM = S.with_symbols(vm, symbols)
     +classes : +List<M.LoadedClass> = M.append(M.LoadedClass, S.classes(with_symbols), [proxy_class])
     +with_classes : M.VM = S.with_classes(with_symbols, classes)
-    +updated : M.VM = S.with_statics(with_classes, proxy_binding_set(S.statics(with_classes), key, M.Slot{1, class_id_value}))
-    return ProxyClassResult{updated, class_id_value}
+    +node : M.HeapEntry = H.object_entry(class_id(vm, "java/lang/reflect/Proxy"), [M.Binding{0, M.Slot{1, loader}}, M.Binding{1, M.Slot{3, interface_array}}, M.Binding{2, M.Slot{1, class_id_value}}, M.Binding{3, M.Slot{3, head}}])
+    result : ProxyClassResult <- proxy_cache_node_result(H.allocate(with_classes, node), class_id_value, key)
+    return result
 
-def proxy_catalog_found_result(+vm: M.VM, +ids: +List<U32>, key: U32, found: Maybe<&2, U32>) -> Result<&2, &2, String, ProxyClassResult>:
+def proxy_catalog_found_result(+vm: M.VM, +ids: +List<U32>, key: U32, loader: U32, interface_array: U32, head: U32, found: Maybe<&2, U32>) -> Result<&2, &2, String, ProxyClassResult>:
   match found:
-    case Some{class_id_value}: Done{ProxyClassResult{vm, class_id_value}}
-    case None{}: proxy_catalog_append(vm, ids, key)
+    case Some{reference}:
+      do Result<&2, &2, String, ProxyClassResult>:
+        +entry : M.HeapEntry <- H.get(S.heap(vm), reference)
+        +class_slot : M.Slot <- S.require(M.Slot, H.binding_find(entry_fields(entry), 2), "java/lang/IllegalArgumentException")
+        return ProxyClassResult{vm, bits_of(class_slot)}
+    case None{}: proxy_catalog_append(vm, ids, key, loader, interface_array, head)
 
-def proxy_catalog(+vm: M.VM, loader: U32, +interface_array: U32) -> Result<&2, &2, String, ProxyClassResult>:
+def proxy_catalog(+vm: M.VM, +loader: U32, +interface_array: U32) -> Result<&2, &2, String, ProxyClassResult>:
   do Result<&2, &2, String, ProxyClassResult>:
     +array : M.HeapEntry <- H.get(S.heap(vm), interface_array)
     checked : Unit <- S.check(U32.is_eq(entry_kind(array), 2), "java/lang/IllegalArgumentException")
     +ids : +List<U32> <- proxy_interface_ids(256n, vm, entry_values(array), Nil{})
-    validation : Unit <- proxy_validate_ids(ids, S.metadata(vm), Nil{})
+    validation : Unit <- proxy_validate_ids(ids, vm, S.metadata(vm), Nil{}, False{}, "")
+    method_validation : Unit <- proxy_validate_methods(100000n, S.methods(vm), ids, vm, Nil{})
     +key : U32 = proxy_cache_key(loader, entry_values(array))
-    found : Maybe<&2, M.Slot> = H.binding_find(S.statics(vm), key)
-    catalog : Maybe<&2, U32> = proxy_catalog_found(found)
-    result : ProxyClassResult <- proxy_catalog_found_result(vm, ids, key, catalog)
+    +head : U32 = proxy_cache_slot_bits(H.binding_find(S.statics(vm), key))
+    found : Maybe<&2, U32> <- proxy_cache_lookup(100000n, vm, head, loader, entry_values(array))
+    result : ProxyClassResult <- proxy_catalog_found_result(vm, ids, key, loader, interface_array, head, found)
     return result
 
 def proxy_mirror_key(class_id_value: U32) -> U32:
@@ -462,8 +642,41 @@ def proxy_invoke(+vm: M.VM, +method: M.LoadedMethod, +values: +List<M.Slot>, +na
 
 def proxy_instance_alloc(catalog: ProxyClassResult, handler: M.Slot, interfaces: M.Slot) -> Result<&2, &2, String, O.Outcome>:
   match catalog:
-    case ProxyClassResult{+vm, classId}:
-      alloc_result(H.allocate(vm, M.HeapEntry{class_id(vm, "java/lang/reflect/Proxy"), 10, 0, [M.Binding{0, handler}, M.Binding{1, interfaces}, M.Binding{2, M.Slot{1, classId}}], Nil{}, Nil{}}), vm2 => reference => ref_out(vm2, reference))
+    case ProxyClassResult{+vm, +classId}:
+      alloc_result(H.allocate(vm, M.HeapEntry{classId, 10, 0, [M.Binding{0, handler}, M.Binding{1, interfaces}, M.Binding{2, M.Slot{1, classId}}], Nil{}, Nil{}}), vm2 => reference => ref_out(vm2, reference))
+
+def proxy_init(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    receiver : M.Slot <- slot0(args)
+    +handler : M.Slot <- slot1(args)
+    checked : Unit <- S.check(U32.is_ne(bits_of(handler), 0), npe())
+    +reference : U32 = bits_of(receiver)
+    +entry : M.HeapEntry <- H.get(S.heap(vm), reference)
+    kind_checked : Unit <- S.check(U32.is_eq(entry_kind(entry), 10), "java/lang/IllegalArgumentException")
+    result : O.Outcome <- void_out(H.put(vm, reference, M.HeapEntry{H.entry_class(entry), entry_kind(entry), entry_element(entry), proxy_binding_set(entry_fields(entry), 0, handler), entry_values(entry), entry_chars(entry)}))
+    return result
+def proxy_constructor_clone(method: M.LoadedMethod, owner: U32) -> M.LoadedMethod:
+  match method:
+    case M.LoadedMethod{id, old_owner, name, descriptor, flags, parameters, resultTag, maxStack, maxLocals, instructions, handlers, intrinsic}:
+      M.LoadedMethod{id, owner, name, descriptor, flags, parameters, resultTag, maxStack, maxLocals, instructions, handlers, intrinsic}
+
+def proxy_constructor_base(+vm: M.VM) -> Result<&2, &2, String, M.LoadedMethod>:
+  S.require(M.LoadedMethod, proxy_own_method(S.methods(vm), S.symbols(vm), class_id(vm, "java/lang/reflect/Proxy"), "<init>", "(Ljava/lang/reflect/InvocationHandler;)V"), "java/lang/NoSuchMethodException")
+
+def proxy_constructor_method(+vm: M.VM, owner: U32) -> Result<&2, &2, String, M.LoadedMethod>:
+  do Result<&2, &2, String, M.LoadedMethod>:
+    base : M.LoadedMethod <- proxy_constructor_base(vm)
+    return proxy_constructor_clone(base, owner)
+
+def proxy_class_parent_proxy(found: Maybe<&2, M.LoadedClass>, proxy: U32) -> Bool:
+  match found:
+    case None{}: False{}
+    case Some{class}: U32.is_eq(M.loaded_class_parent(class), proxy)
+
+def proxy_class_is_synthetic(+vm: M.VM, target: U32) -> Bool:
+  proxy_class_parent_proxy(M.nth(M.LoadedClass, S.classes(vm), target), class_id(vm, "java/lang/reflect/Proxy"))
+def proxy_constructor_member(+vm: M.VM, +owner: U32, +method: M.LoadedMethod) -> M.LoadedMethod:
+  Bool.pick(M.LoadedMethod, proxy_class_is_synthetic(vm, owner), proxy_constructor_clone(method, owner), method)
 
 def proxy_get_class_result(catalog: ProxyClassResult, interfaces: U32) -> Result<&2, &2, String, O.Outcome>:
   match catalog:
@@ -487,13 +700,6 @@ def proxy_get_proxy_class(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, Str
     result : O.Outcome <- proxy_get_class_result(catalog, bits_of(interfaces))
     return result
 
-def proxy_class_parent_proxy(found: Maybe<&2, M.LoadedClass>, proxy: U32) -> Bool:
-  match found:
-    case None{}: False{}
-    case Some{class}: U32.is_eq(M.loaded_class_parent(class), proxy)
-
-def proxy_class_is_synthetic(+vm: M.VM, target: U32) -> Bool:
-  proxy_class_parent_proxy(M.nth(M.LoadedClass, S.classes(vm), target), class_id(vm, "java/lang/reflect/Proxy"))
 
 def proxy_is_proxy_class(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
@@ -521,49 +727,116 @@ def class_name_result(+vm: M.VM, +name: String) -> Result<&2, &2, String, O.Outc
   +target : U32 = class_id(vm, binary_name)
   Bool.pick(Result<&2, &2, String, O.Outcome>, U32.is_eq(target, 4294967295), throw_name(vm, "java/lang/ClassNotFoundException"), class_mirror_out(vm, target))
 
+
+type ClassForNameStart is Data:
+  ClassForNameReady{vm: M.VM}
+  ClassForNameCall{vm: M.VM, target: U32, method: M.LoadedMethod}
+
+def system_loader_reference() -> U32:
+  14
+
+def class_bootstrap_target(+vm: M.VM, +target: U32) -> Bool:
+  +object_id : U32 = class_id(vm, "java/lang/Object")
+  U32.is_ge(target, object_id) && Bool.not(String.starts_with(class_name_text(vm, target), "$Proxy"))
+
+def class_loader_allowed(+vm: M.VM, +target: U32, +loader: U32) -> Bool:
+  Bool.or(U32.is_eq(loader, system_loader_reference()), Bool.and(U32.is_ne(loader, 0), Bool.not(class_bootstrap_target(vm, target))))
+
 def class_for_name_args(+args: +List<M.Slot>) -> Result<&2, &2, String, ClassForNameArgs>:
   match args:
-    case Con{name, Con{flag, Con{loader, rest}}}: Done{ClassForNameArgs{name, U32.is_ne(bits_of(flag), 0)}}
-    case Con{name, Nil{}}: Done{ClassForNameArgs{name, True{}}}
+    case Con{name, Con{flag, Con{loader, rest}}}: Done{ClassForNameArgs{name, U32.is_ne(bits_of(flag), 0), bits_of(loader)}}
+    case Con{name, Nil{}}: Done{ClassForNameArgs{name, True{}, system_loader_reference()}}
     case _: Fail{"InvalidState: intrinsic argument count"}
 
-def class_for_name_call(+vm: M.VM, target: U32, method: M.LoadedMethod) -> O.Outcome:
-  O.Call{S.with_effect(S.set_class_state(vm, target, 1), M.ClassForName{}), method, Nil{}}
+def class_for_name_call(+vm: M.VM, +target: U32, method: M.LoadedMethod) -> O.Outcome:
+  O.Call{S.with_effect(S.set_class_state(vm, target, 1), M.ClassForName{target}), method, Nil{}}
 
-def class_for_name_initial(+vm: M.VM, target: U32, initializer: U32) -> Result<&2, &2, String, O.Outcome>:
-  match initializer:
-    case 4294967295: class_mirror_out(vm, target)
-    case method_id:
-      do Result<&2, &2, String, O.Outcome>:
-        +method : M.LoadedMethod <- S.require(M.LoadedMethod, M.nth(M.LoadedMethod, S.methods(vm), method_id), "java/lang/NoSuchMethodError")
-        return class_for_name_call(vm, target, method)
+def class_for_name_start_outcome(start: ClassForNameStart, target: U32) -> Result<&2, &2, String, O.Outcome>:
+  match start:
+    case ClassForNameReady{+vm}: class_mirror_out(vm, target)
+    case ClassForNameCall{+vm, owner, +method}: Done{class_for_name_call(vm, owner, method)}
 
-def class_for_name_choice(+vm: M.VM, target: U32, action: ClassForNameAction, initializer: U32) -> Result<&2, &2, String, O.Outcome>:
-  match action:
-    case Initialize{}: class_for_name_initial(vm, target, initializer)
-    case NoInitialize{}: class_mirror_out(vm, target)
+def class_for_name_parent_ready(parent_result: ClassForNameStart, +vm: M.VM, id: U32, initializer: U32) -> Result<&2, &2, String, ClassForNameStart>:
+  match parent_result:
+    case ClassForNameCall{+vm, target, +method}: Done{ClassForNameCall{vm, target, method}}
+    case ClassForNameReady{+vm}:
+      match initializer:
+        case 4294967295: Done{ClassForNameReady{S.set_class_state(vm, id, 2)}}
+        case method_id:
+          do Result<&2, &2, String, ClassForNameStart>:
+            method : M.LoadedMethod <- S.require(M.LoadedMethod, M.nth(M.LoadedMethod, S.methods(vm), method_id), "java/lang/NoSuchMethodError")
+            return ClassForNameCall{vm, id, method}
 
-def class_for_name_loaded(+vm: M.VM, +shouldInit: Bool, class: M.LoadedClass) -> Result<&2, &2, String, O.Outcome>:
-  M.LoadedClass{id, name, parent, interfaces, fields, methods, initializer, state} = class
+def class_for_name_walk(fuel: Nat, +vm: M.VM, +target: U32) -> Result<&2, &2, String, ClassForNameStart>:
+  match fuel:
+    case 0n: Fail{"java/lang/NoClassDefFoundError"}
+    case 1n+remaining:
+      +root : Bool = U32.is_eq(target, 4294967295)
+      Bool.pick(Result<&2, &2, String, ClassForNameStart>,
+        root,
+        Done{ClassForNameReady{vm}},
+        Result.bind(&2, &2, String, M.LoadedClass, ClassForNameStart,
+          S.require(M.LoadedClass, M.nth(M.LoadedClass, S.classes(vm), target), "java/lang/ClassNotFoundException"),
+          +class => do Result<&2, &2, String, ClassForNameStart>:
+            +id : U32 = M.loaded_class_id(class)
+            +parent : U32 = M.loaded_class_parent(class)
+            initializer : U32 = M.loaded_class_initializer(class)
+            +state : U32 = M.loaded_class_state(class)
+            +failed : Bool = U32.is_eq(state, 3)
+            +ready : Bool = U32.is_eq(state, 1) || U32.is_eq(state, 2)
+            +fresh : Bool = U32.is_eq(state, 0)
+            Bool.pick(Result<&2, &2, String, ClassForNameStart>,
+              failed,
+              Fail{"java/lang/NoClassDefFoundError"},
+              Bool.pick(Result<&2, &2, String, ClassForNameStart>,
+                ready,
+                Done{ClassForNameReady{vm}},
+                Bool.pick(Result<&2, &2, String, ClassForNameStart>,
+                  fresh,
+                  do Result<&2, &2, String, ClassForNameStart>:
+                    parent_result : ClassForNameStart <- class_for_name_walk(remaining, vm, parent)
+                    next : ClassForNameStart <- class_for_name_parent_ready(parent_result, vm, id, initializer)
+                    return next,
+                  Fail{"java/lang/NoClassDefFoundError"})))))
+def class_for_name_initial(+vm: M.VM, +target: U32, initializer: U32) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    start : ClassForNameStart <- class_for_name_walk(256n, vm, target)
+    result : O.Outcome <- class_for_name_start_outcome(start, target)
+    return result
+
+def class_for_name_continue(+vm: M.VM, +target: U32) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    start : ClassForNameStart <- class_for_name_walk(256n, vm, target)
+    result : O.Outcome <- class_for_name_start_outcome(start, target)
+    return result
+
+def class_for_name_loaded_state(+vm: M.VM, +shouldInit: Bool, +id: U32, initializer: U32, state: U32) -> Result<&2, &2, String, O.Outcome>:
   match state:
     case 3: throw_name(vm, "java/lang/NoClassDefFoundError")
-    case 0: class_for_name_choice(vm, id, Bool.pick(ClassForNameAction, shouldInit, Initialize{}, NoInitialize{}), initializer)
+    case 0: Bool.pick(Result<&2, &2, String, O.Outcome>, shouldInit, class_for_name_initial(vm, id, initializer), class_mirror_out(vm, id))
     case _: class_mirror_out(vm, id)
+
+def class_for_name_loaded(+vm: M.VM, +shouldInit: Bool, +class: M.LoadedClass) -> Result<&2, &2, String, O.Outcome>:
+  +id : U32 = M.loaded_class_id(class)
+  initializer : U32 = M.loaded_class_initializer(class)
+  state : U32 = M.loaded_class_state(class)
+  class_for_name_loaded_state(vm, shouldInit, id, initializer, state)
 
 def class_for_name_target(+vm: M.VM, target: U32, shouldInit: Bool) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
     +class : M.LoadedClass <- S.require(M.LoadedClass, M.nth(M.LoadedClass, S.classes(vm), target), "java/lang/ClassNotFoundException")
     result : O.Outcome <- class_for_name_loaded(vm, shouldInit, class)
     return result
+
 def class_for_name_ready(+vm: M.VM, result: Result<&2, &2, String, ClassForNameArgs>) -> Result<&2, &2, String, O.Outcome>:
   match result:
     case Fail{error}: Fail{error}
-    case Done{ClassForNameArgs{+name, shouldInit}}:
+    case Done{ClassForNameArgs{+name, shouldInit, loader}}:
       do Result<&2, &2, String, O.Outcome>:
         name_text : String <- string_text(vm, bits_of(name))
         text : String = class_binary_name(name_text)
         +target : U32 = class_id(vm, text)
-        checked : Unit <- S.check(U32.is_ne(target, 4294967295), "java/lang/ClassNotFoundException")
+        checked : Unit <- S.check(U32.is_ne(target, 4294967295) && class_loader_allowed(vm, target, loader), "java/lang/ClassNotFoundException")
         result : O.Outcome <- class_for_name_target(vm, target, shouldInit)
         return result
 
@@ -571,16 +844,28 @@ def class_for_name(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.
   class_for_name_ready(vm, class_for_name_args(args))
 
 def class_loader_system(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
-  alloc_result(H.allocate(vm, H.object_entry(class_id(vm, "java/lang/ClassLoader"), Nil{})), vm2 => reference => ref_out(vm2, reference))
+  ref_out(vm, system_loader_reference())
 
 def class_loader_load(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
+    receiver : M.Slot <- slot0(args)
     value : M.Slot <- slot1(args)
+    checked : Unit <- S.check(U32.is_ne(bits_of(receiver), 0), "java/lang/ClassNotFoundException")
     name : String <- string_text(vm, bits_of(value))
-    result : O.Outcome <- class_name_result(vm, name)
+    +binary_name : String = class_binary_name(name)
+    +target : U32 = class_id(vm, binary_name)
+    target_checked : Unit <- S.check(U32.is_ne(target, 4294967295), "java/lang/ClassNotFoundException")
+    result : O.Outcome <- class_mirror_out(vm, target)
     return result
+
 def class_get_loader(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
-  class_loader_system(vm, args)
+  do Result<&2, &2, String, O.Outcome>:
+    mirror : M.Slot <- slot0(args)
+    +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(mirror))
+    checked : Unit <- S.check(U32.is_eq(entry_kind(entry), 8), "java/lang/IllegalArgumentException")
+    target : U32 = entry_element(entry)
+    result : O.Outcome <- Bool.pick(Result<&2, &2, String, O.Outcome>, class_bootstrap_target(vm, target), ref_out(vm, 0), ref_out(vm, system_loader_reference()))
+    return result
 def resource_match_name(+resource: M.Resource, +name: String) -> Bool:
   M.Resource{+resource_name, +bytes, +origin} = resource
   String.eq(resource_name, name)
@@ -780,21 +1065,34 @@ def url_origin_scan(chars: +List<Char>, +acc: +List<Char>, archive: Bool) -> Url
 def url_origin_info(+origin: String) -> UrlOrigin:
   url_origin_scan(String.to_list(origin), Nil{}, False{})
 
-def url_escape_char(value: Char) -> String:
-  match value:
-    case Chr{32}: "%20"
-    case Chr{35}: "%23"
-    case Chr{37}: "%25"
-    case Chr{63}: "%3F"
-    case Chr{91}: "%5B"
-    case Chr{92}: "%5C"
-    case Chr{93}: "%5D"
-    case _: String.from_list([value])
+def url_hex_digit(+value: U32) -> Char:
+  Bool.pick(Char, U32.is_lt(value, 10), Chr{U32.add(48, value)}, Chr{U32.add(55, value)})
+
+def url_percent_byte(+value: U32) -> String:
+  "%" ++ String.from_list([url_hex_digit(U32.shrn(value, 4n)), url_hex_digit(U32.and(value, 15))])
+
+def url_ascii_safe(+value: U32) -> Bool:
+  (U32.is_ge(value, 65) && U32.is_le(value, 90)) ||
+  (U32.is_ge(value, 97) && U32.is_le(value, 122)) ||
+  (U32.is_ge(value, 48) && U32.is_le(value, 57)) ||
+  U32.is_eq(value, 45) || U32.is_eq(value, 46) || U32.is_eq(value, 95) || U32.is_eq(value, 126) ||
+  U32.is_eq(value, 33) || U32.is_eq(value, 36) || U32.is_eq(value, 38) || U32.is_eq(value, 39) || U32.is_eq(value, 40) ||
+  U32.is_eq(value, 41) || U32.is_eq(value, 42) || U32.is_eq(value, 43) || U32.is_eq(value, 44) || U32.is_eq(value, 47) ||
+  U32.is_eq(value, 58) || U32.is_eq(value, 59) || U32.is_eq(value, 61) || U32.is_eq(value, 64)
+
+def url_escape_codepoint(+value: U32) -> String:
+  Bool.pick(String, U32.is_le(value, 127) && url_ascii_safe(value), String.from_list([Chr{value}]),
+    Bool.pick(String, U32.is_le(value, 127), url_percent_byte(value),
+      Bool.pick(String, U32.is_le(value, 2047),
+        url_percent_byte(U32.or(192, U32.shrn(value, 6n))) ++ url_percent_byte(U32.or(128, U32.and(value, 63))),
+        Bool.pick(String, U32.is_le(value, 65535),
+          url_percent_byte(U32.or(224, U32.shrn(value, 12n))) ++ url_percent_byte(U32.or(128, U32.and(U32.shrn(value, 6n), 63))) ++ url_percent_byte(U32.or(128, U32.and(value, 63))),
+          url_percent_byte(U32.or(240, U32.shrn(value, 18n))) ++ url_percent_byte(U32.or(128, U32.and(U32.shrn(value, 12n), 63))) ++ url_percent_byte(U32.or(128, U32.and(U32.shrn(value, 6n), 63))) ++ url_percent_byte(U32.or(128, U32.and(value, 63)))))))
 
 def url_escape_text(chars: +List<Char>) -> String:
   match chars:
     case Nil{}: ""
-    case Con{head, tail}: url_escape_char(head) ++ url_escape_text(tail)
+    case Con{head, tail}: url_escape_codepoint(Char.to_u32(head)) ++ url_escape_text(tail)
 
 def url_external_info(info: UrlOrigin) -> String:
   match info:
@@ -1231,13 +1529,36 @@ def annotation_numeric_constant(+vm: M.VM, result: Result<&2, &2, String, M.Cons
     case Fail{error}: Fail{error}
     case Done{M.Number{kind, bits}}: Done{AnnotationValueRef{vm, M.Slot{1, bits}}}
     case Done{other}: Fail{"VmError.InvalidAnnotation: expected numeric constant"}
+def annotation_wide_box(+vm: M.VM, +wrapper: String, high: U32, low: U32) -> Result<&2, &2, String, AnnotationValueRef>:
+  do Result<&2, &2, String, AnnotationValueRef>:
+    +owner : U32 = class_id(vm, wrapper)
+    checked : Unit <- S.check(U32.is_ne(owner, 4294967295), "UnsupportedFeature: wide annotation wrapper " ++ wrapper)
+    result : AnnotationValueRef <- annotation_nested_alloc_result(H.allocate(vm, H.object_entry(owner, [M.Binding{0, M.Slot{1, high}}, M.Binding{1, M.Slot{1, low}}])))
+    return result
+
+def annotation_wide_pair(+vm: M.VM, result: Result<&2, &2, String, M.Constant>, expected: U32, wrapper: String) -> Result<&2, &2, String, AnnotationValueRef>:
+  match result:
+    case Fail{error}: Fail{error}
+    case Done{M.PairIndex{kind, high, low}}:
+      do Result<&2, &2, String, AnnotationValueRef>:
+        checked : Unit <- S.check(U32.is_eq(kind, expected), "VmError.InvalidAnnotation: expected wide constant")
+        value : AnnotationValueRef <- annotation_wide_box(vm, wrapper, high, low)
+        return value
+    case Done{other}: Fail{"VmError.InvalidAnnotation: expected wide constant"}
+
+def annotation_wide_constant(+vm: M.VM, result: Result<&2, &2, String, M.Constant>, tag: U32) -> Result<&2, &2, String, AnnotationValueRef>:
+  match tag:
+    case 74: annotation_wide_pair(vm, result, 5, "java/lang/Long")
+    case 68: annotation_wide_pair(vm, result, 6, "java/lang/Double")
+    case _: Fail{"VmError.InvalidAnnotation: unsupported wide annotation tag"}
+
 
 def annotation_array_simple_value(+vm: M.VM, +pool: +List<M.Constant>, value: M.AnnotationValue) -> Result<&2, &2, String, AnnotationValueRef>:
   match value:
     case M.AnnotationConst{115, index}: annotation_string_value(vm, pool, index)
     case M.AnnotationConst{70, index}: annotation_float_constant(vm, CP.get(pool, index))
-    case M.AnnotationConst{74, index}: Fail{"UnsupportedFeature: long annotation value"}
-    case M.AnnotationConst{68, index}: Fail{"UnsupportedFeature: double annotation value"}
+    case M.AnnotationConst{74, index}: annotation_wide_constant(vm, CP.get(pool, index), 74)
+    case M.AnnotationConst{68, index}: annotation_wide_constant(vm, CP.get(pool, index), 68)
     case M.AnnotationConst{tag, index}: annotation_numeric_constant(vm, CP.get(pool, index))
     case M.AnnotationClass{descriptorIndex}: annotation_class_value(vm, pool, descriptorIndex)
     case M.AnnotationEnum{typeIndex, nameIndex}: annotation_enum_value(vm, pool, typeIndex, nameIndex)
@@ -1269,6 +1590,8 @@ def annotation_array_primitive_tag(+descriptor: String) -> U32:
 
 def annotation_array_alloc_kind(kind: U32, +vm: M.VM, array_class: U32, component_class: U32, +slots: +List<M.Slot>) -> Result<&2, &2, String, H.Allocation>:
   match kind:
+    case 7: H.allocate(vm, H.reference_array_entry(array_class, class_id(vm, "java/lang/Double"), slots))
+    case 11: H.allocate(vm, H.reference_array_entry(array_class, class_id(vm, "java/lang/Long"), slots))
     case 0: H.allocate(vm, H.reference_array_entry(array_class, component_class, slots))
     case _: H.allocate(vm, H.primitive_array_entry(array_class, kind, slots))
 
@@ -1291,8 +1614,8 @@ def annotation_array_simple_alloc(value: AnnotationValueRefs, +descriptor: Strin
       match tag:
         case 115: annotation_string_value(vm, pool, index)
         case 70: annotation_float_constant(vm, CP.get(pool, index))
-        case 74: Fail{"UnsupportedFeature: long annotation value"}
-        case 68: Fail{"UnsupportedFeature: double annotation value"}
+        case 74: annotation_wide_constant(vm, CP.get(pool, index), 74)
+        case 68: annotation_wide_constant(vm, CP.get(pool, index), 68)
         case _: annotation_numeric_constant(vm, CP.get(pool, index))
     case M.AnnotationClass{descriptorIndex}: annotation_class_value(vm, pool, descriptorIndex)
     case M.AnnotationEnum{typeIndex, nameIndex}: annotation_enum_value(vm, pool, typeIndex, nameIndex)
@@ -1749,7 +2072,7 @@ def annotation_bound(found: Maybe<&2, M.Slot>, +vm: M.VM, +owner: U32, +method_i
 
 def annotation_element_invoke(+vm: M.VM, +args: +List<M.Slot>, +owner: U32, +name: String, +descriptor: String, fields: +List<M.Binding>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
-    +method : M.LoadedMethod <- S.require(M.LoadedMethod, annotation_method_find(S.methods(vm), owner, name, S.symbols(vm)), "java/lang/NoSuchMethodError")
+    +method : M.LoadedMethod <- S.require(M.LoadedMethod, annotation_method_find(S.methods(vm), owner, name, S.symbols(vm)), "java/lang/NoSuchMethodError: annotation element " ++ name)
     value : AnnotationValueRef <- annotation_bound(H.binding_find(fields, M.loaded_method_id(method)), vm, owner, M.loaded_method_id(method), descriptor)
     result : O.Outcome <- annotation_value_outcome(value)
     return result
@@ -2174,6 +2497,13 @@ def declared_constructors(methods: +List<M.LoadedMethod>, +owner: U32, +symbols:
     case Nil{}: M.reverse(M.LoadedMethod, acc)
     case Con{+method, +rest}:
       method_cons(Bool.pick(Maybe<&2, M.LoadedMethod>, U32.is_eq(M.loaded_method_owner(method), owner) && String.eq(Sy.text(symbols, M.loaded_method_name(method)), "<init>"), Some{method}, None{}), declared_constructors(rest, owner, symbols, acc))
+def proxy_declared_constructor_proxy(+vm: M.VM, owner: U32) -> Result<&2, &2, String, +List<M.LoadedMethod>>:
+  do Result<&2, &2, String, +List<M.LoadedMethod>>:
+    method : M.LoadedMethod <- proxy_constructor_method(vm, owner)
+    return [method]
+
+def proxy_declared_constructors(+vm: M.VM, +owner: U32, +ordinary: +List<M.LoadedMethod>) -> Result<&2, &2, String, +List<M.LoadedMethod>>:
+  Bool.pick(Result<&2, &2, String, +List<M.LoadedMethod>>, proxy_class_is_synthetic(vm, owner), proxy_declared_constructor_proxy(vm, owner), Done{ordinary})
 
 def reflect_alloc_found(allocation: H.Allocation, cont: M.VM -> U32 -> Result<&2, &2, String, ReflectRefs>) -> Result<&2, &2, String, ReflectRefs>:
   match allocation:
@@ -2310,6 +2640,33 @@ def jvm_type_class_name(value: M.JvmType) -> String:
     case M.Primitive{tag}: primitive_class_name(tag)
     case M.ObjectType{name}: name
     case M.ArrayType{element}: "[" ++ jvm_type_descriptor(element)
+def annotated_type_value(parsed: M.Descriptor, target: U32, index: U32) -> Result<&2, &2, String, M.JvmType>:
+  match target:
+    case 20: Done{D.result_type(parsed)}
+    case 22: S.require(M.JvmType, M.nth(M.JvmType, D.parameter_types(parsed), index), "java/lang/NoSuchMethodException")
+    case _: Fail{"java/lang/NoSuchMethodException"}
+
+def reflect_annotated_type_get_type(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    receiver : M.Slot <- slot0(args)
+    +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
+    method_slot : M.Slot <- reflect_annotation_binding(entry, 0)
+    target_slot : M.Slot <- reflect_annotation_binding(entry, 1)
+    index_slot : M.Slot <- reflect_annotation_binding(entry, 2)
+    +method : M.LoadedMethod <- S.require(M.LoadedMethod, M.nth(M.LoadedMethod, S.methods(vm), bits_of(method_slot)), "java/lang/NoSuchMethodException")
+    descriptor : String = Sy.text(S.symbols(vm), M.loaded_method_descriptor(method))
+    parsed : M.Descriptor <- D.parse_method(descriptor)
+    typ : M.JvmType <- annotated_type_value(parsed, bits_of(target_slot), bits_of(index_slot))
+    +target : U32 = class_id(vm, jvm_type_class_name(typ))
+    checked : Unit <- S.check(U32.is_ne(target, 4294967295), "java/lang/NoClassDefFoundError")
+    result : O.Outcome <- class_mirror_out(vm, target)
+    return result
+def reflect_annotated_type_get_owner(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  ref_out(vm, 0)
+
+def reflect_annotated_type_get_actuals(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  alloc_result(H.allocate(vm, H.reference_array_entry(class_id(vm, "[Ljava/lang/reflect/AnnotatedType;"), class_id(vm, "java/lang/reflect/AnnotatedType"), Nil{})), vm2 => reference => ref_out(vm2, reference))
+
 
 def parameter_class_ids(+vm: M.VM, +types: +List<M.JvmType>, +acc: +List<U32>) -> Result<&2, &2, String, +List<U32>>:
   match types:
@@ -2348,10 +2705,13 @@ def exception_ref_slots(refs: +List<U32>) -> +List<M.Slot>:
     case Nil{}: Nil{}
     case Con{reference, rest}: Con{M.Slot{3, reference}, exception_ref_slots(rest)}
 
-def exception_array_result(value: ReflectRefs) -> Result<&2, &2, String, O.Outcome>:
+def exception_array_result_kind(value: ReflectRefs, array_name: String, component_name: String) -> Result<&2, &2, String, O.Outcome>:
   match value:
     case ReflectRefs{+vm, +refs}:
-      alloc_result(H.allocate(vm, H.reference_array_entry(class_id(vm, "[Ljava/lang/Class;"), class_id(vm, "java/lang/Class"), exception_ref_slots(refs))), vm2 => reference => ref_out(vm2, reference))
+      alloc_result(H.allocate(vm, H.reference_array_entry(class_id(vm, array_name), class_id(vm, component_name), exception_ref_slots(refs))), vm2 => reference => ref_out(vm2, reference))
+
+def exception_array_result(value: ReflectRefs) -> Result<&2, &2, String, O.Outcome>:
+  exception_array_result_kind(value, "[Ljava/lang/Class;", "java/lang/Class")
 
 def method_exception_types(source: AnnotationMetadataRef) -> Result<&2, &2, String, O.Outcome>:
   match source:
@@ -2361,6 +2721,22 @@ def method_exception_types(source: AnnotationMetadataRef) -> Result<&2, &2, Stri
         refs : ReflectRefs <- parameter_mirror_alloc(vm, ids, Nil{})
         result : O.Outcome <- exception_array_result(refs)
         return result
+def method_generic_exception_types(source: AnnotationMetadataRef) -> Result<&2, &2, String, O.Outcome>:
+  match source:
+    case AnnotationMetadataRef{+vm, +pool, metadata}:
+      do Result<&2, &2, String, O.Outcome>:
+        ids : +List<U32> <- exception_class_ids(metadata_exceptions(metadata), vm, pool, Nil{})
+        refs : ReflectRefs <- parameter_mirror_alloc(vm, ids, Nil{})
+        result : O.Outcome <- exception_array_result_kind(refs, "[Ljava/lang/reflect/Type;", "java/lang/reflect/Type")
+        return result
+
+def reflect_method_get_generic_exception_types(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +method : M.LoadedMethod <- reflect_method_from_args(vm, args)
+    source : AnnotationMetadataRef <- method_annotation_source(vm, method)
+    result : O.Outcome <- method_generic_exception_types(source)
+    return result
+
 
 def reflect_method_get_exception_types(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
@@ -2410,11 +2786,18 @@ def class_declared_methods(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, St
     result : O.Outcome <- reflect_refs_array(refs, "[Ljava/lang/reflect/Method;", "java/lang/reflect/Method")
     return result
 
+def class_declared_constructors_ready(+vm: M.VM, target: U32, methods: Result<&2, &2, String, +List<M.LoadedMethod>>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +selected : +List<M.LoadedMethod> <- methods
+    refs : ReflectRefs <- reflect_constructor_alloc(vm, target, selected, Nil{})
+    result : O.Outcome <- reflect_refs_array(refs, "[Ljava/lang/reflect/Constructor;", "java/lang/reflect/Constructor")
+    return result
+
 def class_declared_constructors(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
     +target : U32 <- class_target(vm, args)
-    refs : ReflectRefs <- reflect_constructor_alloc(vm, target, declared_constructors(S.methods(vm), target, S.symbols(vm), Nil{}), Nil{})
-    result : O.Outcome <- reflect_refs_array(refs, "[Ljava/lang/reflect/Constructor;", "java/lang/reflect/Constructor")
+    methods : Result<&2, &2, String, +List<M.LoadedMethod>> = proxy_declared_constructors(vm, target, declared_constructors(S.methods(vm), target, S.symbols(vm), Nil{}))
+    result : O.Outcome <- class_declared_constructors_ready(vm, target, methods)
     return result
 
 def public_field_cons(found: Maybe<&2, M.LoadedField>, acc: +List<M.LoadedField>) -> +List<M.LoadedField>:
@@ -2572,6 +2955,11 @@ def find_public_constructor_exact(methods: +List<M.LoadedMethod>, +owner: U32, +
       Bool.pick(Maybe<&2, M.LoadedMethod>, selected, Some{method}, find_public_constructor_exact(rest, owner, prefix, symbols))
 
 
+def proxy_declared_constructor_exact(+vm: M.VM, +target: U32, +prefix: String) -> Result<&2, &2, String, M.LoadedMethod>:
+  Bool.pick(Result<&2, &2, String, M.LoadedMethod>, proxy_class_is_synthetic(vm, target) && String.eq(prefix, "(Ljava/lang/reflect/InvocationHandler;)"), proxy_constructor_method(vm, target), S.require(M.LoadedMethod, find_declared_constructor_exact(S.methods(vm), target, prefix, S.symbols(vm)), "java/lang/NoSuchMethodException"))
+def proxy_public_constructor_exact(+vm: M.VM, +target: U32, +prefix: String) -> Result<&2, &2, String, M.LoadedMethod>:
+  Bool.pick(Result<&2, &2, String, M.LoadedMethod>, proxy_class_is_synthetic(vm, target) && String.eq(prefix, "(Ljava/lang/reflect/InvocationHandler;)"), proxy_constructor_method(vm, target), S.require(M.LoadedMethod, find_public_constructor_exact(S.methods(vm), target, prefix, S.symbols(vm)), "java/lang/NoSuchMethodException"))
+
 
 def reflect_field_one(+vm: M.VM, owner: U32, +field: M.LoadedField) -> Result<&2, &2, String, O.Outcome>:
   alloc_result(H.allocate(vm, H.object_entry(class_id(vm, "java/lang/reflect/Field"), [M.Binding{0, M.Slot{1, M.loaded_field_owner(field)}}, M.Binding{1, M.Slot{1, M.loaded_field_id(field)}}, M.Binding{2, M.Slot{1, 0}}])), vm2 => reference => ref_out(vm2, reference))
@@ -2607,7 +2995,7 @@ def class_declared_constructor(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2
     parameter_array : M.Slot <- slot1(args)
     +parameter_names : +List<String> <- reflect_parameter_array_names(vm, bits_of(parameter_array))
     +prefix : String = parameter_prefix(parameter_names)
-    method : M.LoadedMethod <- S.require(M.LoadedMethod, find_declared_constructor_exact(S.methods(vm), target, prefix, S.symbols(vm)), "java/lang/NoSuchMethodException")
+    method : M.LoadedMethod <- proxy_declared_constructor_exact(vm, target, prefix)
     result : O.Outcome <- reflect_constructor_one(vm, target, method)
     return result
 
@@ -2642,11 +3030,18 @@ def public_constructors(methods: +List<M.LoadedMethod>, +owner: U32, +symbols: +
       +name : String = Sy.text(symbols, M.loaded_method_name(method))
       +selected : Bool = U32.is_eq(M.loaded_method_owner(method), owner) && String.eq(name, "<init>") && U32.is_ne(U32.and(M.loaded_method_flags(method), 1), 0)
       public_constructors(rest, owner, symbols, public_method_cons(Bool.pick(Maybe<&2, M.LoadedMethod>, selected, Some{method}, None{}), acc))
+def class_public_constructors_ready(+vm: M.VM, target: U32, methods: Result<&2, &2, String, +List<M.LoadedMethod>>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +selected : +List<M.LoadedMethod> <- methods
+    refs : ReflectRefs <- reflect_constructor_alloc(vm, target, selected, Nil{})
+    result : O.Outcome <- reflect_refs_array(refs, "[Ljava/lang/reflect/Constructor;", "java/lang/reflect/Constructor")
+    return result
+
 def class_public_constructors(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
     +target : U32 <- class_target(vm, args)
-    refs : ReflectRefs <- reflect_constructor_alloc(vm, target, public_constructors(S.methods(vm), target, S.symbols(vm), Nil{}), Nil{})
-    result : O.Outcome <- reflect_refs_array(refs, "[Ljava/lang/reflect/Constructor;", "java/lang/reflect/Constructor")
+    methods : Result<&2, &2, String, +List<M.LoadedMethod>> = proxy_declared_constructors(vm, target, public_constructors(S.methods(vm), target, S.symbols(vm), Nil{}))
+    result : O.Outcome <- class_public_constructors_ready(vm, target, methods)
     return result
 
 
@@ -2676,7 +3071,7 @@ def class_public_constructor(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, 
     parameter_array : M.Slot <- slot1(args)
     +parameter_names : +List<String> <- reflect_parameter_array_names(vm, bits_of(parameter_array))
     +prefix : String = parameter_prefix(parameter_names)
-    method : M.LoadedMethod <- S.require(M.LoadedMethod, find_public_constructor_exact(S.methods(vm), target, prefix, S.symbols(vm)), "java/lang/NoSuchMethodException")
+    method : M.LoadedMethod <- proxy_public_constructor_exact(vm, target, prefix)
     result : O.Outcome <- reflect_constructor_one(vm, target, method)
     return result
 
@@ -2691,6 +3086,8 @@ def class_name(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outc
     target : U32 <- class_target(vm, args)
     result : O.Outcome <- intern_or_alloc(vm, units_from_string(class_display_name(class_name_text(vm, target))))
     return result
+def type_get_type_name(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  class_name(vm, args)
 
 def class_superclass_parent(+vm: M.VM, +parent: U32) -> Result<&2, &2, String, O.Outcome>:
   match parent:
@@ -2814,9 +3211,33 @@ def member_accessible(+vm: M.VM, +caller: U32, +owner: U32, +flags: U32) -> Bool
     Bool.pick(Bool, public, True{},
       Bool.pick(Bool, private, U32.is_eq(caller, owner),
         Bool.pick(Bool, protected, package || H.hierarchy(S.classes(vm), caller, owner), package))))
+def protected_receiver_entry(+vm: M.VM, +target: U32, +caller: U32, result: Result<&2, &2, String, M.HeapEntry>) -> Bool:
+  match result:
+    case Fail{error}: False{}
+    case Done{entry}: H.assignable(S.classes(vm), S.symbols(vm), H.entry_class(entry), caller)
+
+def protected_receiver_target(+vm: M.VM, +target: U32, +caller: U32) -> Bool:
+  match target:
+    case 0: True{}
+    case reference: protected_receiver_entry(vm, target, caller, H.get(S.heap(vm), reference))
+
+def protected_receiver_required(+vm: M.VM, +owner: U32, +flags: U32, +caller: U32) -> Bool:
+  U32.is_ne(U32.and(flags, 4), 0) &&
+  U32.is_eq(U32.and(flags, 8), 0) &&
+  Bool.not(same_package(vm, caller, owner)) &&
+  H.hierarchy(S.classes(vm), caller, owner)
+
+def protected_receiver_accessible(+vm: M.VM, +owner: U32, +flags: U32, +target: U32) -> Bool:
+  +caller : U32 = caller_owner(vm)
+  Bool.pick(Bool, protected_receiver_required(vm, owner, flags, caller), protected_receiver_target(vm, target, caller), True{})
+
+
 
 def reflective_access(+vm: M.VM, +entry: M.HeapEntry, owner: U32, flags: U32) -> Bool:
   Bool.or(accessible_override(entry), member_accessible(vm, caller_owner(vm), owner, flags))
+def reflective_method_access(+vm: M.VM, +entry: M.HeapEntry, +owner: U32, +flags: U32, target: U32) -> Bool:
+  Bool.and(reflective_access(vm, entry, owner, flags), protected_receiver_accessible(vm, owner, flags, target))
+
 
 
 def accessible_update(entry: M.HeapEntry, value: M.Slot) -> M.HeapEntry:
@@ -2929,11 +3350,11 @@ def reflect_field_set_value(+vm: M.VM, field: M.LoadedField, target: U32, value:
   +value_ref : M.Slot = value
   Bool.pick(Result<&2, &2, String, O.Outcome>, U32.is_ne(U32.and(M.loaded_field_flags(field_ref), 8), 0), reflect_static_field_set(vm, field_ref, value_ref), reflect_instance_field_set(vm, field_ref, target_ref, value_ref))
 
-def reflect_field_set_allowed(field: M.LoadedField) -> Bool:
+def reflect_field_set_allowed(entry: M.HeapEntry, field: M.LoadedField) -> Bool:
   +flags : U32 = M.loaded_field_flags(field)
   +static : Bool = U32.is_ne(U32.and(flags, 8), 0)
   +final : Bool = U32.is_ne(U32.and(flags, 16), 0)
-  Bool.not(static && final)
+  Bool.pick(Bool, static, Bool.not(final), Bool.or(Bool.not(final), accessible_override(entry)))
 
 def reflect_field_set(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
@@ -2941,7 +3362,7 @@ def reflect_field_set(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String,
     +handle : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
     +field : M.LoadedField <- reflect_field_member(vm, args)
     checked : Unit <- S.check(reflective_access(vm, handle, M.loaded_field_owner(field), M.loaded_field_flags(field)), "java/lang/IllegalAccessException")
-    final_checked : Unit <- S.check(reflect_field_set_allowed(field), "java/lang/IllegalAccessException")
+    final_checked : Unit <- S.check(reflect_field_set_allowed(handle, field), "java/lang/IllegalAccessException")
     target : M.Slot <- slot1(args)
     value : M.Slot <- slot2(args)
     result : O.Outcome <- reflect_field_set_value(vm, field, bits_of(target), value)
@@ -2998,14 +3419,55 @@ def reflect_argument_values(+vm: M.VM, array_ref: U32) -> Result<&2, &2, String,
         return reflect_unbox_values(vm, entry_values(entry))
 
 
-def reflect_method_call(+vm: M.VM, method: M.LoadedMethod, target: M.Slot, +values: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+def reflect_method_direct(method: M.LoadedMethod) -> Bool:
+  +flags : U32 = M.loaded_method_flags(method)
+  U32.is_ne(U32.and(flags, 8), 0) || U32.is_ne(U32.and(flags, 2), 0) || U32.is_ne(U32.and(flags, 16), 0)
+
+def own_method(methods: +List<M.LoadedMethod>, +owner: U32, +name: U32, +descriptor: U32) -> Maybe<&2, M.LoadedMethod>:
+  match methods:
+    case Nil{}: None{}
+    case Con{+value, rest}:
+      Bool.pick(Maybe<&2, M.LoadedMethod>, U32.is_eq(M.loaded_method_owner(value), owner) && U32.is_eq(M.loaded_method_name(value), name) && U32.is_eq(M.loaded_method_descriptor(value), descriptor), Some{value}, own_method(rest, owner, name, descriptor))
+
+def class_parent_found(found: Maybe<&2, M.LoadedClass>) -> U32:
+  match found:
+    case None{}: 4294967295
+    case Some{value}: M.loaded_class_parent(value)
+
+def method_continue(found: Maybe<&2, M.LoadedMethod>, parent: U32, next: U32 -> Maybe<&2, M.LoadedMethod>) -> Maybe<&2, M.LoadedMethod>:
+  match found:
+    case Some{value}: Some{value}
+    case None{}:
+      match parent:
+        case 4294967295: None{}
+        case value: next(value)
+
+def method_hierarchy(fuel: Nat, +classes: +List<M.LoadedClass>, +methods: +List<M.LoadedMethod>, +owner: U32, +name: U32, +descriptor: U32) -> Maybe<&2, M.LoadedMethod>:
+  match fuel:
+    case 0n: None{}
+    case 1n+p:
+      method_continue(own_method(methods, owner, name, descriptor), class_parent_found(M.nth(M.LoadedClass, classes, owner)), parent => method_hierarchy(p, classes, methods, parent, name, descriptor))
+
+def virtual_on_entry(result: Result<&2, &2, String, M.HeapEntry>, +vm: M.VM, +name: String, +desc: String) -> Maybe<&2, M.LoadedMethod>:
+  match result:
+    case Fail{error}: None{}
+    case Done{entry}: method_hierarchy(256n, S.classes(vm), S.methods(vm), H.entry_class(entry), Sy.find(S.symbols(vm), name), Sy.find(S.symbols(vm), desc))
+
+def virtual_on(+vm: M.VM, +receiver: U32, name: String, desc: String) -> Maybe<&2, M.LoadedMethod>:
+  virtual_on_entry(H.get(S.heap(vm), receiver), vm, name, desc)
+def reflect_method_dispatch(+vm: M.VM, method: M.LoadedMethod, target: U32) -> Result<&2, &2, String, M.LoadedMethod>:
+  +method_ref : M.LoadedMethod = method
+  Bool.pick(Result<&2, &2, String, M.LoadedMethod>, reflect_method_direct(method_ref), Done{method_ref},
+    S.require(M.LoadedMethod, virtual_on(vm, target, Sy.text(S.symbols(vm), M.loaded_method_name(method_ref)), Sy.text(S.symbols(vm), M.loaded_method_descriptor(method_ref))), "java/lang/NoSuchMethodException"))
+
+def reflect_method_call(+vm: M.VM, +method: M.LoadedMethod, target: M.Slot, +values: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
-    +method_ref : M.LoadedMethod = method
     +target_ref : M.Slot = target
-    +static : Bool = U32.is_ne(U32.and(M.loaded_method_flags(method_ref), 8), 0)
+    +static : Bool = U32.is_ne(U32.and(M.loaded_method_flags(method), 8), 0)
     checked : Unit <- S.check(static || U32.is_ne(bits_of(target_ref), 0), npe())
+    +selected : M.LoadedMethod <- reflect_method_dispatch(vm, method, bits_of(target_ref))
     invoke_args : +List<M.Slot> = Bool.pick(+List<M.Slot>, static, values, Con{target_ref, values})
-    return O.Call{S.with_effect(vm, M.ReflectCall{}), method_ref, invoke_args}
+    return O.Call{S.with_effect(vm, M.ReflectCall{}), selected, invoke_args}
 
 
 def reflect_method_invoke(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
@@ -3013,8 +3475,8 @@ def reflect_method_invoke(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, Str
     receiver : M.Slot <- slot0(args)
     +handle : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
     +method : M.LoadedMethod <- reflect_method_member(vm, args)
-    checked : Unit <- S.check(reflective_access(vm, handle, M.loaded_method_owner(method), M.loaded_method_flags(method)), "java/lang/IllegalAccessException")
-    target : M.Slot <- slot1(args)
+    +target : M.Slot <- slot1(args)
+    checked : Unit <- S.check(reflective_method_access(vm, handle, M.loaded_method_owner(method), M.loaded_method_flags(method), bits_of(target)), "java/lang/IllegalAccessException")
     argument_array : M.Slot <- slot2(args)
     +values : +List<M.Slot> <- reflect_argument_values(vm, bits_of(argument_array))
     result : O.Outcome <- reflect_method_call(vm, method, target, values)
@@ -3042,6 +3504,14 @@ def reflect_method_is_varargs(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2,
     method : M.LoadedMethod <- reflect_method_member(vm, args)
     result : O.Outcome <- reflect_flag_value(vm, M.loaded_method_flags(method), 128)
     return result
+def reflect_method_is_default(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +method : M.LoadedMethod <- reflect_method_member(vm, args)
+    owner : U32 = M.loaded_method_owner(method)
+    interface : Bool = U32.is_ne(U32.and(class_flags(vm, owner), 512), 0)
+    concrete : Bool = U32.is_eq(U32.and(M.loaded_method_flags(method), 1024), 0)
+    result : O.Outcome <- bool_out(vm, Bool.and(interface, concrete))
+    return result
 
 def reflect_method_return_type(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
@@ -3061,6 +3531,21 @@ def reflect_member_parameter_types(+vm: M.VM, +method: M.LoadedMethod) -> Result
     refs : ReflectRefs <- parameter_mirror_alloc(vm, ids, Nil{})
     result : O.Outcome <- reflect_refs_array(refs, "[Ljava/lang/Class;", "java/lang/Class")
     return result
+def reflect_member_generic_parameter_types(+vm: M.VM, +method: M.LoadedMethod) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +descriptor : String = Sy.text(S.symbols(vm), M.loaded_method_descriptor(method))
+    parsed : M.Descriptor <- D.parse_method(descriptor)
+    +ids : +List<U32> <- parameter_class_ids(vm, D.parameter_types(parsed), Nil{})
+    refs : ReflectRefs <- parameter_mirror_alloc(vm, ids, Nil{})
+    result : O.Outcome <- reflect_refs_array(refs, "[Ljava/lang/reflect/Type;", "java/lang/reflect/Type")
+    return result
+
+def reflect_method_generic_parameter_types(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    method : M.LoadedMethod <- reflect_method_member(vm, args)
+    result : O.Outcome <- reflect_member_generic_parameter_types(vm, method)
+    return result
+
 
 def reflect_method_parameter_types(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
@@ -3081,14 +3566,56 @@ def reflect_constructor_member(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2
     receiver : M.Slot <- slot0(args)
     +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
     member : M.Slot <- reflect_binding(entry, 1)
-    method : M.LoadedMethod <- S.require(M.LoadedMethod, M.nth(M.LoadedMethod, S.methods(vm), bits_of(member)), "java/lang/NoSuchMethodException")
+    +base : M.LoadedMethod <- S.require(M.LoadedMethod, M.nth(M.LoadedMethod, S.methods(vm), bits_of(member)), "java/lang/NoSuchMethodException")
+    owner : M.Slot <- reflect_binding(entry, 0)
+    method : M.LoadedMethod = proxy_constructor_member(vm, bits_of(owner), base)
     return method
 
-def reflect_constructor_call(+vm: M.VM, method: M.LoadedMethod, +reference: U32, +values: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
-  Done{O.Call{S.with_effect(vm, M.ReflectConstructor{reference}), method, Con{M.Slot{3, reference}, values}}}
+def proxy_constructor_interface_array_result(refs: ReflectRefs) -> Result<&2, &2, String, H.Allocation>:
+  match refs:
+    case ReflectRefs{+vm, +ids}: H.allocate(vm, H.reference_array_entry(class_id(vm, "[Ljava/lang/Class;"), class_id(vm, "java/lang/Class"), ref_slots(ids)))
 
-def reflect_constructor_instance_alloc(+vm: M.VM, method: M.LoadedMethod, +owner: U32, +values: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
-  alloc_result(H.allocate(vm, H.object_entry(owner, reflect_instance_fields(S.fields(vm), S.classes(vm), owner))), vm2 => reference => reflect_constructor_call(vm2, method, reference, values))
+def primitive_name(+name: String) -> Bool:
+  String.eq(name, "int") || String.eq(name, "boolean") || String.eq(name, "byte") || String.eq(name, "short") || String.eq(name, "char") || String.eq(name, "float") || String.eq(name, "long") || String.eq(name, "double") || String.eq(name, "void")
+@unsafe def interface_mirror_alloc(+vm: M.VM, ids: +List<U32>, +refs: +List<U32>) -> Result<&2, &2, String, ReflectRefs>:
+  match ids:
+    case Nil{}:
+      Done{ReflectRefs{vm, M.reverse(U32, refs)}}
+    case Con{target, rest}:
+      reflect_alloc_result(H.allocate(vm, H.class_mirror_entry(class_id(vm, "java/lang/Class"), target)), vm2 => reference => interface_mirror_alloc(vm2, rest, Con{reference, refs}))
+def reflect_constructor_call(+vm: M.VM, method: M.LoadedMethod, target: M.Slot, +values: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +method_ref : M.LoadedMethod = method
+    +target_ref : M.Slot = target
+    invoke_args : +List<M.Slot> = Con{target_ref, values}
+    return O.Call{S.with_effect(vm, M.ReflectConstructor{bits_of(target_ref)}), method_ref, invoke_args}
+
+def proxy_constructor_interface_array(+vm: M.VM, owner: U32) -> Result<&2, &2, String, H.Allocation>:
+  do Result<&2, &2, String, H.Allocation>:
+    +class : M.LoadedClass <- S.require(M.LoadedClass, M.nth(M.LoadedClass, S.classes(vm), owner), "java/lang/NoClassDefFoundError")
+    refs : ReflectRefs <- interface_mirror_alloc(vm, M.loaded_class_interfaces(class), Nil{})
+    result : H.Allocation <- proxy_constructor_interface_array_result(refs)
+    return result
+
+def proxy_constructor_object_result(result: Result<&2, &2, String, H.Allocation>, +owner: U32, method: M.LoadedMethod, +values: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  match result:
+    case Fail{error}: Fail{error}
+    case Done{H.Allocation{+vm, +reference}}:
+      alloc_result(H.allocate(vm, M.HeapEntry{owner, 10, 0, [M.Binding{0, M.Slot{3, 0}}, M.Binding{1, M.Slot{3, reference}}, M.Binding{2, M.Slot{1, owner}}], Nil{}, Nil{}}), vm2 => object_ref => reflect_constructor_call(vm2, method, M.Slot{3, object_ref}, values))
+
+def proxy_constructor_alloc(+vm: M.VM, +owner: U32, method: M.LoadedMethod, +values: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  proxy_constructor_object_result(proxy_constructor_interface_array(vm, owner), owner, method, values)
+
+def reflect_constructor_instance_alloc(+vm: M.VM, +method: M.LoadedMethod, +owner: U32, +values: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  Bool.pick(Result<&2, &2, String, O.Outcome>, proxy_class_is_synthetic(vm, owner), proxy_constructor_alloc(vm, owner, method, values),
+    alloc_result(H.allocate(vm, H.object_entry(owner, reflect_instance_fields(S.fields(vm), S.classes(vm), owner))), vm2 => reference => reflect_constructor_call(vm2, method, M.Slot{3, reference}, values)))
+
+def constructor_instantiable(+vm: M.VM, +owner: U32) -> Bool:
+  +flags : U32 = class_flags(vm, owner)
+  Bool.not(U32.is_eq(owner, class_id(vm, "java/lang/Class")) ||
+    U32.is_ne(U32.and(flags, 512), 0) ||
+    U32.is_ne(U32.and(flags, 1024), 0) ||
+    U32.is_ne(U32.and(flags, 16384), 0))
 
 def reflect_constructor_new_instance(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
@@ -3097,6 +3624,7 @@ def reflect_constructor_new_instance(+vm: M.VM, +args: +List<M.Slot>) -> Result<
     +args_ref : +List<M.Slot> = args
     +method : M.LoadedMethod <- reflect_constructor_member(vm, args_ref)
     checked : Unit <- S.check(reflective_access(vm, handle, M.loaded_method_owner(method), M.loaded_method_flags(method)), "java/lang/IllegalAccessException")
+    instantiable : Unit <- S.check(constructor_instantiable(vm, M.loaded_method_owner(method)), "java/lang/InstantiationException")
     argument_array : M.Slot <- slot1(args_ref)
     +values : +List<M.Slot> <- reflect_argument_values(vm, bits_of(argument_array))
     result : O.Outcome <- reflect_constructor_instance_alloc(vm, method, M.loaded_method_owner(method), values)
@@ -3104,26 +3632,28 @@ def reflect_constructor_new_instance(+vm: M.VM, +args: +List<M.Slot>) -> Result<
 
 def reflect_constructor_name(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
-    receiver : M.Slot <- slot0(args)
-    +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
-    member : M.Slot <- reflect_binding(entry, 1)
-    method : M.LoadedMethod <- S.require(M.LoadedMethod, M.nth(M.LoadedMethod, S.methods(vm), bits_of(member)), "java/lang/NoSuchMethodException")
+    method : M.LoadedMethod <- reflect_constructor_member(vm, args)
     result : O.Outcome <- intern_or_alloc(vm, units_from_string(class_name_text(vm, M.loaded_method_owner(method))))
     return result
 
 def reflect_constructor_modifiers(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
-    receiver : M.Slot <- slot0(args)
-    +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
-    member : M.Slot <- reflect_binding(entry, 1)
-    method : M.LoadedMethod <- S.require(M.LoadedMethod, M.nth(M.LoadedMethod, S.methods(vm), bits_of(member)), "java/lang/NoSuchMethodException")
+    method : M.LoadedMethod <- reflect_constructor_member(vm, args)
     result : O.Outcome <- int_out(vm, M.loaded_method_flags(method))
     return result
+def method_exception_types_from_method(+vm: M.VM, method: M.LoadedMethod) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    source : AnnotationMetadataRef <- method_annotation_source(vm, method)
+    result : O.Outcome <- method_exception_types(source)
+    return result
+def constructor_exception_types_result(+vm: M.VM, +method: M.LoadedMethod) -> Result<&2, &2, String, O.Outcome>:
+  Bool.pick(Result<&2, &2, String, O.Outcome>, proxy_class_is_synthetic(vm, M.loaded_method_owner(method)), reflect_empty_parameter_types(vm), method_exception_types_from_method(vm, method))
+
+
 def reflect_constructor_get_exception_types(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
     method : M.LoadedMethod <- reflect_constructor_member(vm, args)
-    source : AnnotationMetadataRef <- method_annotation_source(vm, method)
-    result : O.Outcome <- method_exception_types(source)
+    result : O.Outcome <- constructor_exception_types_result(vm, method)
     return result
 
 def reflect_constructor_is_synthetic(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
@@ -3157,14 +3687,6 @@ def class_get_modifiers(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, Strin
     result : O.Outcome <- int_out(vm, class_flags(vm, target))
     return result
 
-def primitive_name(+name: String) -> Bool:
-  String.eq(name, "int") || String.eq(name, "boolean") || String.eq(name, "byte") || String.eq(name, "short") || String.eq(name, "char") || String.eq(name, "float") || String.eq(name, "long") || String.eq(name, "double") || String.eq(name, "void")
-@unsafe def interface_mirror_alloc(+vm: M.VM, ids: +List<U32>, +refs: +List<U32>) -> Result<&2, &2, String, ReflectRefs>:
-  match ids:
-    case Nil{}:
-      Done{ReflectRefs{vm, M.reverse(U32, refs)}}
-    case Con{target, rest}:
-      reflect_alloc_result(H.allocate(vm, H.class_mirror_entry(class_id(vm, "java/lang/Class"), target)), vm2 => reference => interface_mirror_alloc(vm2, rest, Con{reference, refs}))
 
 def class_interfaces_found(+vm: M.VM, target: U32, found: Maybe<&2, M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   match found:
@@ -3434,38 +3956,6 @@ def objects_equals(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.
     result : O.Outcome <- objects_equals_refs(vm, bits_of(left), bits_of(right))
     return result
 
-def own_method(methods: +List<M.LoadedMethod>, +owner: U32, +name: U32, +descriptor: U32) -> Maybe<&2, M.LoadedMethod>:
-  match methods:
-    case Nil{}: None{}
-    case Con{+value, rest}:
-      Bool.pick(Maybe<&2, M.LoadedMethod>, U32.is_eq(M.loaded_method_owner(value), owner) && U32.is_eq(M.loaded_method_name(value), name) && U32.is_eq(M.loaded_method_descriptor(value), descriptor), Some{value}, own_method(rest, owner, name, descriptor))
-
-def class_parent_found(found: Maybe<&2, M.LoadedClass>) -> U32:
-  match found:
-    case None{}: 4294967295
-    case Some{value}: M.loaded_class_parent(value)
-
-def method_continue(found: Maybe<&2, M.LoadedMethod>, parent: U32, next: U32 -> Maybe<&2, M.LoadedMethod>) -> Maybe<&2, M.LoadedMethod>:
-  match found:
-    case Some{value}: Some{value}
-    case None{}:
-      match parent:
-        case 4294967295: None{}
-        case value: next(value)
-
-def method_hierarchy(fuel: Nat, +classes: +List<M.LoadedClass>, +methods: +List<M.LoadedMethod>, +owner: U32, +name: U32, +descriptor: U32) -> Maybe<&2, M.LoadedMethod>:
-  match fuel:
-    case 0n: None{}
-    case 1n+p:
-      method_continue(own_method(methods, owner, name, descriptor), class_parent_found(M.nth(M.LoadedClass, classes, owner)), parent => method_hierarchy(p, classes, methods, parent, name, descriptor))
-
-def virtual_on_entry(result: Result<&2, &2, String, M.HeapEntry>, +vm: M.VM, +name: String, +desc: String) -> Maybe<&2, M.LoadedMethod>:
-  match result:
-    case Fail{error}: None{}
-    case Done{entry}: method_hierarchy(256n, S.classes(vm), S.methods(vm), H.entry_class(entry), Sy.find(S.symbols(vm), name), Sy.find(S.symbols(vm), desc))
-
-def virtual_on(+vm: M.VM, +receiver: U32, name: String, desc: String) -> Maybe<&2, M.LoadedMethod>:
-  virtual_on_entry(H.get(S.heap(vm), receiver), vm, name, desc)
 
 
 def execute_known(id: U32, vm: M.VM, args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
@@ -3737,6 +4227,46 @@ def integer_int_value(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String,
     +receiver : M.Slot <- slot0(args)
     +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
     result : O.Outcome <- int_out(vm, H.integer_value(entry_fields(entry)))
+    return result
+def wide_entry_valid(+entry: M.HeapEntry) -> Bool:
+  match entry:
+    case M.HeapEntry{class, kind, element, fields, values, chars}: U32.is_eq(kind, 9)
+
+def wide_box(+vm: M.VM, +args: +List<M.Slot>, +class_name: String, tag: U32) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +value : M.Slot <- slot0(args)
+    +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(value))
+    checked : Unit <- S.check(wide_entry_valid(entry), "java/lang/IllegalArgumentException")
+    result : O.Outcome <- alloc_result(H.allocate(vm, H.wide_object_entry(class_id(vm, class_name), tag, H.wide_high(entry), H.wide_low(entry))), vm2 => reference => ref_out(vm2, reference))
+    return result
+
+def wide_value_alloc(tag: U32, allocation: Result<&2, &2, String, H.Allocation>) -> Result<&2, &2, String, O.Outcome>:
+  match allocation:
+    case Fail{error}: Fail{error}
+    case Done{H.Allocation{updated, reference}}:
+      Done{O.Returned{updated, Some{M.Slot{tag, reference}}}}
+
+def wide_value(+vm: M.VM, +args: +List<M.Slot>, +tag: U32) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +receiver : M.Slot <- slot0(args)
+    +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
+    checked : Unit <- S.check(wide_entry_valid(entry), "java/lang/IllegalArgumentException")
+    result : O.Outcome <- wide_value_alloc(tag, H.allocate(vm, H.wide_entry(tag, H.wide_high(entry), H.wide_low(entry))))
+    return result
+
+def long_to_string(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +receiver : M.Slot <- slot0(args)
+    +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
+    text : String = W.long_show(W.Words{H.wide_high(entry), H.wide_low(entry)})
+    result : O.Outcome <- intern_or_alloc(vm, units_from_string(text))
+    return result
+def double_to_string(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +receiver : M.Slot <- slot0(args)
+    +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
+    text : String = W.double_show(W.Words{H.wide_high(entry), H.wide_low(entry)})
+    result : O.Outcome <- intern_or_alloc(vm, units_from_string(text))
     return result
 
 
@@ -4345,10 +4875,16 @@ def throwable_init_s(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, 
     result : O.Outcome <- throwable_init(vm, args, bits_of(message), 0, 0)
     return result
 
+def throwable_init_t_dispatch(+vm: M.VM, receiver: U32, +cause: U32) -> Result<&2, &2, String, O.Outcome>:
+  match cause:
+    case 0: throwable_init(vm, [M.Slot{3, receiver}, M.Slot{3, 0}], 0, 0, 0)
+    case +cause_ref: call_virtual(push_cont(vm, M.NeedThrowableMessage{receiver, cause_ref}), virtual_on(vm, cause_ref, "toString", "()Ljava/lang/String;"), [M.Slot{3, cause_ref}])
+
 def throwable_init_t(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
+    +receiver : M.Slot <- slot0(args)
     +cause : M.Slot <- slot1(args)
-    result : O.Outcome <- throwable_init(vm, args, 0, bits_of(cause), 1)
+    result : O.Outcome <- throwable_init_t_dispatch(vm, bits_of(receiver), bits_of(cause))
     return result
 
 def throwable_init_st(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
@@ -4683,21 +5219,69 @@ def reflect_box_value(+vm: M.VM, name: String, +value: M.Slot) -> Result<&2, &2,
           Bool.pick(Result<&2, &2, String, O.Outcome>, String.eq(name_ref, "short"), reflect_box_alloc(vm, "java/lang/Short", value_ref),
             Bool.pick(Result<&2, &2, String, O.Outcome>, String.eq(name_ref, "int") || String.eq(name_ref, "long"), reflect_box_alloc(vm, "java/lang/Integer", value_ref), returned(vm, Some{value_ref})))))))
 
-def proxy_return_value_kind(primitive: Bool, +vm: M.VM, value: M.Slot) -> M.Slot:
-  match primitive:
-    case True{}: reflect_unbox_value(vm, value)
-    case False{}: value
+def proxy_wrapper_name(+name: String) -> String:
+  match name:
+    case "boolean": "java/lang/Boolean"
+    case "byte": "java/lang/Byte"
+    case "short": "java/lang/Short"
+    case "char": "java/lang/Character"
+    case "int": "java/lang/Integer"
+    case "float": "java/lang/Float"
+    case "long": "java/lang/Long"
+    case "double": "java/lang/Double"
+    case _: ""
 
-def proxy_return_value(+vm: M.VM, +descriptor: String, value: M.Slot) -> M.Slot:
+def proxy_return_primitive(+vm: M.VM, +name: String, value: M.Slot) -> Result<&2, &2, String, M.Slot>:
+  match value:
+    case M.Slot{+tag, +reference}:
+      do Result<&2, &2, String, M.Slot>:
+        checked_tag : Unit <- S.check(U32.is_eq(tag, 3), "java/lang/NullPointerException")
+        checked_null : Unit <- S.check(U32.is_ne(reference, 0), "java/lang/NullPointerException")
+        wrapper : String = proxy_wrapper_name(name)
+        +wrapper_id : U32 = class_id(vm, wrapper)
+        wrapper_checked : Unit <- S.check(U32.is_ne(wrapper_id, 4294967295), "UnsupportedFeature: proxy wide primitive return")
+        +entry : M.HeapEntry <- H.get(S.heap(vm), reference)
+        checked_type : Unit <- S.check(U32.is_eq(H.entry_class(entry), wrapper_id), "java/lang/ClassCastException")
+        return reflect_unbox_value(vm, value)
+
+def proxy_return_reference_slot(+vm: M.VM, +name: String, value: M.Slot, tag: U32, reference: U32) -> Result<&2, &2, String, M.Slot>:
+  match reference:
+    case 0:
+      do Result<&2, &2, String, M.Slot>:
+        checked_tag : Unit <- S.check(U32.is_eq(tag, 3), "java/lang/ClassCastException")
+        return value
+    case _:
+      do Result<&2, &2, String, M.Slot>:
+        checked_tag : Unit <- S.check(U32.is_eq(tag, 3), "java/lang/ClassCastException")
+        +entry : M.HeapEntry <- H.get(S.heap(vm), reference)
+        +expected : U32 = class_id(vm, name)
+        checked_expected : Unit <- S.check(U32.is_ne(expected, 4294967295), "java/lang/ClassCastException")
+        checked_type : Unit <- S.check(H.assignable(S.classes(vm), S.symbols(vm), H.entry_class(entry), expected), "java/lang/ClassCastException")
+        return value
+
+def proxy_return_reference(+vm: M.VM, +name: String, value: M.Slot) -> Result<&2, &2, String, M.Slot>:
+  match value:
+    case M.Slot{+tag, +reference}: proxy_return_reference_slot(vm, name, value, tag, reference)
+
+def proxy_return_value(+vm: M.VM, +descriptor: String, +value: M.Slot) -> Result<&2, &2, String, M.Slot>:
   +name : String = method_return_name(descriptor)
-  proxy_return_value_kind(primitive_name(name), vm, value)
+  Bool.pick(Result<&2, &2, String, M.Slot>, String.eq(name, "void"), Done{value}, Bool.pick(Result<&2, &2, String, M.Slot>, primitive_name(name), proxy_return_primitive(vm, name, value), proxy_return_reference(vm, name, value)))
 
 def reflect_box_return(+vm: M.VM, descriptor: String, value: M.Slot) -> Result<&2, &2, String, O.Outcome>:
   reflect_box_value(vm, method_return_name(descriptor), value)
 
 
+def continue_throwable_message(+vm: M.VM, +receiver: U32, +cause: U32, value: M.Slot) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +entry : M.HeapEntry <- H.get(S.heap(vm), receiver)
+    updated : M.HeapEntry = M.HeapEntry{H.entry_class(entry), 0, 0, [M.Binding{0, M.Slot{3, bits_of(value)}}, M.Binding{1, M.Slot{3, cause}}, M.Binding{2, M.Slot{3, 0}}, M.Binding{3, M.Slot{1, 1}}], Nil{}, Nil{}}
+    result : O.Outcome <- void_out(H.put(vm, receiver, updated))
+    return result
+
 def continue_java(+vm: M.VM, cont: M.Cont, +value: M.Slot) -> Result<&2, &2, String, O.Outcome>:
   match cont:
+    case M.NeedThrowableMessage{+receiver, +cause}:
+      continue_throwable_message(vm, receiver, cause, value)
     case M.NeedToString{op, extra}:
       continue_to_string(vm, op, extra, value)
     case M.NeedEquals{op, left, right}:

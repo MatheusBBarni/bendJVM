@@ -32,13 +32,13 @@ Repository evidence:
   `<clinit>` only when requested; the runner publishes configuration-only
   classes from dependency archives.
 
-The remaining surface is intentionally bounded: Code-level type-annotation
-attributes are parsed only at non-Code declaration sites; category-two
-annotation values are retained but rejected at materialization; generated proxy
-constructors, method-conflict/visibility/return validation, declared checked
-exception selection, and loader-namespace rules are incomplete; the explicit
-Class.forName loader is currently one application namespace; parent/complex
-initialization ordering and Unicode URL escaping remain bounded.
+The current bounded expansion adds:
+
+- caller/protected receiver checks, final instance-field restrictions, reflective virtual dispatch, constructor rejection for interfaces/abstract/enum targets, and public-constructor filtering;
+- a single logical-slot raw-word long/double representation with long arithmetic, `lshl`, `i2l`, `l2i`, `dadd`, `dsub`, `dneg`, wide fields/calls/returns, boxed `Long`/`Double` value accessors, and bounded decimal formatting;
+- custom loader object acceptance for the existing application catalog, default-interface fallback when class dispatch has no concrete override, `Method.isDefault()` fallback reflection, `InvocationTargetException` wrapping at reflective unwind boundaries, `Throwable(Throwable)` cause-to-message initialization, and bounded `AnnotatedType` type/owner/actual-argument exposure for erased descriptors.
+
+The following remain incomplete: true category-two JVM stack/local layout and the remaining long/double opcodes/conversions, loader identity and multiple independent namespaces, special default-method proxy invocation, generic `Signature`/`MethodParameters`/`TypeVariable` reflection, full `AnnotatedType` target/type-path exposure, and byte-for-byte OpenJDK formatting/exception-message compatibility. `AnnotatedType.getType()`, `Type.getTypeName()`, `Method.getGenericReturnType()`, `Method.getGenericParameterTypes()`, and `Method.getGenericExceptionTypes()` expose erased descriptor types only.
 
 ## Scope and boundaries
 
@@ -47,12 +47,12 @@ initialization ordering and Unicode URL escaping remain bounded.
 - Milestone 1 supplies deterministic classpath/archive lookup, a Bend-driven loading session, source identity, manifest dependency order, and resource byte requests. Extend it for runtime requests and resource enumeration; do not add another scanner or Python class parser.
 - Milestone 2 supplies interface dispatch, typed throwable objects, heap-mutating intrinsic results, Java callback continuations, boxed integers, collections, stream APIs, and cleanup. Reflection and proxies must use these paths instead of hidden host execution.
 - Add category-one primitive wrapper support missing from milestone 2: Boolean, Byte, Short, Character, and Float, including `valueOf`, primitive-value accessors, and primitive `TYPE` mirrors. Add `Void.TYPE` and metadata-only primitive mirrors for all Java primitive types.
-- Preserve raw long/double annotation constants and recognize their descriptors and Class mirrors. Executing or boxing category-two values still depends on milestone 4; reject unsupported operations explicitly rather than truncating values or faking support. This restriction also applies to proxy signatures and reflective field/call conversions.
+- Preserve raw long/double annotation constants and materialize them through boxed `Long`/`Double` reflection values using high/low U32 words. The current runtime additionally supports a single logical VM slot for bounded long arithmetic, `dadd`, wide field/call/return transport, and wrapper accessors; true category-two stack/local semantics and the remaining opcodes remain excluded.
 - Add only the enum support required to compile and consume Java 8 annotation enum values: Enum construction/name/ordinal/identity semantics, constant lookup, and array cloning used by javac-generated `values()`. Enum switch execution remains milestone 4.
 
 ### Explicit exclusions
 
-Custom class-loader subclasses and arbitrary `defineClass`, multiple application-loader namespaces, modules/security managers, MethodHandles, `invokedynamic`, full generic Type/Signature reflection, parameter-name reflection, serialization of reflection/proxy objects, Java threading/context-class-loader APIs, subclass-based proxies, default-method special invocation, Spring Boot archive layouts, and general classpath/package scanning.
+Custom loader instances may resolve names from the existing application catalog, but arbitrary `defineClass`, loader identity, and multiple application-loader namespaces remain unsupported; modules/security managers, MethodHandles, `invokedynamic`, full generic Type/Signature reflection, parameter-name reflection, serialization of reflection/proxy objects, Java threading/context-class-loader APIs, subclass-based proxies, default-method special invocation, Spring Boot archive layouts, and general classpath/package scanning are also excluded.
 
 Generic Signature and other unsupported attributes must not be invented into reflection results. Preserve validated metadata where useful, but advertise only implemented APIs. Application discovery in the integrated example uses explicit names in configuration, not an unbounded archive scan.
 
@@ -103,11 +103,11 @@ existing typed exception mechanism and correct Java inheritance.
 - Model bootstrap and one application loader explicitly. Bootstrap classes remain protected from classpath replacement; array mirrors inherit appropriate component loader identity. Primitive mirrors do not require a `.class` file.
 - Add Class constants through verifier, linker, and runtime together. Obtain mirrors without triggering class initialization. Arrays have Object superclass and Cloneable/Serializable interfaces; primitives/void have no superclass.
 - `Class.forName` resolves configured classpath names; the explicit overload
-  initializes the target through its direct `<clinit>` when `true` and leaves it
-  uninitialized when `false`. Parent and complex initializer ordering remains
-  bounded. `loadClass` likewise resolves without initialization. Array-name
-  handling follows Java binary-name rules; `Class.forName("int")` does not
-  resolve `int.class`.
+  initializes the superclass chain parent-first and runs the target's direct
+  `<clinit>` once when `true`, while `false` leaves it uninitialized.
+  `loadClass` resolves without initialization. The supported explicit loader
+  remains one application namespace. Array-name handling follows Java
+  binary-name rules; `Class.forName("int")` does not resolve `int.class`.
 - When a name appears only in a configuration file, request it through milestone 1's sources at runtime. Append symbols/classes/members and link the new closure transactionally; never renumber existing IDs, replace live statics, or clear initialization state.
 - Failed runtime loading must not leave partially visible classes, dangling member IDs, duplicate mirrors, or inconsistent retry state. Loading cycles and initializer recursion use explicit state transitions.
 - Distinguish ClassNotFoundException at explicit lookup from linkage errors while resolving dependencies. VM capability errors remain explicit and are not disguised as absence.
@@ -139,7 +139,7 @@ existing typed exception mechanism and correct Java inheritance.
 - Annotation equality/hash follow the Annotation contract, including primitive/reference array contents and floating-point value semantics. Deterministic toString is useful, but formatting is not a byte-for-byte OpenJDK oracle.
 - Annotation interfaces and Enum metadata must have correct flags/hierarchy. Enum values are actual Java enum singleton objects, not strings.
 - Use VM-managed annotation instances implementing their annotation interface. Share ordinary synthetic-class/interface dispatch machinery with proxies where appropriate, without requiring annotations to masquerade as user InvocationHandlers.
-- Metadata parsing supports long/double forms even before execution does. Public APIs that would need unsupported wide-value materialization must fail explicitly; do not advertise complete annotation execution for those element types until milestone 4.
+- Metadata parsing supports long/double forms and reflection materializes them as boxed raw-word `Long`/`Double` values holding high/low U32 words. General category-two bytecode, field, call, and primitive-unboxing execution remains milestone 4; do not advertise that broader support.
 
 ### 6. Dynamic proxies
 
@@ -288,12 +288,15 @@ Candidate `LAWS.bend`/`PROOF.bend` invariants: appending types preserves existin
   and field access work for the documented supported domain.
 - Runtime-visible annotation retention, defaults, parameter queries, Class and
   reference values, repeatable containers, recursive `@Inherited` lookup,
-  structural equality, enum identity, and defensive arrays are covered;
-  category-two values are retained but rejected at materialization.
+  structural equality, enum identity, defensive arrays, and boxed raw-word
+  long/double reflection values are covered; general category-two execution
+  remains excluded.
 - Supported interface proxies invoke real Java handlers through the normal VM,
   including Object methods, generated-class identity, interface checks,
-  category-one argument boxing, and undeclared checked-throwable wrapping;
-  method-conflict/default-method and full loader-namespace rules remain bounded.
+  category-one argument boxing, method-conflict/return validation,
+  declared-exception handling, and undeclared checked-throwable wrapping.
+  Default-method special invocation and multiple custom loader namespaces
+  remain excluded.
 - Framework configuration resources support class-relative `./` and `..`
   normalization, ordered enumeration, origin-bound reopening, and Properties
   decoding.
@@ -307,7 +310,8 @@ Planning verification: the bounded milestone is exercised by repository checks.
 Parser/linker metadata, reflective member access, runtime annotation objects
 including repeatable containers, interface proxies, resources, and both
 bounded Properties paths have permanent fixtures or suite coverage. Remaining
-limits are recorded in `README.md` and `ROADMAP.md`: wide annotation values,
-complete access-edge compatibility, proxy method-conflict/default-method and
-loader-namespace semantics, parent/complex static-initialization semantics,
-and full OpenJDK reflection compatibility.
+limits are recorded in `README.md` and this plan: general category-two
+bytecode/field/call execution, complete access-edge compatibility, custom
+loader subclasses and multiple application namespaces, default-method proxy
+dispatch, generic/signature reflection, and full OpenJDK reflection
+compatibility.

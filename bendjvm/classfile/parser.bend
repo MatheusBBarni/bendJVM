@@ -4,6 +4,7 @@ import ./reader.bend as R
 import ./constant_pool.bend as CP
 import ./attribute.bend as A
 import ../bytecode/decode.bend as BC
+import ./annotation.bend as AN
 
 # Parser state wrappers keep reader ownership explicit across recursive sections.
 type Interfaces is Data:
@@ -76,62 +77,80 @@ def code_attribute(attributes: +List<M.Attribute>) -> Maybe<&2, +List<U32>>:
         result : R.Reader <- skip_attributes_go(p, skipped)
         return result
 
-def handler_finish(reader: R.Reader, +handlers: +List<M.Handler>) -> Result<&2, &2, String, +List<M.Handler>>:
-  do Result<&2, &2, String, +List<M.Handler>>:
-    +count : R.RWord <- R.read_u2(reader)
-    checked : R.Reader <- skip_attributes_go(U32.to_nat(word_value(count)), word_reader(count))
-    return M.reverse(M.Handler, handlers)
-@unsafe def handlers_go(count: Nat, reader: R.Reader, acc: +List<M.Handler>) -> Result<&2, &2, String, +List<M.Handler>>:
+type CodeHandlers is Data:
+  CodeHandlers{reader: R.Reader, handlers: +List<M.Handler>}
+
+def handler_finish(reader: R.Reader, +handlers: +List<M.Handler>) -> Result<&2, &2, String, CodeHandlers>:
+  Done{CodeHandlers{reader, M.reverse(M.Handler, handlers)}}
+
+@unsafe def handlers_go(count: Nat, reader: R.Reader, acc: +List<M.Handler>) -> Result<&2, &2, String, CodeHandlers>:
   match count:
     case 0n:
       handler_finish(reader, acc)
     case 1n+p:
-      do Result<&2, &2, String, +List<M.Handler>>:
+      do Result<&2, &2, String, CodeHandlers>:
         +start : R.RWord <- R.read_u2(reader)
         +end : R.RWord <- R.read_u2(word_reader(start))
         +target : R.RWord <- R.read_u2(word_reader(end))
         +catch_type : R.RWord <- R.read_u2(word_reader(target))
-        result : +List<M.Handler> <- handlers_go(p, word_reader(catch_type), Con{M.Handler{word_value(start), word_value(end), word_value(target), word_value(catch_type)}, acc})
+        result : CodeHandlers <- handlers_go(p, word_reader(catch_type), Con{M.Handler{word_value(start), word_value(end), word_value(target), word_value(catch_type)}, acc})
         return result
 
-def code_after_exceptions(max_stack: U32, max_locals: U32, code: +List<U32>, exception_count: R.RWord) -> Result<&2, &2, String, CodeInfo>:
+def code_attributes_validate(attributes: A.Attributes, +pool: +List<M.Constant>) -> Result<&2, &2, String, Unit>:
+  match attributes:
+    case A.Attributes{+reader, +values}:
+      do Result<&2, &2, String, Unit>:
+        R.finish(reader)
+        checked : M.AnnotationMetadata <- AN.parse_code_metadata_attributes(values, pool)
+        return Unit{}
+
+def code_after_handlers(max_stack: U32, max_locals: U32, +code: +List<U32>, result: CodeHandlers, +pool: +List<M.Constant>) -> Result<&2, &2, String, CodeInfo>:
+  match result:
+    case CodeHandlers{+reader, +handlers}:
+      do Result<&2, &2, String, CodeInfo>:
+        attributes : A.Attributes <- A.parse(reader, pool)
+        code_attributes_validate(attributes, pool)
+        return CodeInfo{max_stack, max_locals, code, handlers}
+
+def code_after_exceptions(max_stack: U32, max_locals: U32, +code: +List<U32>, exception_count: R.RWord, +pool: +List<M.Constant>) -> Result<&2, &2, String, CodeInfo>:
   match exception_count:
     case R.RWord{reader, value}:
       do Result<&2, &2, String, CodeInfo>:
-        handlers : +List<M.Handler> <- handlers_go(U32.to_nat(value), reader, Nil{})
-        return CodeInfo{max_stack, max_locals, code, handlers}
-
-def code_after_code(max_stack: U32, max_locals: U32, code: R.RBytes) -> Result<&2, &2, String, CodeInfo>:
-  match code:
-    case R.RBytes{reader, value}:
-      do Result<&2, &2, String, CodeInfo>:
-        exception_count : R.RWord <- R.read_u2(reader)
-        result : CodeInfo <- code_after_exceptions(max_stack, max_locals, value, exception_count)
+        handlers : CodeHandlers <- handlers_go(U32.to_nat(value), reader, Nil{})
+        result : CodeInfo <- code_after_handlers(max_stack, max_locals, code, handlers, pool)
         return result
 
-def code_after_locals(max_stack: U32, locals: R.RWord) -> Result<&2, &2, String, CodeInfo>:
+def code_after_code(max_stack: U32, max_locals: U32, code: R.RBytes, +pool: +List<M.Constant>) -> Result<&2, &2, String, CodeInfo>:
+  match code:
+    case R.RBytes{reader, +value}:
+      do Result<&2, &2, String, CodeInfo>:
+        exception_count : R.RWord <- R.read_u2(reader)
+        result : CodeInfo <- code_after_exceptions(max_stack, max_locals, value, exception_count, pool)
+        return result
+
+def code_after_locals(max_stack: U32, locals: R.RWord, +pool: +List<M.Constant>) -> Result<&2, &2, String, CodeInfo>:
   match locals:
     case R.RWord{reader, value}:
       do Result<&2, &2, String, CodeInfo>:
         +code_length : R.RWord <- R.read_u4(reader)
         length : U32 = word_value(code_length)
         bytes : R.RBytes <- R.slice(word_reader(code_length), length)
-        result : CodeInfo <- code_after_code(max_stack, value, bytes)
+        result : CodeInfo <- code_after_code(max_stack, value, bytes, pool)
         return result
 
-def code_after_stack(stack: R.RWord) -> Result<&2, &2, String, CodeInfo>:
+def code_after_stack(stack: R.RWord, +pool: +List<M.Constant>) -> Result<&2, &2, String, CodeInfo>:
   match stack:
     case R.RWord{reader, value}:
       do Result<&2, &2, String, CodeInfo>:
         locals : R.RWord <- R.read_u2(reader)
-        result : CodeInfo <- code_after_locals(value, locals)
+        result : CodeInfo <- code_after_locals(value, locals, pool)
         return result
 
-def parse_code_bytes(+bytes: +List<U32>) -> Result<&2, &2, String, CodeInfo>:
+def parse_code_bytes(+bytes: +List<U32>, +pool: +List<M.Constant>) -> Result<&2, &2, String, CodeInfo>:
   reader = R.new(bytes)
   do Result<&2, &2, String, CodeInfo>:
     stack : R.RWord <- R.read_u2(reader)
-    result : CodeInfo <- code_after_stack(stack)
+    result : CodeInfo <- code_after_stack(stack, pool)
     return result
 
 def attrs_values(attributes: A.Attributes) -> +List<M.Attribute>:
@@ -144,15 +163,16 @@ def attrs_reader(attributes: A.Attributes) -> R.Reader:
     case A.Attributes{reader, values}:
       reader
 
-def method_code_found(found: Maybe<&2, +List<U32>>) -> Result<&2, &2, String, CodeInfo>:
+def method_code_found(found: Maybe<&2, +List<U32>>, +pool: +List<M.Constant>) -> Result<&2, &2, String, CodeInfo>:
   match found:
     case None{}:
       Done{code_info_default()}
     case Some{bytes}:
-      parse_code_bytes(bytes)
+      parse_code_bytes(bytes, pool)
 
-def method_code(attributes: +List<M.Attribute>) -> Result<&2, &2, String, CodeInfo>:
-  method_code_found(code_attribute(attributes))
+def method_code(attributes: +List<M.Attribute>, +pool: +List<M.Constant>) -> Result<&2, &2, String, CodeInfo>:
+  method_code_found(code_attribute(attributes), pool)
+
 
 def method_build(info: CodeInfo, flags: U32, name: String, descriptor: String, attributes: +List<M.Attribute>) -> Result<&2, &2, String, M.Method>:
   match info:
@@ -173,7 +193,7 @@ def method_build(info: CodeInfo, flags: U32, name: String, descriptor: String, a
         descriptor : String <- CP.utf(pool, word_value(descriptor_word))
         +attr_count : R.RWord <- R.read_u2(word_reader(descriptor_word))
         +attributes : A.Attributes <- A.read_go(U32.to_nat(word_value(attr_count)), word_reader(attr_count), pool, Nil{})
-        info : CodeInfo <- method_code(attrs_values(attributes))
+        info : CodeInfo <- method_code(attrs_values(attributes), pool)
         method : M.Method <- method_build(info, flags, name, descriptor, attrs_values(attributes))
         result : Methods <- methods_go(p, attrs_reader(attributes), pool, Con{method, acc})
         return result

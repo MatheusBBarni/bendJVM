@@ -304,23 +304,25 @@ loaded class and array identities. Declared members expose basic metadata;
 supported access path, including primitive wrapper arguments and results.
 Primitive/void mirrors and wrapper `TYPE` fields are supported. `setAccessible`
 is tracked per reflective handle for bounded private-member access. Runtime
-annotations materialize supported scalar/reference values, defaults,
-parameter metadata, defensive array results, and repeatable containers.
+annotations materialize supported scalar/reference values, raw-word boxed
+`Long`/`Double` values, defaults, parameter metadata, defensive array results,
+and repeatable containers.
 `Class.forName(name, false, loader)` leaves a loaded class uninitialized;
-the `true` form runs its direct `<clinit>` once. Parent/complex initializer
-ordering and custom loader namespaces remain bounded.
-Interface proxies route supported calls to Java `InvocationHandler` objects,
-preserve generated proxy/interface checks, box category-one primitive arguments,
-and wrap undeclared checked throwables. Caller package/protected edge cases,
-wide annotation values, full proxy method-conflict/cache semantics, and
-complete OpenJDK formatting remain outside this bounded slice.
+the `true` form initializes the superclass chain before the direct `<clinit>`,
+and the supported application namespace is loader-aware. Interface proxies
+generate a public `InvocationHandler` constructor, validate interface
+visibility/conflicts/returns, preserve declared checked exceptions, cache by
+loader and ordered interfaces, and wrap undeclared checked throwables.
+Caller package/protected access edges, default-method proxy dispatch,
+category-two bytecode execution, and complete OpenJDK formatting remain
+outside this bounded slice.
 
 Resources are root-relative for `ClassLoader` and package-relative for `Class`;
 relative class names normalize `./` and `..`, while single lookups preserve
 first-match classpath order. `getResources` enumerates every matching origin in
 order. Returned URLs retain the selected origin, reopen it independently, and
-expose local `file:`/`jar:file:` protocol and string forms. URL escaping is
-bounded to supported local paths.
+expose local `file:`/`jar:file:` protocol and UTF-8 percent-escaped string
+forms for supported local paths.
 
 `Properties.load(InputStream)` handles ISO-8859-1 bytes, Unicode escapes,
 comments, separators, continuation lines, duplicate-key last-write behavior,
@@ -328,11 +330,13 @@ default getters, and malformed Unicode escape rejection. `load(Reader)` is
 implemented for the bounded UTF-8 `InputStreamReader` over memory resources;
 other reader backends remain unsupported.
 
-The class-file metadata parser validates and links structured annotation data,
-then materializes supported runtime-visible annotations on demand. CLASS
-retention remains absent from runtime query results; category-two annotation
-values are parsed but fail explicitly when materialization would require
-unsupported wide execution.
+The class-file metadata parser validates declaration, parameter, type, and
+nested `Code` type-annotation attributes and links them into method metadata.
+Runtime-visible annotations materialize supported values on demand; CLASS
+retention remains absent from runtime query results. Wide annotation constants
+are represented losslessly as two raw U32 words inside boxed `Long`/`Double`
+reflection results; they do not imply general long/double execution.
+
 
 Host file and TCP effects use opaque handles scoped to one VM run. `--no-files`
 and `--no-net` deny those effects with `IOException`. `--max-heap` counts heap
@@ -345,10 +349,13 @@ BendJVM accepts Java 8 class files and ordered directory/JAR/ZIP classpaths, but
 intentionally does not provide full JVM or OpenJDK compatibility. It does not
 yet promise:
 
-- full reflection access checks, generic/signature reflection, or complete
-  annotation/proxy validation and formatting
-- modules, JNI, agents, custom class loaders, or runtime class publication
-- `long` and `double` execution, or complete floating-point edge-case compatibility
+- full reflection access-edge compatibility (caller package/protected cases),
+  generic/signature reflection, or complete annotation formatting
+- modules, JNI, agents, custom class-loader subclasses, multiple application
+  namespaces, or runtime class publication
+- `long` and `double` bytecode execution, category-two field/call conversion,
+  or complete floating-point edge-case compatibility; annotation reflection
+  only exposes boxed raw-word wide values
 - `invokedynamic`, method handles, default-method special proxy invocation, or
   full verifier compatibility
 - Java threads, monitors, `synchronized`, `volatile`, garbage collection, JIT

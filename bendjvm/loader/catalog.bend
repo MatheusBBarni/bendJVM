@@ -75,8 +75,12 @@ def field_value(tag: U32, nextId: U32, owner: U32, +sy: +List<String>, name: Str
       Done{M.LoadedField{nextId, owner, S.find(sy, name), S.find(sy, descriptor), flags, tag}}
     case 3:
       Done{M.LoadedField{nextId, owner, S.find(sy, name), S.find(sy, descriptor), flags, tag}}
+    case 4:
+      Done{M.LoadedField{nextId, owner, S.find(sy, name), S.find(sy, descriptor), flags, tag}}
+    case 5:
+      Done{M.LoadedField{nextId, owner, S.find(sy, name), S.find(sy, descriptor), flags, tag}}
     case _:
-      Fail{"UnsupportedFeature: long/double field"}
+      Fail{"UnsupportedFeature: invalid field type"}
 
 def field_records(fields: +List<M.Field>, +owner: U32, +sy: +List<String>, id: U32) -> Result<&2, &2, String, +List<M.LoadedField>>:
   match fields:
@@ -129,6 +133,8 @@ def literal_tag(kind: U32) -> U32:
   match kind:
     case 3: 1
     case 4: 2
+    case 5: 4
+    case 6: 5
     case 7: 4
     case 8: 3
     case _: 0
@@ -149,6 +155,8 @@ def class_literal_name(name: String) -> String:
 def link_literal(op: U32, a: U32, b: U32, c: U32, offset: U32, value: M.Constant, +pool: +List<M.Constant>, +sy: +List<String>) -> Result<&2, &2, String, M.Instruction>:
   match value:
     case M.Number{kind, bits}: Done{M.Instruction{op, bits, literal_tag(kind), c, offset}}
+    case M.PairIndex{kind, first, second}:
+      Done{M.Instruction{op, first, second, literal_tag(kind), offset}}
     case M.Index{7, index}:
       do Result<&2, &2, String, M.Instruction>:
         name : String <- CP.utf(pool, index)
@@ -194,6 +202,7 @@ def link_one(value: M.Instruction, +pool: +List<M.Constant>, +sy: +List<String>)
             return M.Instruction{op, S.find(sy, name), b, c, offset}
         case 18: link_literal_ref(op, a, b, c, offset, pool, sy)
         case 19: link_literal_ref(op, a, b, c, offset, pool, sy)
+        case 20: link_literal_ref(op, a, b, c, offset, pool, sy)
         case _:
           Done{value}
 
@@ -261,12 +270,21 @@ def field_metadata_records(fields: +List<M.Field>, +owner: U32, +pool: +List<M.C
         tail : +List<M.FieldMetadata> <- field_metadata_records(rest, owner, pool, (id + 1 : U32))
         return Con{M.FieldMetadata{owner, id, metadata}, tail}
 
+def method_code_metadata(attributes: +List<M.Attribute>, +pool: +List<M.Constant>) -> Result<&2, &2, String, M.AnnotationMetadata>:
+  match attributes:
+    case Nil{}:
+      Done{M.empty_annotation_metadata()}
+    case Con{M.Attribute{name, bytes}, rest}:
+      Bool.pick(Result<&2, &2, String, M.AnnotationMetadata>, String.eq(name, "Code"), AN.parse_code_metadata_bytes(bytes, pool), method_code_metadata(rest, pool))
+
 def method_metadata_records(methods: +List<M.Method>, +owner: U32, +pool: +List<M.Constant>, +id: U32) -> Result<&2, &2, String, +List<M.MethodMetadata>>:
   match methods:
     case Nil{}: Done{Nil{}}
     case Con{M.Method{flags, name, desc, stack, locals, code, ins, handlers, +attrs}, rest}:
       do Result<&2, &2, String, +List<M.MethodMetadata>>:
-        metadata : M.AnnotationMetadata <- AN.parse_attributes(attrs, pool)
+        declaration_metadata : M.AnnotationMetadata <- AN.parse_attributes(attrs, pool)
+        code_metadata : M.AnnotationMetadata <- method_code_metadata(attrs, pool)
+        metadata : M.AnnotationMetadata = AN.merge_code_metadata(declaration_metadata, code_metadata)
         tail : +List<M.MethodMetadata> <- method_metadata_records(rest, owner, pool, (id + 1 : U32))
         return Con{M.MethodMetadata{owner, id, metadata}, tail}
 def annotation_type_name(value: M.JvmType) -> Result<&2, &2, String, String>:

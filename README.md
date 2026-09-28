@@ -313,7 +313,11 @@ and the supported application namespace is loader-aware. Interface proxies
 generate a public `InvocationHandler` constructor, validate interface
 visibility/conflicts/returns, preserve declared checked exceptions, cache by
 loader and ordered interfaces, and wrap undeclared checked throwables.
-Caller package/protected access edges, default-method proxy dispatch,
+Method, field, and class `Signature` attributes expose generic return,
+parameter, exception, field, and superclass types, including parameterized
+type arguments and type-variable names.
+`Class.forName(name, initialize, null)` resolves bootstrap classes through the
+bootstrap loader. Caller package edges, default-method proxy dispatch,
 category-two bytecode execution, and complete OpenJDK formatting remain
 outside this bounded slice.
 
@@ -349,8 +353,8 @@ BendJVM accepts Java 8 class files and ordered directory/JAR/ZIP classpaths, but
 intentionally does not provide full JVM or OpenJDK compatibility. It does not
 yet promise:
 
-- full reflection access-edge compatibility (caller package/protected cases),
-  generic/signature reflection, or complete annotation formatting
+- full reflection access-edge compatibility (caller package cases),
+  parameter-name reflection, or complete annotation formatting
 - modules, JNI, agents, custom class-loader subclasses, multiple application
   namespaces, or runtime class publication
 - `long` and `double` bytecode execution, category-two field/call conversion,

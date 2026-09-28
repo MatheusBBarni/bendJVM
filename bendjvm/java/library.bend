@@ -8,7 +8,7 @@ import ../classfile/constant_pool.bend as CP
 import ./outcome.bend as O
 import ../classfile/descriptor.bend as D
 import ../runtime/wide.bend as W
-
+import ./generic.bend as G
 type ReflectRefs is Data:
   ReflectRefs{vm: M.VM, refs: +List<U32>}
 type AnnotationValueRef is Data:
@@ -297,7 +297,7 @@ def proxy_box_args(+types: +List<M.JvmType>, +values: +List<M.Slot>, +vm: M.VM, 
 def proxy_class_pool_found(found: Maybe<&2, M.ClassMetadata>) -> Result<&2, &2, String, +List<M.Constant>>:
   match found:
     case None{}: Fail{"InvalidState: missing class metadata"}
-    case Some{M.ClassMetadata{owner, flags, metadata, visibleAnnotations, +pool}}: Done{pool}
+    case Some{M.ClassMetadata{owner, flags, metadata, visibleAnnotations, +pool, signature}}: Done{pool}
 
 def proxy_class_pool(metadata: M.Metadata, owner: U32) -> Result<&2, &2, String, +List<M.Constant>>:
   match metadata:
@@ -310,7 +310,7 @@ def proxy_annotation_exceptions(value: M.AnnotationMetadata) -> +List<U32>:
 def proxy_method_exceptions_found(found: Maybe<&2, M.MethodMetadata>) -> Result<&2, &2, String, +List<U32>>:
   match found:
     case None{}: Fail{"InvalidState: missing method metadata"}
-    case Some{M.MethodMetadata{owner, method, metadata}}: Done{proxy_annotation_exceptions(metadata)}
+    case Some{M.MethodMetadata{owner, method, metadata, signature}}: Done{proxy_annotation_exceptions(metadata)}
 
 def proxy_metadata_exceptions(metadata: M.Metadata, method: U32) -> Result<&2, &2, String, +List<U32>>:
   match metadata:
@@ -394,7 +394,7 @@ def proxy_interface_ids(fuel: Nat, +vm: M.VM, values: +List<M.Slot>, +acc: +List
 def proxy_class_flags_found(found: Maybe<&2, M.ClassMetadata>) -> U32:
   match found:
     case None{}: 0
-    case Some{M.ClassMetadata{owner, flags, metadata, visibleAnnotations, pool}}: flags
+    case Some{M.ClassMetadata{owner, flags, metadata, visibleAnnotations, pool, signature}}: flags
 
 def proxy_class_flags(metadata: M.Metadata, target: U32) -> U32:
   match metadata:
@@ -740,7 +740,7 @@ def class_bootstrap_target(+vm: M.VM, +target: U32) -> Bool:
   U32.is_ge(target, object_id) && Bool.not(String.starts_with(class_name_text(vm, target), "$Proxy"))
 
 def class_loader_allowed(+vm: M.VM, +target: U32, +loader: U32) -> Bool:
-  Bool.or(U32.is_eq(loader, system_loader_reference()), Bool.and(U32.is_ne(loader, 0), Bool.not(class_bootstrap_target(vm, target))))
+  Bool.pick(Bool, U32.is_eq(loader, 0), class_bootstrap_target(vm, target), Bool.or(U32.is_eq(loader, system_loader_reference()), Bool.not(class_bootstrap_target(vm, target))))
 
 def class_for_name_args(+args: +List<M.Slot>) -> Result<&2, &2, String, ClassForNameArgs>:
   match args:
@@ -1209,7 +1209,7 @@ def class_component_result(+vm: M.VM, +name: String) -> Result<&2, &2, String, O
 def class_metadata_found(found: Maybe<&2, M.ClassMetadata>) -> U32:
   match found:
     case None{}: 0
-    case Some{M.ClassMetadata{owner, flags, metadata, visibleAnnotations, pool}}: flags
+    case Some{M.ClassMetadata{owner, flags, metadata, visibleAnnotations, pool, signature}}: flags
 
 def class_flags_from_metadata(metadata: M.Metadata, +target: U32) -> U32:
   match metadata:
@@ -1223,7 +1223,7 @@ def annotation_name_present(+names: +List<String>, +target: String) -> Bool:
 def class_annotation_names_found(found: Maybe<&2, M.ClassMetadata>) -> +List<String>:
   match found:
     case None{}: Nil{}
-    case Some{M.ClassMetadata{owner, flags, metadata, visibleAnnotations, pool}}: visibleAnnotations
+    case Some{M.ClassMetadata{owner, flags, metadata, visibleAnnotations, pool, signature}}: visibleAnnotations
 
 def class_annotation_names_from_metadata(metadata: M.Metadata, +target: U32) -> +List<String>:
   match metadata:
@@ -1719,7 +1719,7 @@ def annotation_array_result_type(+vm: M.VM, component: U32, +slots: +List<M.Slot
 
 def class_annotation_values_from(+vm: M.VM, metadata: M.ClassMetadata) -> AnnotationMetadataRef:
   match metadata:
-    case M.ClassMetadata{owner, flags, metadata, visibleAnnotations, +pool}: AnnotationMetadataRef{vm, pool, metadata}
+    case M.ClassMetadata{owner, flags, metadata, visibleAnnotations, +pool, signature}: AnnotationMetadataRef{vm, pool, metadata}
 
 def class_annotation_values_after(+vm: M.VM, result: Result<&2, &2, String, M.ClassMetadata>) -> Result<&2, &2, String, AnnotationMetadataRef>:
   match result:
@@ -2005,11 +2005,11 @@ def field_metadata_value(+vm: M.VM, +id: U32) -> Result<&2, &2, String, M.FieldM
 
 def class_metadata_pool(value: M.ClassMetadata) -> +List<M.Constant>:
   match value:
-    case M.ClassMetadata{owner, flags, metadata, visibleAnnotations, +pool}: pool
+    case M.ClassMetadata{owner, flags, metadata, visibleAnnotations, +pool, signature}: pool
 
 def field_metadata_annotations(value: M.FieldMetadata) -> M.AnnotationMetadata:
   match value:
-    case M.FieldMetadata{owner, field, metadata}: metadata
+    case M.FieldMetadata{owner, field, metadata, signature}: metadata
 
 
 def method_metadata_from_metadata(metadata: M.Metadata, +id: U32) -> Result<&2, &2, String, M.MethodMetadata>:
@@ -2021,7 +2021,53 @@ def method_metadata_value(+vm: M.VM, +id: U32) -> Result<&2, &2, String, M.Metho
   method_metadata_from_metadata(S.metadata(vm), id)
 def method_metadata_annotations(value: M.MethodMetadata) -> M.AnnotationMetadata:
   match value:
-    case M.MethodMetadata{owner, method, metadata}: metadata
+    case M.MethodMetadata{owner, method, metadata, signature}: metadata
+
+def method_signature_found(found: Result<&2, &2, String, M.MethodMetadata>) -> String:
+  match found:
+    case Fail{error}: ""
+    case Done{M.MethodMetadata{owner, method, metadata, signature}}: signature
+
+def method_signature(+vm: M.VM, method: M.LoadedMethod) -> String:
+  method_signature_found(method_metadata_value(vm, M.loaded_method_id(method)))
+def field_signature_found(found: Result<&2, &2, String, M.FieldMetadata>) -> String:
+  match found:
+    case Fail{error}: ""
+    case Done{M.FieldMetadata{owner, field, metadata, signature}}: signature
+
+def field_signature(+vm: M.VM, field: M.LoadedField) -> String:
+  field_signature_found(field_metadata_value(vm, M.loaded_field_id(field)))
+
+def forget_pool(pool: +List<M.Constant>, signature: String) -> String:
+  match pool:
+    case Nil{}: signature
+    case Con{head, tail}: forget_pool(tail, signature)
+
+def class_signature_found(found: Result<&2, &2, String, M.ClassMetadata>) -> String:
+  match found:
+    case Fail{error}: ""
+    case Done{M.ClassMetadata{owner, flags, metadata, visibleAnnotations, pool, signature}}: forget_pool(pool, signature)
+
+def class_signature(+vm: M.VM, +target: U32) -> String:
+  class_signature_found(class_metadata_value(vm, target))
+
+
+def pack_path(path: +List<U32>) -> +List<U32>:
+  match path:
+    case Nil{}: Nil{}
+    case Con{kind, Con{index, rest}}: Con{(kind * 256 + index : U32), pack_path(rest)}
+    case Con{kind, Nil{}}: Nil{}
+
+def path_equal(left: +List<U32>, right: +List<U32>) -> Bool:
+  match left right:
+    case Nil{} Nil{}: True{}
+    case Con{left_head, left_tail} Con{right_head, right_tail}: U32.is_eq(left_head, right_head) && path_equal(left_tail, right_tail)
+    case _ _: False{}
+
+def slot_bits(values: +List<M.Slot>) -> +List<U32>:
+  match values:
+    case Nil{}: Nil{}
+    case Con{head, tail}: Con{bits_of(head), slot_bits(tail)}
 
 def field_annotation_source(+vm: M.VM, +field: M.LoadedField) -> Result<&2, &2, String, AnnotationMetadataRef>:
   do Result<&2, &2, String, AnnotationMetadataRef>:
@@ -2044,7 +2090,7 @@ def annotation_default_from_maybe(+vm: M.VM, +pool: +List<M.Constant>, found: Ma
 
 def annotation_default_method(+vm: M.VM, +pool: +List<M.Constant>, method_metadata: M.MethodMetadata, +descriptor: String) -> Result<&2, &2, String, AnnotationValueRef>:
   match method_metadata:
-    case M.MethodMetadata{owner, method, metadata}: annotation_default_from_maybe(vm, pool, metadata_default(metadata), descriptor)
+    case M.MethodMetadata{owner, method, metadata, signature}: annotation_default_from_maybe(vm, pool, metadata_default(metadata), descriptor)
 
 def annotation_default_source(source: AnnotationMetadataRef, +method_id: U32, +descriptor: String) -> Result<&2, &2, String, AnnotationValueRef>:
   match source:
@@ -2417,7 +2463,7 @@ def annotation_default_optional_from_maybe(+vm: M.VM, +pool: +List<M.Constant>, 
 
 def annotation_default_optional_method(+vm: M.VM, +pool: +List<M.Constant>, method_metadata: M.MethodMetadata, +descriptor: String) -> Result<&2, &2, String, Maybe<&2, AnnotationValueRef>>:
   match method_metadata:
-    case M.MethodMetadata{owner, method, metadata}: annotation_default_optional_from_maybe(vm, pool, metadata_default(metadata), descriptor)
+    case M.MethodMetadata{owner, method, metadata, signature}: annotation_default_optional_from_maybe(vm, pool, metadata_default(metadata), descriptor)
 
 def annotation_default_optional_source(source: AnnotationMetadataRef, +method_id: U32, +descriptor: String) -> Result<&2, &2, String, Maybe<&2, AnnotationValueRef>>:
   match source:
@@ -2530,26 +2576,37 @@ def type_annotation_info_index(info: +List<U32>) -> U32:
     case Nil{}: 4294967295
     case Con{value, rest}: value
 
-def type_annotation_matches(value: M.TypeAnnotation, +target: U32, +index: U32) -> Bool:
+def type_annotation_matches(value: M.TypeAnnotation, +target: U32, +index: U32, +expected: +List<U32>) -> Bool:
   match value:
-    case M.TypeAnnotation{targetType, +targetInfo, path, annotation}: U32.is_eq(targetType, target) && Bool.or(U32.is_eq(target, 20), U32.is_eq(type_annotation_info_index(targetInfo), index))
+    case M.TypeAnnotation{targetType, +targetInfo, +path, annotation}:
+      U32.is_eq(targetType, target) && Bool.or(U32.is_eq(target, 20), Bool.or(U32.is_eq(target, 19), U32.is_eq(type_annotation_info_index(targetInfo), index))) && path_equal(pack_path(path), expected)
 
-def type_annotation_values(+values: +List<M.TypeAnnotation>, +target: U32, +index: U32, +acc: +List<M.Annotation>) -> +List<M.Annotation>:
+def type_annotation_values(+values: +List<M.TypeAnnotation>, +target: U32, +index: U32, +expected: +List<U32>, +acc: +List<M.Annotation>) -> +List<M.Annotation>:
   match values:
     case Nil{}: M.reverse(M.Annotation, acc)
     case Con{+value, rest}:
       match value:
         case M.TypeAnnotation{targetType, targetInfo, path, annotation}:
-          type_annotation_values(rest, target, index, Bool.pick(+List<M.Annotation>, type_annotation_matches(value, target, index), Con{annotation, acc}, acc))
+          type_annotation_values(rest, target, index, expected, Bool.pick(+List<M.Annotation>, type_annotation_matches(value, target, index, expected), Con{annotation, acc}, acc))
 
-def method_type_annotation_source(+vm: M.VM, +method: M.LoadedMethod, +target: U32, +index: U32) -> Result<&2, &2, String, AnnotationMetadataRef>:
+def method_type_annotation_source(+vm: M.VM, +method: M.LoadedMethod, +target: U32, +index: U32, +expected: +List<U32>) -> Result<&2, &2, String, AnnotationMetadataRef>:
   do Result<&2, &2, String, AnnotationMetadataRef>:
     class_metadata : M.ClassMetadata <- class_metadata_value(vm, M.loaded_method_owner(method))
     method_metadata : M.MethodMetadata <- method_metadata_value(vm, M.loaded_method_id(method))
     metadata : M.AnnotationMetadata = method_metadata_annotations(method_metadata)
-    +annotations : +List<M.Annotation> = type_annotation_values(metadata_type_annotations(metadata), target, index, Nil{})
+    +annotations : +List<M.Annotation> = type_annotation_values(metadata_type_annotations(metadata), target, index, expected, Nil{})
     result : AnnotationMetadataRef = AnnotationMetadataRef{vm, class_metadata_pool(class_metadata), M.AnnotationMetadata{0, Nil{}, annotations, Nil{}, Nil{}, None{}}}
     return result
+def field_type_annotation_source(+vm: M.VM, +field_id: U32, +target: U32, +index: U32, +expected: +List<U32>) -> Result<&2, &2, String, AnnotationMetadataRef>:
+  do Result<&2, &2, String, AnnotationMetadataRef>:
+    field : M.LoadedField <- S.require(M.LoadedField, M.nth(M.LoadedField, S.fields(vm), field_id), "java/lang/NoSuchFieldException")
+    class_metadata : M.ClassMetadata <- class_metadata_value(vm, M.loaded_field_owner(field))
+    field_metadata : M.FieldMetadata <- field_metadata_value(vm, field_id)
+    metadata : M.AnnotationMetadata = field_metadata_annotations(field_metadata)
+    +annotations : +List<M.Annotation> = type_annotation_values(metadata_type_annotations(metadata), target, index, expected, Nil{})
+    result : AnnotationMetadataRef = AnnotationMetadataRef{vm, class_metadata_pool(class_metadata), M.AnnotationMetadata{0, Nil{}, annotations, Nil{}, Nil{}, None{}}}
+    return result
+
 
 def annotated_ref_slots(refs: +List<U32>) -> +List<M.Slot>:
   match refs:
@@ -2579,21 +2636,69 @@ def reflect_method_get_annotated_parameter_types(+vm: M.VM, +args: +List<M.Slot>
     result : O.Outcome <- annotated_type_refs_array(refs)
     return result
 
+def annotated_type_name(parameterized: Bool) -> String:
+  match parameterized:
+    case True{}: "java/lang/reflect/AnnotatedParameterizedType"
+    case False{}: "java/lang/reflect/AnnotatedType"
+
+def annotated_type_stored(+vm: M.VM, method_id: U32, target: U32, type_ref: U32, parameterized: Bool) -> Result<&2, &2, String, O.Outcome>:
+  alloc_result(H.allocate(vm, H.object_entry(class_id(vm, annotated_type_name(parameterized)), [M.Binding{0, M.Slot{1, method_id}}, M.Binding{1, M.Slot{1, target}}, M.Binding{2, M.Slot{1, 0}}, M.Binding{3, M.Slot{3, 0}}, M.Binding{4, M.Slot{3, type_ref}}])), vm2 => reference => ref_out(vm2, reference))
+
+def annotated_type_from_ref(+vm: M.VM, method_id: U32, target: U32, +reference: U32) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +entry : M.HeapEntry <- H.get(S.heap(vm), reference)
+    result : O.Outcome <- annotated_type_stored(vm, method_id, target, reference, String.eq(class_name_text(vm, H.entry_class(entry)), "java/lang/reflect/ParameterizedType"))
+    return result
+
+def annotated_return_parsed(parsed: Result<&2, &2, String, G.TypeRef>, +vm: M.VM, method_id: U32) -> Result<&2, &2, String, O.Outcome>:
+  match parsed:
+    case Fail{error}: reflect_annotated_type_one(vm, method_id, 20)
+    case Done{G.TypeRef{next, reference}}: annotated_type_from_ref(next, method_id, 20, reference)
+
+def annotated_return_text(+vm: M.VM, method_id: U32, text: String, empty: Bool) -> Result<&2, &2, String, O.Outcome>:
+  match empty:
+    case True{}: reflect_annotated_type_one(vm, method_id, 20)
+    case False{}: annotated_return_parsed(G.return_ref(vm, text), vm, method_id)
+
 def reflect_method_get_annotated_return_type(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
     +method : M.LoadedMethod <- reflect_method_from_args(vm, args)
-    result : O.Outcome <- reflect_annotated_type_one(vm, M.loaded_method_id(method), 20)
+    +text : String = method_signature(vm, method)
+    result : O.Outcome <- annotated_return_text(vm, M.loaded_method_id(method), text, String.is_empty(text))
     return result
+
+def path_bits_slot(+vm: M.VM, slot: M.Slot) -> Result<&2, &2, String, +List<U32>>:
+  match slot:
+    case M.Slot{tag, 0}: Done{Nil{}}
+    case M.Slot{tag, reference}:
+      do Result<&2, &2, String, +List<U32>>:
+        +entry : M.HeapEntry <- H.get(S.heap(vm), reference)
+        return slot_bits(entry_values(entry))
+
+def path_bits_found(+vm: M.VM, found: Maybe<&2, M.Slot>) -> Result<&2, &2, String, +List<U32>>:
+  match found:
+    case None{}: Done{Nil{}}
+    case Some{slot}: path_bits_slot(vm, slot)
+
+def reflect_annotated_type_source_kind(+vm: M.VM, entry: M.HeapEntry, member: M.Slot, +target: U32, +index: U32, +expected: +List<U32>, field_site: Bool) -> Result<&2, &2, String, AnnotationMetadataRef>:
+  match field_site:
+    case True{}: field_type_annotation_source(vm, bits_of(member), target, index, expected)
+    case False{}:
+      do Result<&2, &2, String, AnnotationMetadataRef>:
+        +method : M.LoadedMethod <- S.require(M.LoadedMethod, M.nth(M.LoadedMethod, S.methods(vm), bits_of(member)), "java/lang/NoSuchMethodException")
+        result : AnnotationMetadataRef <- method_type_annotation_source(vm, method, target, index, expected)
+        return result
 
 def reflect_annotated_type_source(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, AnnotationMetadataRef>:
   do Result<&2, &2, String, AnnotationMetadataRef>:
     receiver : M.Slot <- slot0(args)
     +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
-    method_slot : M.Slot <- reflect_annotation_binding(entry, 0)
+    member : M.Slot <- reflect_annotation_binding(entry, 0)
     target_slot : M.Slot <- reflect_annotation_binding(entry, 1)
     index_slot : M.Slot <- reflect_annotation_binding(entry, 2)
-    +method : M.LoadedMethod <- S.require(M.LoadedMethod, M.nth(M.LoadedMethod, S.methods(vm), bits_of(method_slot)), "java/lang/NoSuchMethodException")
-    result : AnnotationMetadataRef <- method_type_annotation_source(vm, method, bits_of(target_slot), bits_of(index_slot))
+    +expected : +List<U32> <- path_bits_found(vm, H.binding_find(entry_fields(entry), 3))
+    +target : U32 = bits_of(target_slot)
+    result : AnnotationMetadataRef <- reflect_annotated_type_source_kind(vm, entry, member, target, bits_of(index_slot), expected, U32.is_eq(target, 19))
     return result
 
 def reflect_annotated_type_is_annotation_present(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
@@ -2646,26 +2751,130 @@ def annotated_type_value(parsed: M.Descriptor, target: U32, index: U32) -> Resul
     case 22: S.require(M.JvmType, M.nth(M.JvmType, D.parameter_types(parsed), index), "java/lang/NoSuchMethodException")
     case _: Fail{"java/lang/NoSuchMethodException"}
 
+def binding_bits(found: Maybe<&2, M.Slot>) -> U32:
+  match found:
+    case None{}: 0
+    case Some{M.Slot{tag, bits}}: bits
+
+def reflect_annotated_field_erased(+vm: M.VM, +field_id: U32) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    field : M.LoadedField <- S.require(M.LoadedField, M.nth(M.LoadedField, S.fields(vm), field_id), "java/lang/NoSuchFieldException")
+    +descriptor : String = Sy.text(S.symbols(vm), M.loaded_field_descriptor(field))
+    result : O.Outcome <- descriptor_mirror(vm, descriptor)
+    return result
+
+def reflect_annotated_type_erased_kind(+vm: M.VM, member: M.Slot, +target: U32, +index: U32, field_site: Bool) -> Result<&2, &2, String, O.Outcome>:
+  match field_site:
+    case True{}: reflect_annotated_field_erased(vm, bits_of(member))
+    case False{}:
+      do Result<&2, &2, String, O.Outcome>:
+        +method : M.LoadedMethod <- S.require(M.LoadedMethod, M.nth(M.LoadedMethod, S.methods(vm), bits_of(member)), "java/lang/NoSuchMethodException")
+        descriptor : String = Sy.text(S.symbols(vm), M.loaded_method_descriptor(method))
+        parsed : M.Descriptor <- D.parse_method(descriptor)
+        typ : M.JvmType <- annotated_type_value(parsed, target, index)
+        +class_target : U32 = class_id(vm, jvm_type_class_name(typ))
+        checked : Unit <- S.check(U32.is_ne(class_target, 4294967295), "java/lang/NoClassDefFoundError")
+        result : O.Outcome <- class_mirror_out(vm, class_target)
+        return result
+
+def reflect_annotated_type_erased(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    receiver : M.Slot <- slot0(args)
+    +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
+    member : M.Slot <- reflect_annotation_binding(entry, 0)
+    target_slot : M.Slot <- reflect_annotation_binding(entry, 1)
+    index_slot : M.Slot <- reflect_annotation_binding(entry, 2)
+    +target : U32 = bits_of(target_slot)
+    result : O.Outcome <- reflect_annotated_type_erased_kind(vm, member, target, bits_of(index_slot), U32.is_eq(target, 19))
+    return result
+
+def stored_or_erased(+vm: M.VM, +args: +List<M.Slot>, stored: U32, missing: Bool) -> Result<&2, &2, String, O.Outcome>:
+  match missing:
+    case False{}: ref_out(vm, stored)
+    case True{}: reflect_annotated_type_erased(vm, args)
+
 def reflect_annotated_type_get_type(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    receiver : M.Slot <- slot0(args)
+    +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
+    +stored : U32 = binding_bits(H.binding_find(entry_fields(entry), 4))
+    result : O.Outcome <- stored_or_erased(vm, args, stored, U32.is_eq(stored, 0))
+    return result
+def reflect_annotated_type_get_owner(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  ref_out(vm, 0)
+
+def empty_annotated_array(+vm: M.VM) -> Result<&2, &2, String, O.Outcome>:
+  alloc_result(H.allocate(vm, H.reference_array_entry(class_id(vm, "[Ljava/lang/reflect/AnnotatedType;"), class_id(vm, "java/lang/reflect/AnnotatedType"), Nil{})), vm2 => reference => ref_out(vm2, reference))
+
+def step_path(+vm: M.VM, index: U32) -> Result<&2, &2, String, G.TypeRef>:
+  G.alloc_ref(H.allocate(vm, H.primitive_array_entry(class_id(vm, "[I"), 1, [M.Slot{1, (768 + index : U32)}])))
+
+def child_annotated(+vm: M.VM, method_id: U32, target: U32, index: U32, type_ref: U32, path_ref: U32, parameterized: Bool) -> Result<&2, &2, String, G.TypeRef>:
+  G.alloc_ref(H.allocate(vm, H.object_entry(class_id(vm, annotated_type_name(parameterized)), [M.Binding{0, M.Slot{1, method_id}}, M.Binding{1, M.Slot{1, target}}, M.Binding{2, M.Slot{1, index}}, M.Binding{3, M.Slot{3, path_ref}}, M.Binding{4, M.Slot{3, type_ref}}])))
+
+def child_from_type(+vm: M.VM, method_id: U32, target: U32, index: U32, +type_ref: U32, path_ref: U32) -> Result<&2, &2, String, G.TypeRef>:
+  do Result<&2, &2, String, G.TypeRef>:
+    +entry : M.HeapEntry <- H.get(S.heap(vm), type_ref)
+    result : G.TypeRef <- child_annotated(vm, method_id, target, index, type_ref, path_ref, String.eq(class_name_text(vm, H.entry_class(entry)), "java/lang/reflect/ParameterizedType"))
+    return result
+
+def child_from_path(parsed: Result<&2, &2, String, G.TypeRef>, +vm: M.VM, method_id: U32, target: U32, index: U32, type_ref: U32) -> Result<&2, &2, String, G.TypeRef>:
+  match parsed:
+    case Fail{error}: Fail{error}
+    case Done{G.TypeRef{next, path_ref}}: child_from_type(next, method_id, target, index, type_ref, path_ref)
+
+type ExpandStep is Data:
+  ExpandNext{vm: M.VM, method_id: U32, target: U32, refs: +List<U32>, index: U32, acc: +List<U32>}
+  ExpandGot{parsed: Result<&2, &2, String, G.TypeRef>, vm: M.VM, method_id: U32, target: U32, refs: +List<U32>, index: U32, acc: +List<U32>}
+
+@unsafe def expand_run(fuel: Nat, step: ExpandStep) -> Result<&2, &2, String, ReflectRefs>:
+  match fuel step:
+    case 0n _: Fail{"VmError.InvalidSignature: truncated annotated types"}
+    case 1n+p ExpandNext{vm, method_id, target, Nil{}, index, acc}: Done{ReflectRefs{vm, M.reverse(U32, acc)}}
+    case 1n+p ExpandNext{+vm, +method_id, +target, Con{type_ref, rest}, +index, acc}:
+      expand_run(p, ExpandGot{child_from_path(step_path(vm, index), vm, method_id, target, index, type_ref), vm, method_id, target, rest, index, acc})
+    case 1n+p ExpandGot{Fail{error}, vm, method_id, target, refs, index, acc}: Fail{error}
+    case 1n+p ExpandGot{Done{G.TypeRef{next, reference}}, vm, method_id, target, refs, index, acc}:
+      expand_run(p, ExpandNext{next, method_id, target, refs, (index + 1 : U32), Con{reference, acc}})
+
+def expand_actuals(+vm: M.VM, method_id: U32, target: U32, refs: +List<U32>, index: U32, +acc: +List<U32>) -> Result<&2, &2, String, ReflectRefs>:
+  expand_run(256n, ExpandNext{vm, method_id, target, refs, index, acc})
+
+def actuals_from_array(+vm: M.VM, method_id: U32, target: U32, array_ref: U32) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +array : M.HeapEntry <- H.get(S.heap(vm), array_ref)
+    refs : ReflectRefs <- expand_actuals(vm, method_id, target, slot_bits(entry_values(array)), 0, Nil{})
+    result : O.Outcome <- annotated_type_refs_array(refs)
+    return result
+
+def actuals_if_parameterized(+vm: M.VM, method_id: U32, target: U32, +type_ref: U32, parameterized: Bool) -> Result<&2, &2, String, O.Outcome>:
+  match parameterized:
+    case False{}: empty_annotated_array(vm)
+    case True{}:
+      do Result<&2, &2, String, O.Outcome>:
+        +entry : M.HeapEntry <- H.get(S.heap(vm), type_ref)
+        array_slot : M.Slot <- reflect_annotation_binding(entry, 1)
+        result : O.Outcome <- actuals_from_array(vm, method_id, target, bits_of(array_slot))
+        return result
+
+def actuals_of_stored(+vm: M.VM, method_id: U32, target: U32, +type_ref: U32, missing: Bool) -> Result<&2, &2, String, O.Outcome>:
+  match missing:
+    case True{}: empty_annotated_array(vm)
+    case False{}:
+      do Result<&2, &2, String, O.Outcome>:
+        +entry : M.HeapEntry <- H.get(S.heap(vm), type_ref)
+        result : O.Outcome <- actuals_if_parameterized(vm, method_id, target, type_ref, String.eq(class_name_text(vm, H.entry_class(entry)), "java/lang/reflect/ParameterizedType"))
+        return result
+
+def reflect_annotated_type_get_actuals(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
     receiver : M.Slot <- slot0(args)
     +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
     method_slot : M.Slot <- reflect_annotation_binding(entry, 0)
     target_slot : M.Slot <- reflect_annotation_binding(entry, 1)
-    index_slot : M.Slot <- reflect_annotation_binding(entry, 2)
-    +method : M.LoadedMethod <- S.require(M.LoadedMethod, M.nth(M.LoadedMethod, S.methods(vm), bits_of(method_slot)), "java/lang/NoSuchMethodException")
-    descriptor : String = Sy.text(S.symbols(vm), M.loaded_method_descriptor(method))
-    parsed : M.Descriptor <- D.parse_method(descriptor)
-    typ : M.JvmType <- annotated_type_value(parsed, bits_of(target_slot), bits_of(index_slot))
-    +target : U32 = class_id(vm, jvm_type_class_name(typ))
-    checked : Unit <- S.check(U32.is_ne(target, 4294967295), "java/lang/NoClassDefFoundError")
-    result : O.Outcome <- class_mirror_out(vm, target)
+    +stored : U32 = binding_bits(H.binding_find(entry_fields(entry), 4))
+    result : O.Outcome <- actuals_of_stored(vm, bits_of(method_slot), bits_of(target_slot), stored, U32.is_eq(stored, 0))
     return result
-def reflect_annotated_type_get_owner(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
-  ref_out(vm, 0)
-
-def reflect_annotated_type_get_actuals(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
-  alloc_result(H.allocate(vm, H.reference_array_entry(class_id(vm, "[Ljava/lang/reflect/AnnotatedType;"), class_id(vm, "java/lang/reflect/AnnotatedType"), Nil{})), vm2 => reference => ref_out(vm2, reference))
 
 
 def parameter_class_ids(+vm: M.VM, +types: +List<M.JvmType>, +acc: +List<U32>) -> Result<&2, &2, String, +List<U32>>:
@@ -2730,11 +2939,35 @@ def method_generic_exception_types(source: AnnotationMetadataRef) -> Result<&2, 
         result : O.Outcome <- exception_array_result_kind(refs, "[Ljava/lang/reflect/Type;", "java/lang/reflect/Type")
         return result
 
+def generic_exceptions_refs(+vm: M.VM, +method: M.LoadedMethod, refs: +List<U32>) -> Result<&2, &2, String, O.Outcome>:
+  match refs:
+    case Nil{}:
+      do Result<&2, &2, String, O.Outcome>:
+        source : AnnotationMetadataRef <- method_annotation_source(vm, method)
+        result : O.Outcome <- method_generic_exception_types(source)
+        return result
+    case _:
+      alloc_result(H.allocate(vm, H.reference_array_entry(class_id(vm, "[Ljava/lang/reflect/Type;"), class_id(vm, "java/lang/reflect/Type"), exception_ref_slots(refs))), vm2 => reference => ref_out(vm2, reference))
+
+def generic_exceptions_parsed(parsed: Result<&2, &2, String, G.TypeRefs>, +vm: M.VM, +method: M.LoadedMethod) -> Result<&2, &2, String, O.Outcome>:
+  match parsed:
+    case Fail{error}: Fail{error}
+    case Done{G.TypeRefs{next, refs}}: generic_exceptions_refs(next, method, refs)
+
+def generic_exceptions_text(+vm: M.VM, +method: M.LoadedMethod, text: String, empty: Bool) -> Result<&2, &2, String, O.Outcome>:
+  match empty:
+    case False{}: generic_exceptions_parsed(G.thrown_refs(vm, text), vm, method)
+    case True{}:
+      do Result<&2, &2, String, O.Outcome>:
+        source : AnnotationMetadataRef <- method_annotation_source(vm, method)
+        result : O.Outcome <- method_generic_exception_types(source)
+        return result
+
 def reflect_method_get_generic_exception_types(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
     +method : M.LoadedMethod <- reflect_method_from_args(vm, args)
-    source : AnnotationMetadataRef <- method_annotation_source(vm, method)
-    result : O.Outcome <- method_generic_exception_types(source)
+    +text : String = method_signature(vm, method)
+    result : O.Outcome <- generic_exceptions_text(vm, method, text, String.is_empty(text))
     return result
 
 
@@ -3086,8 +3319,76 @@ def class_name(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outc
     target : U32 <- class_target(vm, args)
     result : O.Outcome <- intern_or_alloc(vm, units_from_string(class_display_name(class_name_text(vm, target))))
     return result
+def type_name_named(+vm: M.VM, entry: M.HeapEntry, +name: String, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  match name:
+    case "java/lang/reflect/ParameterizedType": ref_out(vm, binding_bits(H.binding_find(entry_fields(entry), 3)))
+    case "java/lang/reflect/TypeVariable": ref_out(vm, binding_bits(H.binding_find(entry_fields(entry), 0)))
+    case "java/lang/reflect/WildcardType": ref_out(vm, binding_bits(H.binding_find(entry_fields(entry), 2)))
+    case "java/lang/reflect/GenericArrayType": ref_out(vm, binding_bits(H.binding_find(entry_fields(entry), 1)))
+    case _: class_name(vm, args)
+
 def type_get_type_name(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
-  class_name(vm, args)
+  do Result<&2, &2, String, O.Outcome>:
+    receiver : M.Slot <- slot0(args)
+    +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
+    result : O.Outcome <- type_name_named(vm, entry, class_name_text(vm, H.entry_class(entry)), args)
+    return result
+
+def parameterized_arguments(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    receiver : M.Slot <- slot0(args)
+    +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
+    result : O.Outcome <- ref_out(vm, binding_bits(H.binding_find(entry_fields(entry), 1)))
+    return result
+
+def parameterized_raw(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    receiver : M.Slot <- slot0(args)
+    +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
+    result : O.Outcome <- class_mirror_out(vm, binding_bits(H.binding_find(entry_fields(entry), 0)))
+    return result
+
+def parameterized_owner(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    receiver : M.Slot <- slot0(args)
+    +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
+    result : O.Outcome <- ref_out(vm, binding_bits(H.binding_find(entry_fields(entry), 2)))
+    return result
+
+def type_variable_name(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    receiver : M.Slot <- slot0(args)
+    +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
+    result : O.Outcome <- ref_out(vm, binding_bits(H.binding_find(entry_fields(entry), 0)))
+    return result
+
+def type_variable_bounds(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    receiver : M.Slot <- slot0(args)
+    +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
+    result : O.Outcome <- ref_out(vm, binding_bits(H.binding_find(entry_fields(entry), 1)))
+    return result
+
+def wildcard_upper(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    receiver : M.Slot <- slot0(args)
+    +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
+    result : O.Outcome <- ref_out(vm, binding_bits(H.binding_find(entry_fields(entry), 0)))
+    return result
+
+def wildcard_lower(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    receiver : M.Slot <- slot0(args)
+    +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
+    result : O.Outcome <- ref_out(vm, binding_bits(H.binding_find(entry_fields(entry), 1)))
+    return result
+
+def generic_array_component(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    receiver : M.Slot <- slot0(args)
+    +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
+    result : O.Outcome <- ref_out(vm, binding_bits(H.binding_find(entry_fields(entry), 0)))
+    return result
 
 def class_superclass_parent(+vm: M.VM, +parent: U32) -> Result<&2, &2, String, O.Outcome>:
   match parent:
@@ -3218,12 +3519,11 @@ def protected_receiver_entry(+vm: M.VM, +target: U32, +caller: U32, result: Resu
 
 def protected_receiver_target(+vm: M.VM, +target: U32, +caller: U32) -> Bool:
   match target:
-    case 0: True{}
+    case 0: False{}
     case reference: protected_receiver_entry(vm, target, caller, H.get(S.heap(vm), reference))
 
 def protected_receiver_required(+vm: M.VM, +owner: U32, +flags: U32, +caller: U32) -> Bool:
   U32.is_ne(U32.and(flags, 4), 0) &&
-  U32.is_eq(U32.and(flags, 8), 0) &&
   Bool.not(same_package(vm, caller, owner)) &&
   H.hierarchy(S.classes(vm), caller, owner)
 
@@ -3231,12 +3531,15 @@ def protected_receiver_accessible(+vm: M.VM, +owner: U32, +flags: U32, +target: 
   +caller : U32 = caller_owner(vm)
   Bool.pick(Bool, protected_receiver_required(vm, owner, flags, caller), protected_receiver_target(vm, target, caller), True{})
 
-
+def access_with_receiver(override: Bool, +vm: M.VM, +owner: U32, +flags: U32, target: U32) -> Bool:
+  match override:
+    case True{}: True{}
+    case False{}: Bool.and(member_accessible(vm, caller_owner(vm), owner, flags), protected_receiver_accessible(vm, owner, flags, target))
 
 def reflective_access(+vm: M.VM, +entry: M.HeapEntry, owner: U32, flags: U32) -> Bool:
   Bool.or(accessible_override(entry), member_accessible(vm, caller_owner(vm), owner, flags))
 def reflective_method_access(+vm: M.VM, +entry: M.HeapEntry, +owner: U32, +flags: U32, target: U32) -> Bool:
-  Bool.and(reflective_access(vm, entry, owner, flags), protected_receiver_accessible(vm, owner, flags, target))
+  access_with_receiver(accessible_override(entry), vm, owner, flags, target)
 
 
 
@@ -3300,6 +3603,69 @@ def reflect_field_type(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String
     +descriptor : String = Sy.text(S.symbols(vm), M.loaded_field_descriptor(field))
     result : O.Outcome <- descriptor_mirror(vm, descriptor)
     return result
+
+def field_generic_parsed(parsed: Result<&2, &2, String, G.TypeRef>, +vm: M.VM, +descriptor: String) -> Result<&2, &2, String, O.Outcome>:
+  match parsed:
+    case Fail{error}: descriptor_mirror(vm, descriptor)
+    case Done{G.TypeRef{next, reference}}: ref_out(next, reference)
+
+def field_generic_text(+vm: M.VM, +descriptor: String, text: String, empty: Bool) -> Result<&2, &2, String, O.Outcome>:
+  match empty:
+    case True{}: descriptor_mirror(vm, descriptor)
+    case False{}: field_generic_parsed(G.field_ref(vm, text), vm, descriptor)
+
+def reflect_field_generic_type(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +field : M.LoadedField <- reflect_field_member(vm, args)
+    +descriptor : String = Sy.text(S.symbols(vm), M.loaded_field_descriptor(field))
+    +text : String = field_signature(vm, field)
+    result : O.Outcome <- field_generic_text(vm, descriptor, text, String.is_empty(text))
+    return result
+
+def field_annotated_plain(+vm: M.VM, field_id: U32) -> Result<&2, &2, String, O.Outcome>:
+  alloc_result(H.allocate(vm, H.object_entry(class_id(vm, "java/lang/reflect/AnnotatedType"), [M.Binding{0, M.Slot{1, field_id}}, M.Binding{1, M.Slot{1, 19}}, M.Binding{2, M.Slot{1, 0}}])), vm2 => reference => ref_out(vm2, reference))
+
+def field_annotated_parsed(parsed: Result<&2, &2, String, G.TypeRef>, +vm: M.VM, field_id: U32) -> Result<&2, &2, String, O.Outcome>:
+  match parsed:
+    case Fail{error}: field_annotated_plain(vm, field_id)
+    case Done{G.TypeRef{next, reference}}: annotated_type_from_ref(next, field_id, 19, reference)
+
+def field_annotated_text(+vm: M.VM, field_id: U32, text: String, empty: Bool) -> Result<&2, &2, String, O.Outcome>:
+  match empty:
+    case True{}: field_annotated_plain(vm, field_id)
+    case False{}: field_annotated_parsed(G.field_ref(vm, text), vm, field_id)
+
+def reflect_field_annotated_type(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +field : M.LoadedField <- reflect_field_member(vm, args)
+    +text : String = field_signature(vm, field)
+    result : O.Outcome <- field_annotated_text(vm, M.loaded_field_id(field), text, String.is_empty(text))
+    return result
+
+def class_generic_parsed(parsed: Result<&2, &2, String, G.TypeRef>, +vm: M.VM, +parent: U32) -> Result<&2, &2, String, O.Outcome>:
+  match parsed:
+    case Fail{error}: class_superclass_parent(vm, parent)
+    case Done{G.TypeRef{next, reference}}: ref_out(next, reference)
+
+def class_generic_text(+vm: M.VM, +parent: U32, text: String, empty: Bool) -> Result<&2, &2, String, O.Outcome>:
+  match empty:
+    case True{}: class_superclass_parent(vm, parent)
+    case False{}: class_generic_parsed(G.superclass_ref(vm, text), vm, parent)
+
+def class_generic_superclass_parent(+vm: M.VM, +target: U32, +parent: U32, missing: Bool) -> Result<&2, &2, String, O.Outcome>:
+  match missing:
+    case True{}: ref_out(vm, 0)
+    case False{}:
+      +text : String = class_signature(vm, target)
+      class_generic_text(vm, parent, text, String.is_empty(text))
+
+def class_generic_superclass(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +target : U32 <- class_target(vm, args)
+    class : M.LoadedClass <- S.require(M.LoadedClass, M.nth(M.LoadedClass, S.classes(vm), target), "java/lang/NoClassDefFoundError")
+    +parent : U32 = M.loaded_class_parent(class)
+    result : O.Outcome <- class_generic_superclass_parent(vm, target, parent, U32.is_eq(parent, 4294967295))
+    return result
 def reflect_static_field_value(+vm: M.VM, field: M.LoadedField) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
     value : M.Slot <- S.require(M.Slot, H.binding_find(S.statics(vm), M.loaded_field_id(field)), "java/lang/NoSuchFieldException")
@@ -3326,8 +3692,8 @@ def reflect_field_get(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String,
     receiver : M.Slot <- slot0(args)
     +handle : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
     +field : M.LoadedField <- reflect_field_member(vm, args)
-    checked : Unit <- S.check(reflective_access(vm, handle, M.loaded_field_owner(field), M.loaded_field_flags(field)), "java/lang/IllegalAccessException")
-    target : M.Slot <- slot1(args)
+    +target : M.Slot <- slot1(args)
+    checked : Unit <- S.check(reflective_method_access(vm, handle, M.loaded_field_owner(field), M.loaded_field_flags(field), bits_of(target)), "java/lang/IllegalAccessException")
     result : O.Outcome <- reflect_field_value(vm, field, bits_of(target))
     return result
 
@@ -3361,9 +3727,9 @@ def reflect_field_set(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String,
     receiver : M.Slot <- slot0(args)
     +handle : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
     +field : M.LoadedField <- reflect_field_member(vm, args)
-    checked : Unit <- S.check(reflective_access(vm, handle, M.loaded_field_owner(field), M.loaded_field_flags(field)), "java/lang/IllegalAccessException")
+    +target : M.Slot <- slot1(args)
+    checked : Unit <- S.check(reflective_method_access(vm, handle, M.loaded_field_owner(field), M.loaded_field_flags(field), bits_of(target)), "java/lang/IllegalAccessException")
     final_checked : Unit <- S.check(reflect_field_set_allowed(handle, field), "java/lang/IllegalAccessException")
-    target : M.Slot <- slot1(args)
     value : M.Slot <- slot2(args)
     result : O.Outcome <- reflect_field_set_value(vm, field, bits_of(target), value)
     return result
@@ -3513,6 +3879,30 @@ def reflect_method_is_default(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2,
     result : O.Outcome <- bool_out(vm, Bool.and(interface, concrete))
     return result
 
+def generic_type_array(parsed: Result<&2, &2, String, G.TypeRefs>) -> Result<&2, &2, String, O.Outcome>:
+  match parsed:
+    case Fail{error}: Fail{error}
+    case Done{G.TypeRefs{+vm, refs}}:
+      alloc_result(H.allocate(vm, H.reference_array_entry(class_id(vm, "[Ljava/lang/reflect/Type;"), class_id(vm, "java/lang/reflect/Type"), exception_ref_slots(refs))), vm2 => reference => ref_out(vm2, reference))
+
+def generic_return_parsed(parsed: Result<&2, &2, String, G.TypeRef>, +vm: M.VM, +descriptor: String) -> Result<&2, &2, String, O.Outcome>:
+  match parsed:
+    case Fail{error}: class_name_mirror(vm, method_return_name(descriptor))
+    case Done{G.TypeRef{next, reference}}: ref_out(next, reference)
+
+def generic_return_text(+vm: M.VM, +descriptor: String, text: String, empty: Bool) -> Result<&2, &2, String, O.Outcome>:
+  match empty:
+    case True{}: class_name_mirror(vm, method_return_name(descriptor))
+    case False{}: generic_return_parsed(G.return_ref(vm, text), vm, descriptor)
+
+def reflect_method_generic_return(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +method : M.LoadedMethod <- reflect_method_member(vm, args)
+    +descriptor : String = Sy.text(S.symbols(vm), M.loaded_method_descriptor(method))
+    +text : String = method_signature(vm, method)
+    result : O.Outcome <- generic_return_text(vm, descriptor, text, String.is_empty(text))
+    return result
+
 def reflect_method_return_type(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
     method : M.LoadedMethod <- reflect_method_member(vm, args)
@@ -3531,14 +3921,21 @@ def reflect_member_parameter_types(+vm: M.VM, +method: M.LoadedMethod) -> Result
     refs : ReflectRefs <- parameter_mirror_alloc(vm, ids, Nil{})
     result : O.Outcome <- reflect_refs_array(refs, "[Ljava/lang/Class;", "java/lang/Class")
     return result
+def generic_parameters_text(+vm: M.VM, +method: M.LoadedMethod, text: String, empty: Bool) -> Result<&2, &2, String, O.Outcome>:
+  match empty:
+    case False{}: generic_type_array(G.parameter_refs(vm, text))
+    case True{}:
+      do Result<&2, &2, String, O.Outcome>:
+        +descriptor : String = Sy.text(S.symbols(vm), M.loaded_method_descriptor(method))
+        parsed : M.Descriptor <- D.parse_method(descriptor)
+        +ids : +List<U32> <- parameter_class_ids(vm, D.parameter_types(parsed), Nil{})
+        refs : ReflectRefs <- parameter_mirror_alloc(vm, ids, Nil{})
+        result : O.Outcome <- reflect_refs_array(refs, "[Ljava/lang/reflect/Type;", "java/lang/reflect/Type")
+        return result
+
 def reflect_member_generic_parameter_types(+vm: M.VM, +method: M.LoadedMethod) -> Result<&2, &2, String, O.Outcome>:
-  do Result<&2, &2, String, O.Outcome>:
-    +descriptor : String = Sy.text(S.symbols(vm), M.loaded_method_descriptor(method))
-    parsed : M.Descriptor <- D.parse_method(descriptor)
-    +ids : +List<U32> <- parameter_class_ids(vm, D.parameter_types(parsed), Nil{})
-    refs : ReflectRefs <- parameter_mirror_alloc(vm, ids, Nil{})
-    result : O.Outcome <- reflect_refs_array(refs, "[Ljava/lang/reflect/Type;", "java/lang/reflect/Type")
-    return result
+  +text : String = method_signature(vm, method)
+  generic_parameters_text(vm, method, text, String.is_empty(text))
 
 def reflect_method_generic_parameter_types(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
@@ -3623,7 +4020,7 @@ def reflect_constructor_new_instance(+vm: M.VM, +args: +List<M.Slot>) -> Result<
     +handle : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
     +args_ref : +List<M.Slot> = args
     +method : M.LoadedMethod <- reflect_constructor_member(vm, args_ref)
-    checked : Unit <- S.check(reflective_access(vm, handle, M.loaded_method_owner(method), M.loaded_method_flags(method)), "java/lang/IllegalAccessException")
+    checked : Unit <- S.check(reflective_method_access(vm, handle, M.loaded_method_owner(method), M.loaded_method_flags(method), 0), "java/lang/IllegalAccessException")
     instantiable : Unit <- S.check(constructor_instantiable(vm, M.loaded_method_owner(method)), "java/lang/InstantiationException")
     argument_array : M.Slot <- slot1(args_ref)
     +values : +List<M.Slot> <- reflect_argument_values(vm, bits_of(argument_array))

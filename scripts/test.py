@@ -37,7 +37,7 @@ NAMED = (
     "StaticMethod", "RecursiveMethod", "MultipleArguments", "ObjectCreation",
     "Fields", "VirtualMethod", "IntArray", "ObjectArray", "StringConstant",
     "Println", "ExceptionCaught", "ExceptionUncaught", "MetadataFixture",
-    "ReflectionAccess", "RepeatableAnnotation", "InheritedAnnotation", "EnumAnnotation", "ProxyIntegration", "ProxyExceptions", "DynamicLoadingFailure", "ReflectionIntegration", "CrossPackageReflection",
+    "ReflectionAccess", "RepeatableAnnotation", "InheritedAnnotation", "EnumAnnotation", "ProxyIntegration", "ProxyExceptions", "DynamicLoadingFailure", "ReflectionIntegration", "CrossPackageReflection", "GenericSignature",
 )
 EXTENDED = (
     "FloatOperations", "FloatArray", "InheritedFields", "ClassInitialization",
@@ -398,7 +398,7 @@ def malformed_cases(original: bytes, full: bool) -> list[tuple[str, bytes, str]]
         ("local-index", replace_main(original, site, b"\x15\xff\x57\xb1"), r"VerifyError"),
         ("branch-operand", replace_main(original, site, b"\xa7\x00\x01\xb1"), r"InvalidBytecode|VerifyError"),
         ("instruction-truncated", replace_main(original, site, b"\x11\x01"), r"InvalidBytecode"),
-        ("opcode-unsupported", replace_main(original, site, b"\x0e\xb1"), r"UnsupportedOpcode"),
+        ("opcode-unsupported", replace_main(original, site, b"\xc2\xb1"), r"UnsupportedOpcode"),
         ("field-pool-zero", replace_main(original, site, b"\xb2\x00\x00\x57\xb1"), invalid_pool),
     ]
     if full:

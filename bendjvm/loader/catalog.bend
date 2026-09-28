@@ -261,14 +261,36 @@ def method_records(methods: +List<M.Method>, +owner: U32, +ownerName: String, +p
         method : M.LoadedMethod <- method_value(U32.is_ne(U32.and(flags, 256), 0), intrinsic, nextId, owner, sy, name, desc, flags, D.parameter_count(parsed), resultTag, stack, locals, linked, linked_handlers)
         return Con{method, tail}
 
+def signature_word(bytes: +List<U32>) -> U32:
+  match bytes:
+    case Con{high, Con{low, tail}}: (high * 256 + low : U32)
+    case _: 0
+
+type SignatureScan is Data:
+  SignatureScan{attributes: +List<M.Attribute>, pool: +List<M.Constant>}
+  SignatureDecide{ok: Bool, bytes: +List<U32>, rest: +List<M.Attribute>, pool: +List<M.Constant>}
+
+@unsafe def signature_run(fuel: Nat, scan: SignatureScan) -> Result<&2, &2, String, String>:
+  match fuel scan:
+    case 0n _: Fail{"VmError.InvalidSignature: truncated attribute scan"}
+    case 1n+p SignatureScan{Nil{}, pool}: Done{""}
+    case 1n+p SignatureScan{Con{M.Attribute{name, bytes}, rest}, pool}:
+      signature_run(p, SignatureDecide{String.eq(name, "Signature"), bytes, rest, pool})
+    case 1n+p SignatureDecide{True{}, bytes, rest, pool}: CP.utf(pool, signature_word(bytes))
+    case 1n+p SignatureDecide{False{}, bytes, rest, pool}: signature_run(p, SignatureScan{rest, pool})
+
+def signature_text(attributes: +List<M.Attribute>, +pool: +List<M.Constant>) -> Result<&2, &2, String, String>:
+  signature_run(256n, SignatureScan{attributes, pool})
+
 def field_metadata_records(fields: +List<M.Field>, +owner: U32, +pool: +List<M.Constant>, +id: U32) -> Result<&2, &2, String, +List<M.FieldMetadata>>:
   match fields:
     case Nil{}: Done{Nil{}}
     case Con{M.Field{flags, name, desc, constant, +attributes}, rest}:
       do Result<&2, &2, String, +List<M.FieldMetadata>>:
         metadata : M.AnnotationMetadata <- AN.parse_attributes(attributes, pool)
+        signature : String <- signature_text(attributes, pool)
         tail : +List<M.FieldMetadata> <- field_metadata_records(rest, owner, pool, (id + 1 : U32))
-        return Con{M.FieldMetadata{owner, id, metadata}, tail}
+        return Con{M.FieldMetadata{owner, id, metadata, signature}, tail}
 
 def method_code_metadata(attributes: +List<M.Attribute>, +pool: +List<M.Constant>) -> Result<&2, &2, String, M.AnnotationMetadata>:
   match attributes:
@@ -285,8 +307,9 @@ def method_metadata_records(methods: +List<M.Method>, +owner: U32, +pool: +List<
         declaration_metadata : M.AnnotationMetadata <- AN.parse_attributes(attrs, pool)
         code_metadata : M.AnnotationMetadata <- method_code_metadata(attrs, pool)
         metadata : M.AnnotationMetadata = AN.merge_code_metadata(declaration_metadata, code_metadata)
+        signature : String <- signature_text(attrs, pool)
         tail : +List<M.MethodMetadata> <- method_metadata_records(rest, owner, pool, (id + 1 : U32))
-        return Con{M.MethodMetadata{owner, id, metadata}, tail}
+        return Con{M.MethodMetadata{owner, id, metadata, signature}, tail}
 def annotation_type_name(value: M.JvmType) -> Result<&2, &2, String, String>:
   match value:
     case M.ObjectType{name}: Done{name}
@@ -321,7 +344,7 @@ def metadata_add(meta: M.Metadata, class_meta: M.ClassMetadata, field_meta: +Lis
 def collect(classes: +List<M.ClassFile>, +all: +List<M.ClassFile>, +ns: +List<String>, +sy: +List<String>, fs: +List<M.LoadedField>, ms: +List<M.LoadedMethod>, metadata: M.Metadata, owner: U32) -> Result<&2, &2, String, Catalog>:
   match classes:
     case Nil{}: Done{Catalog{all, ns, sy, fs, ms, metadata}}
-    case Con{M.ClassFile{mi, ma, fl, name, parent, interfaces, +pool, +fields, +methods, attrs}, rest}:
+    case Con{M.ClassFile{mi, ma, fl, name, parent, interfaces, +pool, +fields, +methods, +attrs}, rest}:
       +oldFields = fs
       +oldMethods = ms
       +cid = owner
@@ -332,7 +355,8 @@ def collect(classes: +List<M.ClassFile>, +all: +List<M.ClassFile>, +ns: +List<St
         field_metadata : +List<M.FieldMetadata> <- field_metadata_records(fields, cid, pool, M.length(M.LoadedField, oldFields))
         method_metadata : +List<M.MethodMetadata> <- method_metadata_records(methods, cid, pool, M.length(M.LoadedMethod, oldMethods))
         visible_names : +List<String> <- annotation_names(annotation_metadata_annotations(class_metadata), pool, Nil{})
-        next_metadata : M.Metadata = metadata_add(metadata, M.ClassMetadata{cid, fl, class_metadata, visible_names, pool}, field_metadata, method_metadata)
+        class_signature : String <- signature_text(attrs, pool)
+        next_metadata : M.Metadata = metadata_add(metadata, M.ClassMetadata{cid, fl, class_metadata, visible_names, pool, class_signature}, field_metadata, method_metadata)
         next : Catalog <- collect(rest, all, ns, sy, M.append(M.LoadedField, oldFields, newFields), M.append(M.LoadedMethod, oldMethods, newMethods), next_metadata, (cid + 1 : U32))
         return next
 

@@ -448,7 +448,7 @@ def invoke_virtual_reflect_default(args: F.Arguments, +vm: M.VM, max: U32) -> Re
     case F.Arguments{frame, +values}: intrinsic_result(frame, max, L.reflect_method_is_default(vm, values))
 def invoke_virtual_reflect_generic_return(args: F.Arguments, +vm: M.VM, max: U32) -> Result<&2, &2, String, M.VM>:
   match args:
-    case F.Arguments{frame, +values}: intrinsic_result(frame, max, L.reflect_method_return_type(vm, values))
+    case F.Arguments{frame, +values}: intrinsic_result(frame, max, L.reflect_method_generic_return(vm, values))
 
 def invoke_virtual_reflect_generic_parameters(args: F.Arguments, +vm: M.VM, max: U32) -> Result<&2, &2, String, M.VM>:
   match args:

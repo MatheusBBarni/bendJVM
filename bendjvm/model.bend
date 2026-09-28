@@ -39,13 +39,13 @@ def empty_annotation_metadata() -> AnnotationMetadata:
   AnnotationMetadata{0, Nil{}, Nil{}, Nil{}, Nil{}, None{}}
 
 type ClassMetadata is Data:
-  ClassMetadata{owner: U32, flags: U32, metadata: AnnotationMetadata, visibleAnnotations: +List<String>, pool: +List<Constant>}
+  ClassMetadata{owner: U32, flags: U32, metadata: AnnotationMetadata, visibleAnnotations: +List<String>, pool: +List<Constant>, signature: String}
 
 type FieldMetadata is Data:
-  FieldMetadata{owner: U32, field: U32, metadata: AnnotationMetadata}
+  FieldMetadata{owner: U32, field: U32, metadata: AnnotationMetadata, signature: String}
 
 type MethodMetadata is Data:
-  MethodMetadata{owner: U32, method: U32, metadata: AnnotationMetadata}
+  MethodMetadata{owner: U32, method: U32, metadata: AnnotationMetadata, signature: String}
 
 type Metadata is Data:
   Metadata{classes: +List<ClassMetadata>, fields: +List<FieldMetadata>, methods: +List<MethodMetadata>}

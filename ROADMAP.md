@@ -24,10 +24,11 @@ bounded UTF-8 `Properties.load(Reader)` parsing. Host JDK classes are not
 loaded.
 
 This is not full OpenJDK reflection. Complete Java access-edge compatibility,
-category-two annotation materialization, proxy method-conflict/default-method
-and loader-namespace rules, parent/complex static-initialization semantics,
-generic/signature reflection, exact annotation formatting, and full URL escaping
-remain bounded or unsupported.
+proxy method-conflict/default-method and loader-namespace rules,
+parent/complex static-initialization semantics, parameter-name reflection,
+exact annotation formatting, and full URL escaping remain bounded or
+unsupported. Method, field, and class `Signature` attributes and method-return
+and field type-argument annotations are implemented.
 
 ## Spring Boot target
 
@@ -85,9 +86,9 @@ missing runtime classes or reaches unsupported bytecode.
   normalization, origin-bound URL handles, ordered resource enumeration,
   local URL protocol/string forms, ISO-8859-1/Unicode/continuation-aware
   `Properties.load(InputStream)`, and bounded UTF-8 `Properties.load(Reader)`.
-- Remaining work: complete Java access-edge compatibility, category-two
-  annotation materialization, proxy method-conflict/default-method and
-  loader-namespace rules, parent/complex static-initialization semantics, and
+- Remaining work: true category-two stack layout, proxy
+  method-conflict/default-method and loader-namespace rules, parent/complex
+  static-initialization semantics, parameter-name reflection, and
   complete URL escaping.
 
 ### 4. Broader JVM bytecode support

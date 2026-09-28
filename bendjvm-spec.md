@@ -106,8 +106,8 @@ does not support:
 * JNI.
 * Native libraries.
 * Java agents.
-* complete reflection access checks, generic/signature reflection, or the
-  complete OpenJDK reflection surface.
+* complete reflection access checks, parameter-name reflection, or the
+  complete OpenJDK reflection surface. Method, field, and class signatures are parsed.
 * Method handles.
 * `invokedynamic`.
 * Java threads.

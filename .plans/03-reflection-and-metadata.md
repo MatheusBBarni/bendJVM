@@ -36,9 +36,11 @@ The current bounded expansion adds:
 
 - caller/protected receiver checks, final instance-field restrictions, reflective virtual dispatch, constructor rejection for interfaces/abstract/enum targets, and public-constructor filtering;
 - a single logical-slot raw-word long/double representation with long arithmetic, `lshl`, `i2l`, `l2i`, `dadd`, `dsub`, `dneg`, wide fields/calls/returns, boxed `Long`/`Double` value accessors, and bounded decimal formatting;
-- custom loader object acceptance for the existing application catalog, default-interface fallback when class dispatch has no concrete override, `Method.isDefault()` fallback reflection, `InvocationTargetException` wrapping at reflective unwind boundaries, `Throwable(Throwable)` cause-to-message initialization, and bounded `AnnotatedType` type/owner/actual-argument exposure for erased descriptors.
+- custom loader object acceptance for the existing application catalog, default-interface fallback when class dispatch has no concrete override, `Method.isDefault()` fallback reflection, `InvocationTargetException` wrapping at reflective unwind boundaries, `Throwable(Throwable)` cause-to-message initialization, and `AnnotatedType` exposure for method return/parameter sites, including type-argument paths on parameterized returns;
+- Java 8 method `Signature` attributes for generic return, parameter, and exception types, including `ParameterizedType` argument arrays and `TypeVariable` names. Non-generic throws stay on the `Exceptions` attribute when the signature omits them. `Class.forName(name, initialize, null)` uses the bootstrap loader for bootstrap classes.
+- Field and class `Signature` attributes for `Field.getGenericType`, `Field.getAnnotatedType`, and `Class.getGenericSuperclass`, including type-argument annotations on fields.
 
-The following remain incomplete: true category-two JVM stack/local layout and the remaining long/double opcodes/conversions, loader identity and multiple independent namespaces, special default-method proxy invocation, generic `Signature`/`MethodParameters`/`TypeVariable` reflection, full `AnnotatedType` target/type-path exposure, and byte-for-byte OpenJDK formatting/exception-message compatibility. `AnnotatedType.getType()`, `Type.getTypeName()`, `Method.getGenericReturnType()`, `Method.getGenericParameterTypes()`, and `Method.getGenericExceptionTypes()` expose erased descriptor types only.
+The following remain incomplete: true category-two JVM stack/local layout and the remaining long/double opcodes/conversions, loader identity and multiple independent namespaces, special default-method proxy invocation, parameter-name reflection, `AnnotatedType` coverage for local-variable and expression targets, and byte-for-byte OpenJDK formatting/exception-message compatibility.
 
 ## Scope and boundaries
 
@@ -52,7 +54,7 @@ The following remain incomplete: true category-two JVM stack/local layout and th
 
 ### Explicit exclusions
 
-Custom loader instances may resolve names from the existing application catalog, but arbitrary `defineClass`, loader identity, and multiple application-loader namespaces remain unsupported; modules/security managers, MethodHandles, `invokedynamic`, full generic Type/Signature reflection, parameter-name reflection, serialization of reflection/proxy objects, Java threading/context-class-loader APIs, subclass-based proxies, default-method special invocation, Spring Boot archive layouts, and general classpath/package scanning are also excluded.
+Custom loader instances may resolve names from the existing application catalog, but arbitrary `defineClass`, loader identity, and multiple application-loader namespaces remain unsupported; modules/security managers, MethodHandles, `invokedynamic`, Class type-parameter and generic-interface reflection beyond recorded method/field/superclass signatures, parameter-name reflection, serialization of reflection/proxy objects, Java threading/context-class-loader APIs, subclass-based proxies, default-method special invocation, Spring Boot archive layouts, and general classpath/package scanning are also excluded.
 
 Generic Signature and other unsupported attributes must not be invented into reflection results. Preserve validated metadata where useful, but advertise only implemented APIs. Application discovery in the integrated example uses explicit names in configuration, not an unbounded archive scan.
 
@@ -300,9 +302,9 @@ Candidate `LAWS.bend`/`PROOF.bend` invariants: appending types preserves existin
 - Framework configuration resources support class-relative `./` and `..`
   normalization, ordered enumeration, origin-bound reopening, and Properties
   decoding.
-- Existing milestone behavior and Bend ownership are preserved; category-two,
-  generic/signature, complete Java access-edge, and default-method limitations
-  remain explicit in documentation.
+- Existing milestone behavior and Bend ownership are preserved; category-two
+  execution, parameter-name reflection, complete Java access-edge, and
+  default-method limitations remain explicit in documentation.
 - Documentation and proof gates are updated after behavior verification.
 
 
@@ -313,5 +315,6 @@ bounded Properties paths have permanent fixtures or suite coverage. Remaining
 limits are recorded in `README.md` and this plan: general category-two
 bytecode/field/call execution, complete access-edge compatibility, custom
 loader subclasses and multiple application namespaces, default-method proxy
-dispatch, generic/signature reflection, and full OpenJDK reflection
-compatibility.
+dispatch, parameter-name reflection, and full OpenJDK reflection
+compatibility. Method, field, and class signatures and method-return and field
+type-argument annotations are implemented.

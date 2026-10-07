@@ -11,8 +11,6 @@ type Constant is Data:
   Index{tag: U32, index: U32}
   PairIndex{tag: U32, first: U32, second: U32}
 
-type Attribute is Data:
-  Attribute{name: String, bytes: +List<U32>}
 # Structured class-file metadata. Constant-pool references remain symbolic so
 # annotation Class and enum values can resolve lazily at materialization time.
 type AnnotationValue is Data:
@@ -33,10 +31,13 @@ type TypeAnnotation is Data:
   TypeAnnotation{targetType: U32, targetInfo: +List<U32>, path: +List<U32>, annotation: Annotation}
 
 type AnnotationMetadata is Data:
-  AnnotationMetadata{flags: U32, exceptions: +List<U32>, annotations: +List<Annotation>, parameterAnnotations: +List<+List<Annotation>>, typeAnnotations: +List<TypeAnnotation>, defaultValue: Maybe<&2, AnnotationValue>}
+  AnnotationMetadata{flags: U32, exceptions: +List<U32>, annotations: +List<Annotation>, parameterAnnotations: +List<+List<Annotation>>, typeAnnotations: +List<TypeAnnotation>, defaultValue: Maybe<&2, AnnotationValue>, invisibleAnnotations: +List<Annotation>, invisibleParameterAnnotations: +List<+List<Annotation>>, invisibleTypeAnnotations: +List<TypeAnnotation>}
 
 def empty_annotation_metadata() -> AnnotationMetadata:
-  AnnotationMetadata{0, Nil{}, Nil{}, Nil{}, Nil{}, None{}}
+  AnnotationMetadata{0, Nil{}, Nil{}, Nil{}, Nil{}, None{}, Nil{}, Nil{}, Nil{}}
+type Attribute is Data:
+  Attribute{name: String, bytes: +List<U32>}
+  ValidatedAnnotations{metadata: AnnotationMetadata}
 
 type ClassMetadata is Data:
   ClassMetadata{owner: U32, flags: U32, metadata: AnnotationMetadata, visibleAnnotations: +List<String>, pool: +List<Constant>, signature: String}
@@ -173,15 +174,18 @@ type HeapEntry is Data:
   HeapEntry{class: U32, kind: U32, element: U32, fields: +List<Binding>, values: +List<Slot>, chars: +List<U32>}
 
 type Resource is Data:
-  Resource{name: String, bytes: +List<U32>, origin: String}
+  Resource{name: String, origin: String}
 
 # Host effects are opaque OS requests. Bend keeps Java-visible state only.
 type Effect is Data:
   Idle{}
   ReflectCall{}
   ReflectConstructor{reference: U32}
-  ProxyCall{descriptor: String, exceptions: +List<U32>}
+  ProxyCall{descriptor: String, method: U32, owners: +List<U32>}
   ClassForName{target: U32}
+  RuntimeClass{name: String, initialize: Bool, loader: U32}
+  InitCall{target: U32, intrinsic: U32, args: +List<Slot>}
+  ReadResource{name: String, origin: String}
   OpenFile{path: String, mode: U32, receiver: U32}
   StatPath{path: String, op: U32}
   ReadBytes{handle: U32, count: U32, timeout: U32}
@@ -199,6 +203,8 @@ type Cont is Data:
   NeedToString{op: U32, extra: U32}
   NeedEquals{op: U32, left: U32, right: U32}
   NeedListEq{list: U32, query: U32, index: U32, op: U32}
+  CallBoundary{depth: U32, effect: Effect, descriptor: U32}
+  InitCallContinuation{depth: U32, intrinsic: U32, args: +List<Slot>}
 type Host is Data:
   Host{effect: Effect, cwd: String, caps: U32, maxPayload: U32, cont: +List<Cont>, metadata: Metadata}
 

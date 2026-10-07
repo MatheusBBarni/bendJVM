@@ -4,7 +4,7 @@ import ./reader.bend as R
 import ./constant_pool.bend as CP
 import ./attribute.bend as A
 import ../bytecode/decode.bend as BC
-import ./annotation.bend as AN
+import ./metadata.bend as MD
 
 # Parser state wrappers keep reader ownership explicit across recursive sections.
 type Interfaces is Data:
@@ -53,6 +53,7 @@ def constant_index(attributes: +List<M.Attribute>) -> U32:
   match attributes:
     case Nil{}:
       0
+    case Con{M.ValidatedAnnotations{metadata}, rest}: constant_index(rest)
     case Con{M.Attribute{name, bytes}, rest}:
       Bool.pick(U32, String.eq(name, "ConstantValue"), bytes_index(bytes), constant_index(rest))
 
@@ -63,6 +64,7 @@ def code_attribute(attributes: +List<M.Attribute>) -> Maybe<&2, +List<U32>>:
   match attributes:
     case Nil{}:
       None{}
+    case Con{M.ValidatedAnnotations{metadata}, rest}: code_attribute(rest)
     case Con{M.Attribute{name, bytes}, rest}:
       Bool.pick(Maybe<&2, +List<U32>>, String.eq(name, "Code"), Some{bytes}, code_attribute(rest))
 @unsafe def skip_attributes_go(count: Nat, reader: R.Reader) -> Result<&2, &2, String, R.Reader>:
@@ -101,7 +103,6 @@ def code_attributes_validate(attributes: A.Attributes, +pool: +List<M.Constant>)
     case A.Attributes{+reader, +values}:
       do Result<&2, &2, String, Unit>:
         R.finish(reader)
-        checked : M.AnnotationMetadata <- AN.parse_code_metadata_attributes(values, pool)
         return Unit{}
 
 def code_after_handlers(max_stack: U32, max_locals: U32, +code: +List<U32>, result: CodeHandlers, +pool: +List<M.Constant>) -> Result<&2, &2, String, CodeInfo>:
@@ -233,8 +234,10 @@ def parse_class_attributes(methods: Methods, fields: +List<M.Field>, interfaces:
   match methods:
     case Methods{reader, values, +pool}:
       do Result<&2, &2, String, M.ClassFile>:
-        attributes : A.Attributes <- A.parse(reader, pool)
-        return M.ClassFile{minor, major, flags, name, parent, interfaces, pool, fields, values, attrs_values(attributes)}
+        +attributes : A.Attributes <- A.parse(reader, pool)
+        R.finish(attrs_reader(attributes))
+        checked : M.ClassFile <- MD.class_checked(M.ClassFile{minor, major, flags, name, parent, interfaces, pool, fields, values, attrs_values(attributes)})
+        return checked
 
 def parse_methods_count(fields: Fields, interfaces: +List<String>, minor: U32, major: U32, flags: U32, name: String, parent: String) -> Result<&2, &2, String, M.ClassFile>:
   match fields:

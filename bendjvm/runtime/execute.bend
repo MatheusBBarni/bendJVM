@@ -113,6 +113,29 @@ def push_return(+vm: M.VM, value: M.Slot) -> M.VM:
   return_frames(vm, value, S.frames(vm))
 
 
+def void_frames(+vm: M.VM, frames: +List<M.Frame>) -> M.VM:
+  match frames:
+    case Nil{}: S.with_status(vm, 1)
+    case Con{current, rest}:
+      match rest:
+        case Nil{}: S.with_status(vm, 1)
+        case Con{caller, callers}: S.with_frames(vm, Con{caller, callers})
+def allocate_named_result(+vm: M.VM, name: String, result: Result<&2, &2, String, H.Allocation>) -> M.VM:
+  match result:
+    case Fail{error}: S.with_exception(vm, 2)
+    case Done{H.Allocation{updated, reference}}: S.with_exception(updated, reference)
+
+def allocate_named(+vm: M.VM, +name: String) -> M.VM:
+  allocate_named_result(vm, name, H.allocate(vm, H.throwable_entry(H.named_class(S.classes(vm), S.symbols(vm), name))))
+
+def ensure_throw_state(has_exception: Bool, +vm: M.VM, error: String) -> M.VM:
+  match has_exception:
+    case True{}: vm
+    case False{}: allocate_named(vm, error)
+
+def ensure_throw(+vm: M.VM, error: String) -> M.VM:
+  ensure_throw_state(U32.is_ne(S.exception(vm), 0), vm, error)
+
 def finish_reflect_outcome(+vm: M.VM, result: Result<&2, &2, String, O.Outcome>) -> M.VM:
   match result:
     case Fail{error}: S.fail(vm, error)
@@ -121,104 +144,67 @@ def finish_reflect_outcome(+vm: M.VM, result: Result<&2, &2, String, O.Outcome>)
       return_frames(updated, value, frames)
     case Done{O.Returned{+updated, None{}}}:
       +frames = S.frames(updated)
-      return_frames(updated, M.Slot{3, 0}, frames)
+      void_frames(updated, frames)
     case Done{O.ThrownRef{updated, reference}}: S.with_status(S.with_exception(updated, reference), 6)
-    case Done{O.ThrownName{updated, name}}: S.fail(updated, name)
+    case Done{O.ThrownName{updated, name}}: S.with_status(ensure_throw(updated, name), 6)
     case Done{O.Suspend{updated, effect}}: S.with_effect(updated, effect)
     case Done{O.Call{updated, method, args}}: S.fail(updated, "VmError.Internal: nested reflection call")
 
-def reflected_marker(marker: U32) -> Maybe<&2, U32>:
-  +marker_ref : U32 = marker
-  take : Bool = U32.is_eq(marker_ref, 4294967294)
-  Bool.pick(Maybe<&2, U32>, take, Some{0}, None{})
+def boundary_push(+vm: M.VM, effect: M.Effect, descriptor: U32) -> M.VM:
+  S.with_cont(S.with_effect(vm, M.Idle{}), Con{M.CallBoundary{M.length(M.Frame, S.frames(vm)), effect, descriptor}, host_cont(vm)})
 
-def reflected_descriptor(frame: M.Frame) -> Maybe<&2, U32>:
-  reflected_marker(S.initializing(frame))
+def proxy_return_exception(is_java_exception: Bool, +vm: M.VM, +error: String) -> Result<&2, &2, String, O.Outcome>:
+  match is_java_exception:
+    case True{}: Done{O.ThrownName{vm, error}}
+    case False{}: Fail{error}
+def proxy_return_value_result(+vm: M.VM, +text: String, converted: Result<&2, &2, String, M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  match converted:
+    case Fail{+error}: proxy_return_exception(String.eq(error, "java/lang/NullPointerException") || String.eq(error, "java/lang/ClassCastException"), vm, error)
+    case Done{slot}: Done{O.Returned{vm, Bool.pick(Maybe<&2, M.Slot>, String.eq(L.method_return_name(text), "void"), None{}, Some{slot})}}
 
-def reflected_method_descriptor_found(found: Maybe<&2, M.LoadedMethod>) -> U32:
-  match found:
-    case None{}: 0
-    case Some{method}: M.loaded_method_descriptor(method)
 
-def reflected_method_descriptor(vm: M.VM, frame: M.Frame) -> U32:
-  reflected_method_descriptor_found(M.nth(M.LoadedMethod, S.methods(vm), S.method_id(frame)))
-
-def finish_reflect_marked(+vm: M.VM, value: M.Slot, +current: M.Frame, +caller: M.Frame, +callers: +List<M.Frame>, descriptor: U32) -> M.VM:
-  +vm_ref : M.VM = vm
-  descriptor_id : U32 = reflected_method_descriptor(vm_ref, current)
-  clean : M.Frame = S.frame_initializing(caller, 4294967295)
-  +cleared : M.VM = S.with_cont(S.with_effect(vm, M.Idle{}), Nil{})
-  +updated : M.VM = S.with_frames(cleared, Con{current, Con{clean, callers}})
-  +text : String = Sy.text(S.symbols(updated), descriptor_id)
-  finish_reflect_outcome(updated, L.reflect_box_return(updated, text, value))
-
-def finish_return_found(+vm: M.VM, value: M.Slot, current: M.Frame, +caller: M.Frame, +callers: +List<M.Frame>, found: Maybe<&2, U32>) -> M.VM:
-  match found:
-    case None{}: push_return(vm, value)
-    case Some{descriptor}: finish_reflect_marked(vm, value, current, caller, callers, descriptor)
-
-def finish_return_marked(+vm: M.VM, value: M.Slot, +frames: +List<M.Frame>) -> M.VM:
-  match frames:
-    case Con{current, Con{+caller, callers}}:
-      finish_return_found(vm, value, current, caller, callers, reflected_descriptor(caller))
-    case _: push_return(vm, value)
-
-def proxy_return_frames(+vm: M.VM, value: M.Slot, +frames: +List<M.Frame>, +descriptor: String) -> M.VM:
-  match frames:
-    case Con{current, Con{+caller, callers}}:
-      M.Frame{method, pc, invoke, locals, +stack, initializing} = caller
-      +return_name : String = L.method_return_name(descriptor)
-      +next_stack : +List<M.Slot> = Bool.pick(+List<M.Slot>, String.eq(return_name, "void"), stack, Con{value, stack})
-      S.with_frames(vm, Con{M.Frame{method, pc, invoke, locals, next_stack, initializing}, callers})
-    case _: S.with_result(S.with_status(vm, 1), value)
-
-def allocate_named_result(+vm: M.VM, name: String, result: Result<&2, &2, String, H.Allocation>) -> M.VM:
-  match result:
-    case Fail{error}: S.with_exception(vm, 2)
-    case Done{allocation}:
-      match allocation:
-        case H.Allocation{updated, reference}: S.with_exception(updated, reference)
-
-def allocate_named(+vm: M.VM, +name: String) -> M.VM:
-  allocate_named_result(vm, name, H.allocate(vm, H.throwable_entry(H.named_class(S.classes(vm), S.symbols(vm), name))))
-
-def ensure_throw(+vm: M.VM, error: String) -> M.VM:
-  Bool.pick(M.VM, U32.is_ne(S.exception(vm), 0), vm, allocate_named(vm, error))
-
-def proxy_return_failure(error: String, +vm: M.VM, +frames: +List<M.Frame>) -> M.VM:
-  S.with_status(ensure_throw(vm, error), 6)
-
-def finish_proxy_return_value(result: Result<&2, &2, String, M.Slot>, +vm: M.VM, +frames: +List<M.Frame>, +descriptor: String) -> M.VM:
-  match result:
-    case Fail{error}: proxy_return_failure(error, vm, frames)
-    case Done{unboxed}: proxy_return_frames(vm, unboxed, frames, descriptor)
-
-def finish_proxy_return(+vm: M.VM, value: M.Slot, +current: M.Frame, +caller: M.Frame, +callers: +List<M.Frame>, +descriptor: String) -> M.VM:
-  +clean : M.Frame = S.frame_initializing(caller, 4294967295)
-  +cleared : M.VM = S.with_cont(S.with_effect(vm, M.Idle{}), Nil{})
-  +updated : M.VM = S.with_frames(cleared, Con{current, Con{clean, callers}})
-  finish_proxy_return_value(L.proxy_return_value(updated, descriptor, value), updated, S.frames(updated), descriptor)
-
-def finish_proxy_return_frames(+vm: M.VM, value: M.Slot, +frames: +List<M.Frame>, +descriptor: String) -> M.VM:
-  match frames:
-    case Con{current, Con{+caller, callers}}: finish_proxy_return(vm, value, current, caller, callers, descriptor)
-    case _: push_return(vm, value)
-
-def finish_return_effect(+vm: M.VM, value: M.Slot, +frames: +List<M.Frame>, effect: M.Effect) -> M.VM:
+def boundary_value(+vm: M.VM, effect: M.Effect, descriptor: U32, value: M.Slot) -> Result<&2, &2, String, O.Outcome>:
   match effect:
-    case M.ProxyCall{descriptor, exceptions}: finish_proxy_return_frames(vm, value, frames, descriptor)
-    case _: finish_return_marked(vm, value, frames)
+    case M.ReflectCall{}: L.reflect_box_return(vm, Sy.text(S.symbols(vm), descriptor), value)
+    case M.ReflectConstructor{reference}: Done{O.Returned{vm, Some{M.Slot{3, reference}}}}
+    case M.ProxyCall{+text, method_id, owners}:
+      proxy_return_value_result(vm, text, L.proxy_return_value(vm, text, value))
+    case _: Done{O.Returned{vm, Some{value}}}
+
+type BoundaryJob is Data:
+  BValues{result: Result<&2, &2, String, O.Outcome>, depth: U32}
+  BResult{value: M.Slot, depth: U32, conts: +List<M.Cont>}
+  BSame{value: M.Slot, depth: U32, effect: M.Effect, descriptor: U32, rest: +List<M.Cont>, same: Bool}
+  BVoid{depth: U32, conts: +List<M.Cont>}
+  BVoidSame{depth: U32, same: Bool}
+
+@unsafe def boundary_job(+vm: M.VM, job: BoundaryJob) -> Result<&2, &2, String, O.Outcome>:
+  match job:
+    case BValues{result, depth}:
+      match result:
+        case Done{O.Returned{+vm, Some{value}}}: boundary_job(vm, BResult{value, depth, host_cont(vm)})
+        case Done{O.Returned{+vm, None{}}}: boundary_job(vm, BVoid{depth, host_cont(vm)})
+        case other: other
+    case BResult{value, +depth, conts}:
+      match conts:
+        case Con{M.CallBoundary{+expected, effect, descriptor}, rest}: boundary_job(vm, BSame{value, depth, effect, descriptor, rest, U32.is_eq(expected, depth)})
+        case _: Done{O.Returned{vm, Some{value}}}
+    case BSame{value, +depth, effect, descriptor, rest, True{}}: boundary_job(vm, BValues{boundary_value(S.with_cont(vm, rest), effect, descriptor, value), depth})
+    case BSame{value, depth, effect, descriptor, rest, False{}}: Done{O.Returned{vm, Some{value}}}
+    case BVoid{+depth, conts}:
+      match conts:
+        case Con{M.CallBoundary{+expected, effect, descriptor}, rest}: boundary_job(vm, BVoidSame{depth, U32.is_eq(expected, depth)})
+        case _: Done{O.Returned{vm, None{}}}
+    case BVoidSame{+depth, True{}}: boundary_job(vm, BResult{M.Slot{3, 0}, depth, host_cont(vm)})
+    case BVoidSame{depth, False{}}: Done{O.Returned{vm, None{}}}
+
+def boundary_result(+vm: M.VM, value: M.Slot, +depth: U32, conts: +List<M.Cont>) -> Result<&2, &2, String, O.Outcome>:
+  boundary_job(vm, BResult{value, depth, conts})
 
 def finish_return(+vm: M.VM, value: M.Slot) -> M.VM:
-  +frames = S.frames(vm)
-  finish_return_effect(vm, value, frames, S.host_effect(vm))
-def void_frames(+vm: M.VM, frames: +List<M.Frame>) -> M.VM:
-  match frames:
-    case Nil{}: S.with_status(vm, 1)
-    case Con{current, rest}:
-      match rest:
-        case Nil{}: S.with_status(vm, 1)
-        case Con{caller, callers}: S.with_frames(vm, Con{caller, callers})
+  finish_reflect_outcome(vm, boundary_result(vm, value, U32.sub(M.length(M.Frame, S.frames(vm)), 1), host_cont(vm)))
+
+
 
 def finish_void_state(+vm: M.VM, current: M.Frame, rest: +List<M.Frame>, state: U32) -> M.VM:
   match state:
@@ -233,27 +219,8 @@ def finish_void_frames(+vm: M.VM, frames: +List<M.Frame>) -> M.VM:
     case Nil{}: S.with_status(vm, 1)
     case Con{current, rest}: finish_void_current(vm, current, rest)
 
-def finish_reflect_void(+vm: M.VM, +frames: +List<M.Frame>) -> M.VM:
-  match frames:
-    case Con{current, Con{+caller, callers}}:
-      +cleared : M.VM = S.with_effect(vm, M.Idle{})
-      return_frames(cleared, M.Slot{3, 0}, Con{current, Con{caller, callers}})
-    case _: S.fail(vm, "InvalidState: reflective void return")
-
-def finish_construct_frames(+vm: M.VM, reference: U32, +frames: +List<M.Frame>) -> M.VM:
-  match frames:
-    case Con{current, Con{+caller, callers}}:
-      +cleared : M.VM = S.with_effect(vm, M.Idle{})
-      return_frames(cleared, M.Slot{3, reference}, Con{current, Con{caller, callers}})
-    case _: S.fail(vm, "InvalidState: constructor return")
-
-def constructor_reference_marker(marker: U32) -> Maybe<&2, U32>:
-  +marker_ref : U32 = marker
-  take : Bool = U32.is_le(marker_ref, 4294967292)
-  Bool.pick(Maybe<&2, U32>, take, Some{U32.sub(4294967293, marker_ref)}, None{})
-
-def constructor_reference_frame(frame: M.Frame) -> Maybe<&2, U32>:
-  constructor_reference_marker(S.initializing(frame))
+def finish_boundary_void(+vm: M.VM) -> M.VM:
+  finish_reflect_outcome(vm, boundary_result(vm, M.Slot{3, 0}, U32.sub(M.length(M.Frame, S.frames(vm)), 1), host_cont(vm)))
 
 def invoke_class_initializer_frame(vm: M.VM, id: U32, maxLocals: U32, owner: U32, +caller: M.Frame, values: +List<M.Slot>, frames: +List<M.Frame>) -> M.VM:
   match frames:
@@ -300,28 +267,24 @@ def finish_class_for_name(+vm: M.VM, +frames: +List<M.Frame>, +target: U32) -> M
       finish_class_for_name_result(ready, target, frames, rest, result)
     case _: S.fail(vm, "InvalidState: Class.forName initializer return")
 
-def finish_void_effect(+vm: M.VM, +frames: +List<M.Frame>, effect: M.Effect) -> M.VM:
+def finish_void_effect(+vm: M.VM, frames: +List<M.Frame>, effect: M.Effect) -> M.VM:
   match effect:
-    case M.ReflectCall{}: finish_reflect_void(vm, frames)
-    case M.ReflectConstructor{reference}: finish_construct_frames(vm, reference, frames)
     case M.ClassForName{target}: finish_class_for_name(vm, frames, target)
     case _: finish_void_frames(vm, frames)
-def finish_void_marked_found(+vm: M.VM, +frames: +List<M.Frame>, effect: M.Effect, current: M.Frame, +caller: M.Frame, +callers: +List<M.Frame>, found: Maybe<&2, U32>) -> M.VM:
-  match found:
-    case Some{reference}: finish_construct_frames(vm, reference, frames)
-    case None{}: finish_void_effect(vm, frames, effect)
-def finish_void_marked(+vm: M.VM, +frames: +List<M.Frame>, effect: M.Effect) -> M.VM:
-  match frames:
-    case Con{current, Con{+caller, callers}}:
-      finish_void_marked_found(vm, frames, effect, current, caller, callers, constructor_reference_frame(caller))
-    case _: finish_void_effect(vm, frames, effect)
+def finish_void_same(+vm: M.VM, same: Bool) -> M.VM:
+  match same:
+    case True{}: finish_boundary_void(vm)
+    case False{}: finish_void_effect(vm, S.frames(vm), S.host_effect(vm))
 
-
+def finish_void_cont(+vm: M.VM, conts: +List<M.Cont>) -> M.VM:
+  match conts:
+    case Con{M.CallBoundary{+depth, effect, descriptor}, rest}:
+      finish_void_same(vm, U32.is_eq(M.length(M.Frame, S.frames(vm)), U32.add(depth, 1)))
+    case _: finish_void_effect(vm, S.frames(vm), S.host_effect(vm))
 
 def finish_void(+vm: M.VM) -> M.VM:
-  +frames = S.frames(vm)
-  +effect = S.host_effect(vm)
-  finish_void_marked(vm, frames, effect)
+  finish_void_cont(vm, host_cont(vm))
+
 
 def invoke_frame(vm: M.VM, id: U32, maxLocals: U32, +caller: M.Frame, values: +List<M.Slot>, frames: +List<M.Frame>) -> M.VM:
   match frames:
@@ -337,33 +300,107 @@ def invoke_arguments(vm: M.VM, method: M.LoadedMethod, args: F.Arguments, frames
         case F.Arguments{caller, values}:
           invoke_frame(vm, id, maxLocals, caller, values, frames)
 
-def invoke_reflect(+vm: M.VM, +method: M.LoadedMethod, +args: +List<M.Slot>, +caller: M.Frame) -> M.VM:
-  +method_ref : M.LoadedMethod = method
-  +caller_ref : M.Frame = caller
-  +marked : M.Frame = S.frame_initializing(caller_ref, 4294967294)
-  invoke_arguments(vm, method_ref, F.Arguments{marked, args}, S.frames(vm))
+def thrown_class_entry(result: Result<&2, &2, String, M.HeapEntry>) -> U32:
+  match result:
+    case Fail{error}: 0
+    case Done{entry}: H.entry_class(entry)
 
-def invoke_constructor(+vm: M.VM, method: M.LoadedMethod, +args: +List<M.Slot>, +caller: M.Frame, reference: U32) -> M.VM:
-  +caller_ref : M.Frame = caller
-  marked : M.Frame = S.frame_initializing(caller_ref, U32.sub(4294967293, reference))
-  +cleared : M.VM = S.with_effect(vm, M.Idle{})
-  invoke_arguments(cleared, method, F.Arguments{marked, args}, S.frames(cleared))
+def thrown_class_of(+vm: M.VM) -> U32:
+  thrown_class_entry(H.get(S.heap(vm), S.exception(vm)))
+def proxy_exception_entry_found(original: U32, entry: M.HeapEntry) -> M.HeapEntry:
+  M.HeapEntry{kind_class, kind, element, fields, values, chars} = entry
+  M.HeapEntry{kind_class, kind, element, H.binding_set(fields, 1, M.Slot{3, original}), values, chars}
 
-def invoke_proxy(+vm: M.VM, method: M.LoadedMethod, +args: +List<M.Slot>, +caller: M.Frame) -> M.VM:
-  invoke_arguments(vm, method, F.Arguments{caller, args}, S.frames(vm))
+def proxy_exception_entry(class: U32, original: U32) -> M.HeapEntry:
+  proxy_exception_entry_found(original, H.throwable_entry(class))
 
+def proxy_wrap_exception_alloc(+vm: M.VM, result: Result<&2, &2, String, H.Allocation>) -> M.VM:
+  match result:
+    case Fail{error}: S.fail(vm, error)
+    case Done{H.Allocation{vm, reference}}: S.with_exception(vm, reference)
 
-def invoke_outcome_effect(+vm: M.VM, method: M.LoadedMethod, +args: +List<M.Slot>, +caller: M.Frame, effect: M.Effect) -> M.VM:
+def proxy_declared_exception_group_select(group_missing: Bool, next: Unit -> Bool) -> Bool:
+  match group_missing:
+    case True{}: False{}
+    case False{}: next(Unit{})
+
+def proxy_declared_exception_groups(fuel: Nat, +thrown: U32, +groups: +List<U32>, +classes: +List<M.LoadedClass>, +symbols: +List<String>, seen: Bool, matched: Bool) -> Bool:
+  match fuel groups:
+    case 0n _: False{}
+    case 1n+remaining Nil{}: seen && matched
+    case 1n+remaining Con{0, rest}:
+      match rest:
+        case Nil{}: seen && matched
+        case Con{head, tail}:
+          proxy_declared_exception_group_select(seen && Bool.not(matched), unit => proxy_declared_exception_groups(remaining, thrown, Con{head, tail}, classes, symbols, True{}, False{}))
+    case 1n+remaining Con{declared, rest}:
+      proxy_declared_exception_groups(remaining, thrown, rest, classes, symbols, True{}, matched || H.assignable(classes, symbols, thrown, declared))
+
+def proxy_declared_exception(fuel: Nat, +thrown: U32, +exceptions: +List<U32>, +classes: +List<M.LoadedClass>, +symbols: +List<String>) -> Bool:
+  proxy_declared_exception_groups(fuel, thrown, exceptions, classes, symbols, False{}, False{})
+def proxy_wrap_exception_policy(result: Result<&2, &2, String, +List<U32>>, +vm: M.VM, thrown: U32, original: U32, wrapper_class: U32) -> M.VM:
+  match result:
+    case Fail{error}: S.fail(vm, error)
+    case Done{+exceptions}:
+      +declared : Bool = proxy_declared_exception(100000n, thrown, exceptions, S.classes(vm), S.symbols(vm))
+      +wrapper_entry : M.HeapEntry = proxy_exception_entry(wrapper_class, original)
+      Bool.pick(M.VM, declared, vm, proxy_wrap_exception_alloc(vm, H.allocate(vm, wrapper_entry)))
+
+def proxy_wrap_exception_checked(+vm: M.VM, thrown: U32, method_id: U32, +owners: +List<U32>) -> M.VM:
+  +original = S.exception(vm)
+  +wrapper_class = H.named_class(S.classes(vm), S.symbols(vm), "java/lang/reflect/UndeclaredThrowableException")
+  proxy_wrap_exception_policy(L.proxy_exception_policy(vm, method_id, owners), vm, thrown, original, wrapper_class)
+
+def proxy_wrap_exception_effect(effect: M.Effect, +vm: M.VM, +error: String) -> M.VM:
   match effect:
-    case M.ReflectConstructor{reference}: invoke_constructor(vm, method, args, caller, reference)
-    case M.ReflectCall{}: invoke_reflect(vm, method, args, caller)
-    case M.ProxyCall{descriptor, exceptions}: invoke_proxy(vm, method, args, caller)
-    case M.ClassForName{target}: invoke_class_initializer(vm, method, args, caller)
-    case _: invoke_arguments(vm, method, F.Arguments{caller, args}, S.frames(vm))
+    case M.ProxyCall{descriptor, method_id, +owners}:
+      +thrown = thrown_class_of(vm)
+      +runtime = H.named_class(S.classes(vm), S.symbols(vm), "java/lang/RuntimeException")
+      +error_class = H.named_class(S.classes(vm), S.symbols(vm), "java/lang/Error")
+      unchecked : Bool = H.assignable(S.classes(vm), S.symbols(vm), thrown, runtime) || H.assignable(S.classes(vm), S.symbols(vm), thrown, error_class)
+      Bool.pick(M.VM, unchecked, vm, proxy_wrap_exception_checked(vm, thrown, method_id, owners))
+    case _: vm
+def reflective_exception_fill(+entry: M.HeapEntry, original: U32) -> M.HeapEntry:
+  match entry:
+    case M.HeapEntry{kind_class, kind, element, +fields, values, chars}:
+      M.HeapEntry{kind_class, kind, element, H.binding_set(fields, 1, M.Slot{3, original}), values, chars}
 
-def invoke_outcome(+vm: M.VM, method: M.LoadedMethod, +args: +List<M.Slot>, caller: M.Frame) -> M.VM:
-  +effect = S.host_effect(vm)
-  invoke_outcome_effect(vm, method, args, caller, effect)
+def reflective_exception_entry(class: U32, original: U32) -> M.HeapEntry:
+  reflective_exception_fill(H.throwable_entry(class), original)
+
+def reflective_exception_wrap_alloc(+vm: M.VM, result: Result<&2, &2, String, H.Allocation>) -> M.VM:
+  match result:
+    case Fail{error}: S.fail(vm, error)
+    case Done{H.Allocation{vm, reference}}: S.with_exception(vm, reference)
+
+def boundary_exception(+vm: M.VM, effect: M.Effect) -> M.VM:
+  match effect:
+    case M.ReflectCall{}: reflective_exception_wrap_alloc(vm, H.allocate(vm, reflective_exception_entry(H.named_class(S.classes(vm), S.symbols(vm), "java/lang/reflect/InvocationTargetException"), S.exception(vm))))
+    case M.ReflectConstructor{reference}: reflective_exception_wrap_alloc(vm, H.allocate(vm, reflective_exception_entry(H.named_class(S.classes(vm), S.symbols(vm), "java/lang/reflect/InvocationTargetException"), S.exception(vm))))
+    case _: proxy_wrap_exception_effect(effect, vm, "java/lang/Throwable")
+
+type ThrowJob is Data:
+  ThrowStart{depth: U32}
+  ThrowCont{depth: U32, conts: +List<M.Cont>}
+  ThrowSame{depth: U32, effect: M.Effect, rest: +List<M.Cont>, same: Bool}
+
+@unsafe def boundary_throw_job(+vm: M.VM, job: ThrowJob) -> M.VM:
+  match job:
+    case ThrowStart{depth}: boundary_throw_job(S.with_status(vm, 6), ThrowCont{depth, host_cont(vm)})
+    case ThrowCont{+depth, conts}:
+      match conts:
+        case Con{M.CallBoundary{+expected, effect, descriptor}, rest}: boundary_throw_job(vm, ThrowSame{depth, effect, rest, U32.is_eq(expected, depth)})
+        case _: vm
+    case ThrowSame{+depth, effect, rest, True{}}: boundary_throw_job(boundary_exception(S.with_cont(vm, rest), effect), ThrowStart{depth})
+    case ThrowSame{depth, effect, rest, False{}}: vm
+
+def boundary_throw(+vm: M.VM, depth: U32) -> M.VM:
+  boundary_throw_job(vm, ThrowStart{depth})
+
+def boundary_intrinsic_value(result: Result<&2, &2, String, M.VM>, updated: M.VM) -> M.VM:
+  match result:
+    case Done{vm}: vm
+    case Fail{error}: S.fail(updated, error)
 
 def intrinsic_value(+vm: M.VM, frame: M.Frame, value: Maybe<&2, M.Slot>, max: U32) -> Result<&2, &2, String, M.VM>:
   match value:
@@ -373,6 +410,67 @@ def intrinsic_value(+vm: M.VM, frame: M.Frame, value: Maybe<&2, M.Slot>, max: U3
       do Result<&2, &2, String, M.VM>:
         pushed : M.Frame <- F.push(S.advance(frame), slot, max)
         return S.commit(vm, pushed)
+def boundary_intrinsic_return(+vm: M.VM, caller: M.Frame, result: Result<&2, &2, String, O.Outcome>) -> M.VM:
+  match result:
+    case Done{O.Returned{+updated, value}}: boundary_intrinsic_value(intrinsic_value(updated, caller, value, 65535), updated)
+    case Fail{error}: S.with_status(ensure_throw(vm, error), 6)
+    case _: S.fail(vm, "InvalidState: boundary return")
+
+
+type InvokeJob is Data:
+  JResult{caller: M.Frame, result: Result<&2, &2, String, O.Outcome>}
+  JReceiverKind{method: M.LoadedMethod, caller: M.Frame, reference: U32, rest: +List<M.Slot>, kind: U32}
+  JReceiverEntry{method: M.LoadedMethod, caller: M.Frame, reference: U32, rest: +List<M.Slot>, result: Result<&2, &2, String, M.HeapEntry>}
+  JDispatchReceiver{method: M.LoadedMethod, args: +List<M.Slot>, caller: M.Frame}
+  JDispatchKind{method: M.LoadedMethod, args: +List<M.Slot>, caller: M.Frame, kind: U32}
+  JDispatch{method: M.LoadedMethod, args: +List<M.Slot>, caller: M.Frame}
+  JBoundary{method: M.LoadedMethod, args: +List<M.Slot>, caller: M.Frame, effect: M.Effect}
+  JOutcomeEffect{method: M.LoadedMethod, args: +List<M.Slot>, caller: M.Frame, effect: M.Effect}
+  JOutcome{method: M.LoadedMethod, args: +List<M.Slot>, caller: M.Frame}
+
+@unsafe def invoke_job(+vm: M.VM, job: InvokeJob) -> M.VM:
+  match job:
+    case JResult{+caller, result}:
+      match result:
+        case Fail{error}: boundary_throw(ensure_throw(vm, error), M.length(M.Frame, S.frames(vm)))
+        case Done{O.Returned{+updated, Some{value}}}:
+          boundary_intrinsic_return(updated, caller, boundary_result(updated, value, M.length(M.Frame, S.frames(updated)), host_cont(updated)))
+        case Done{O.Returned{+updated, None{}}}:
+          boundary_intrinsic_return(updated, caller, boundary_result(updated, M.Slot{3, 0}, M.length(M.Frame, S.frames(updated)), host_cont(updated)))
+        case Done{O.Call{+updated, method, args}}: invoke_job(updated, JOutcome{method, args, caller})
+        case Done{O.ThrownRef{+updated, reference}}: boundary_throw(S.with_status(S.with_exception(updated, reference), 6), M.length(M.Frame, S.frames(updated)))
+        case Done{O.ThrownName{+updated, error}}: boundary_throw(ensure_throw(updated, error), M.length(M.Frame, S.frames(updated)))
+        case Done{O.Suspend{updated, effect}}: S.with_effect(updated, effect)
+    case JReceiverKind{+method, caller, +reference, +rest, kind}:
+      match kind:
+        case 10: invoke_job(vm, JResult{caller, L.proxy_invoke(vm, method, Con{M.Slot{3, reference}, rest}, Sy.text(S.symbols(vm), M.loaded_method_name(method)), Sy.text(S.symbols(vm), M.loaded_method_descriptor(method)))})
+        case _: invoke_arguments(vm, method, F.Arguments{caller, Con{M.Slot{3, reference}, rest}}, S.frames(vm))
+    case JReceiverEntry{+method, caller, +reference, +rest, result}:
+      match result:
+        case Done{entry}: invoke_job(vm, JReceiverKind{method, caller, reference, rest, L.entry_kind(entry)})
+        case _: invoke_arguments(vm, method, F.Arguments{caller, Con{M.Slot{3, reference}, rest}}, S.frames(vm))
+    case JDispatchReceiver{+method, +args, caller}:
+      match args:
+        case Con{M.Slot{3, +reference}, rest}: invoke_job(vm, JReceiverEntry{method, caller, reference, rest, H.get(S.heap(vm), reference)})
+        case _: invoke_arguments(vm, method, F.Arguments{caller, args}, S.frames(vm))
+    case JDispatchKind{+method, +args, caller, kind}:
+      match kind:
+        case 0: invoke_job(vm, JDispatchReceiver{method, args, caller})
+        case _: invoke_job(vm, JResult{caller, I.execute_vm(kind, vm, args)})
+    case JDispatch{+method, +args, caller}: invoke_job(vm, JDispatchKind{method, args, caller, method_intrinsic(method)})
+    case JBoundary{+method, +args, caller, effect}: invoke_job(boundary_push(vm, effect, M.loaded_method_descriptor(method)), JDispatch{method, args, caller})
+    case JOutcomeEffect{+method, +args, +caller, effect}:
+      match effect:
+        case M.ReflectConstructor{reference}: invoke_job(vm, JBoundary{method, args, caller, M.ReflectConstructor{reference}})
+        case M.ReflectCall{}: invoke_job(vm, JBoundary{method, args, caller, M.ReflectCall{}})
+        case M.ProxyCall{descriptor, method_id, owners}: invoke_job(vm, JBoundary{method, args, caller, S.host_effect(vm)})
+        case M.ClassForName{target}: invoke_class_initializer(vm, method, args, caller)
+        case _: invoke_arguments(vm, method, F.Arguments{caller, args}, S.frames(vm))
+    case JOutcome{+method, +args, caller}: invoke_job(vm, JOutcomeEffect{method, args, caller, S.host_effect(vm)})
+
+def invoke_outcome(+vm: M.VM, method: M.LoadedMethod, +args: +List<M.Slot>, caller: M.Frame) -> M.VM:
+  invoke_job(vm, JOutcome{method, args, caller})
+
 
 def intrinsic_outcome(frame: M.Frame, max: U32, outcome: O.Outcome) -> Result<&2, &2, String, M.VM>:
   match outcome:
@@ -393,10 +491,60 @@ def intrinsic_result(frame: M.Frame, max: U32, result: Result<&2, &2, String, O.
     case Done{outcome}:
       intrinsic_outcome(frame, max, outcome)
 
+def reflection_field_initialization(+vm: M.VM, +values: +List<M.Slot>) -> Result<&2, &2, String, U32>:
+  do Result<&2, &2, String, U32>:
+    +field : M.LoadedField <- L.reflect_field_member(vm, values)
+    return Bool.pick(U32, U32.is_ne(U32.and(M.loaded_field_flags(field), 8), 0), M.loaded_field_owner(field), 4294967295)
+def intrinsic_initialization_kind(+vm: M.VM, +values: +List<M.Slot>, kind: U32) -> Result<&2, &2, String, U32>:
+  match kind:
+    case 179: reflection_field_initialization(vm, values)
+    case 180: reflection_field_initialization(vm, values)
+    case 181: reflection_field_initialization(vm, values)
+    case 182: reflection_field_initialization(vm, values)
+    case 183:
+      do Result<&2, &2, String, U32>:
+        +member : M.LoadedMethod <- L.reflect_method_member(vm, values)
+        return Bool.pick(U32, U32.is_ne(U32.and(M.loaded_method_flags(member), 8), 0), M.loaded_method_owner(member), 4294967295)
+    case 184:
+      do Result<&2, &2, String, U32>:
+        member : M.LoadedMethod <- L.reflect_constructor_member(vm, values)
+        return M.loaded_method_owner(member)
+    case 310: Done{L.class_id(vm, "java/lang/annotation/RetentionPolicy")}
+    case 311: Done{L.class_id(vm, "java/lang/annotation/RetentionPolicy")}
+    case 312: Done{L.class_id(vm, "java/lang/annotation/ElementType")}
+    case 313: Done{L.class_id(vm, "java/lang/annotation/ElementType")}
+    case _: Done{4294967295}
+
+def intrinsic_initialization_target(+vm: M.VM, +method: M.LoadedMethod, +values: +List<M.Slot>) -> Result<&2, &2, String, U32>:
+  intrinsic_initialization_kind(vm, values, method_intrinsic(method))
+
+
+def initialize_retry_start(start: L.ClassForNameStart) -> Result<&2, &2, String, M.VM>:
+  match start:
+    case L.ClassForNameReady{vm}: Done{vm}
+    case L.ClassForNameCall{+vm, +owner, +method}:
+      +ready : M.VM = S.set_class_state(vm, owner, 1)
+      Done{S.with_frames(ready, Con{M.Frame{M.loaded_method_id(method), 0, 0, M.zeros(U32.to_nat(method_max_locals(method))), Nil{}, owner}, S.frames(ready)})}
+def initialize_retry(+vm: M.VM, target: U32) -> Result<&2, &2, String, M.VM>:
+  do Result<&2, &2, String, M.VM>:
+    start : L.ClassForNameStart <- L.class_for_name_walk(256n, vm, target)
+    result : M.VM <- initialize_retry_start(start)
+    return result
+
+
+def intrinsic_initialized(start: L.ClassForNameStart, method: M.LoadedMethod, frame: M.Frame, values: +List<M.Slot>, max: U32) -> Result<&2, &2, String, M.VM>:
+  match start:
+    case L.ClassForNameReady{+vm}: intrinsic_result(frame, max, I.execute_vm(method_intrinsic(method), vm, values))
+    case _: initialize_retry_start(start)
 def intrinsic_args(+vm: M.VM, +method: M.LoadedMethod, args: F.Arguments, max: U32) -> Result<&2, &2, String, M.VM>:
   match args:
-    case F.Arguments{frame, values}:
-      intrinsic_result(frame, max, I.execute_vm(method_intrinsic(method), vm, values))
+    case F.Arguments{frame, +values}:
+      do Result<&2, &2, String, M.VM>:
+        target : U32 <- intrinsic_initialization_target(vm, method, values)
+        start : L.ClassForNameStart <- L.class_for_name_walk(256n, vm, target)
+        result : M.VM <- intrinsic_initialized(start, method, frame, values, max)
+        return result
+
 
 def dispatch_intrinsic(+vm: M.VM, method: M.LoadedMethod, args: F.Arguments, intrinsic: U32, max: U32) -> Result<&2, &2, String, M.VM>:
   match intrinsic:
@@ -1811,13 +1959,6 @@ def method_handlers(value: M.LoadedMethod) -> +List<M.Handler>:
 def java_fault(error: String) -> Bool:
   String.starts_with(error, "java/")
 
-def thrown_class_entry(result: Result<&2, &2, String, M.HeapEntry>) -> U32:
-  match result:
-    case Fail{error}: 0
-    case Done{entry}: H.entry_class(entry)
-
-def thrown_class_of(+vm: M.VM) -> U32:
-  thrown_class_entry(H.get(S.heap(vm), S.exception(vm)))
 
 def catch_matches_id(+vm: M.VM, +thrown: U32, found: Maybe<&2, U32>) -> Bool:
   match found:
@@ -1848,31 +1989,6 @@ def enter_handler(+vm: M.VM, frame: M.Frame, target: U32, fuel: Nat, continue: U
   +resumed = S.tick(S.with_status(S.commit(vm, S.frame_stack(S.frame_pc(frame, target), Con{M.Slot{3, S.exception(vm)}, Nil{}})), 0))
   +cleared = S.with_exception(resumed, 0)
   continue(S.status(cleared), fuel, cleared)
-def reflective_exception_fill(+entry: M.HeapEntry, original: U32) -> M.HeapEntry:
-  match entry:
-    case M.HeapEntry{kind_class, kind, element, +fields, values, chars}:
-      M.HeapEntry{kind_class, kind, element, H.binding_set(fields, 1, M.Slot{3, original}), values, chars}
-
-def reflective_exception_entry(class: U32, original: U32) -> M.HeapEntry:
-  reflective_exception_fill(H.throwable_entry(class), original)
-
-def reflective_exception_wrap_alloc(+vm: M.VM, result: Result<&2, &2, String, H.Allocation>) -> M.VM:
-  match result:
-    case Fail{error}: S.fail(vm, error)
-    case Done{H.Allocation{vm, reference}}: S.with_exception(vm, reference)
-
-def reflective_exception_wrap(+vm: M.VM, effect: M.Effect, caller: M.Frame) -> M.VM:
-  match effect:
-    case M.ReflectCall{}:
-      Bool.pick(M.VM, U32.is_eq(S.initializing(caller), 4294967294),
-        reflective_exception_wrap_alloc(vm, H.allocate(vm, reflective_exception_entry(H.named_class(S.classes(vm), S.symbols(vm), "java/lang/reflect/InvocationTargetException"), S.exception(vm)))),
-        vm)
-    case M.ReflectConstructor{reference}:
-      Bool.pick(M.VM, U32.is_le(S.initializing(caller), 4294967292),
-        reflective_exception_wrap_alloc(vm, H.allocate(vm, reflective_exception_entry(H.named_class(S.classes(vm), S.symbols(vm), "java/lang/reflect/InvocationTargetException"), S.exception(vm)))),
-        vm)
-    case _:
-      vm
 
 
 def fail_initializer_state(+vm: M.VM, owner: U32) -> M.VM:
@@ -1895,7 +2011,7 @@ def handler_target(found: Maybe<&2, U32>) -> U32:
     case Nil{}: uncaught(fail_initializer(vm, caller), error)
     case Con{+next_caller, +next_callers}:
       +next = S.with_frames(fail_initializer(vm, caller), Con{next_caller, next_callers})
-      +wrapped = reflective_exception_wrap(next, S.host_effect(next), next_caller)
+      +wrapped = boundary_throw(next, M.length(M.Frame, S.frames(next)))
       +target = handler_target(frame_exception_handler(wrapped, next_caller, S.invoke_pc(caller)))
       Bool.pick(M.VM, U32.is_eq(target, 4294967295), exception_unwind_miss(error, wrapped, next_caller, next_callers, fuel, k), enter_handler(wrapped, next_caller, target, fuel, k))
 
@@ -1913,7 +2029,7 @@ def exception_unwind(+error: String, +vm: M.VM, +frames: +List<M.Frame>, +fuel: 
         case Nil{}: uncaught(fail_initializer(vm, current), error)
         case Con{+caller, callers}:
           +next = S.with_frames(fail_initializer(vm, current), Con{caller, callers})
-          +wrapped = reflective_exception_wrap(next, S.host_effect(next), caller)
+          +wrapped = boundary_throw(next, M.length(M.Frame, S.frames(next)))
           +target = handler_target(frame_exception_handler(wrapped, caller, S.invoke_pc(current)))
           exception_unwind_choice(U32.is_eq(target, 4294967295), error, wrapped, caller, callers, fuel, k, target)
 
@@ -1923,46 +2039,11 @@ def exception_resume_found(error: String, +vm: M.VM, +frame: M.Frame, fuel: Nat,
     case None{}: exception_unwind(error, vm, S.frames(vm), fuel, continue)
     case Some{target}: enter_handler(vm, frame, target, fuel, continue)
 
-def proxy_exception_entry_found(original: U32, entry: M.HeapEntry) -> M.HeapEntry:
-  M.HeapEntry{kind_class, kind, element, fields, values, chars} = entry
-  M.HeapEntry{kind_class, kind, element, H.binding_set(fields, 1, M.Slot{3, original}), values, chars}
 
-def proxy_exception_entry(class: U32, original: U32) -> M.HeapEntry:
-  proxy_exception_entry_found(original, H.throwable_entry(class))
-
-def proxy_wrap_exception_alloc(+vm: M.VM, result: Result<&2, &2, String, H.Allocation>) -> M.VM:
-  match result:
-    case Fail{error}: S.fail(vm, error)
-    case Done{H.Allocation{vm, reference}}: S.with_exception(vm, reference)
-
-def proxy_declared_exception(fuel: Nat, +thrown: U32, +exceptions: +List<U32>, +classes: +List<M.LoadedClass>, +symbols: +List<String>) -> Bool:
-  match fuel exceptions:
-    case 0n _: False{}
-    case 1n+remaining Nil{}: False{}
-    case 1n+remaining Con{declared, rest}:
-      H.assignable(classes, symbols, thrown, declared) || proxy_declared_exception(remaining, thrown, rest, classes, symbols)
-
-def proxy_wrap_exception_effect(effect: M.Effect, +vm: M.VM, +error: String) -> M.VM:
-  match effect:
-    case M.ProxyCall{descriptor, +exceptions}:
-      +thrown = thrown_class_of(vm)
-      +runtime = H.named_class(S.classes(vm), S.symbols(vm), "java/lang/RuntimeException")
-      +error_class = H.named_class(S.classes(vm), S.symbols(vm), "java/lang/Error")
-      unchecked : Bool = H.assignable(S.classes(vm), S.symbols(vm), thrown, runtime) || H.assignable(S.classes(vm), S.symbols(vm), thrown, error_class)
-      declared : Bool = proxy_declared_exception(256n, thrown, exceptions, S.classes(vm), S.symbols(vm))
-      +original = S.exception(vm)
-      +wrapper_class = H.named_class(S.classes(vm), S.symbols(vm), "java/lang/reflect/UndeclaredThrowableException")
-      wrapper_entry : M.HeapEntry = proxy_exception_entry(wrapper_class, original)
-      Bool.pick(M.VM, unchecked || declared, vm, proxy_wrap_exception_alloc(vm, H.allocate(vm, wrapper_entry)))
-    case _: vm
-
-def proxy_wrap_exception(+vm: M.VM, +error: String) -> M.VM:
-  proxy_wrap_exception_effect(S.host_effect(vm), vm, error)
 
 def exception_resume_java(+error: String, +vm: M.VM, +frame: M.Frame, method: M.LoadedMethod, fuel: Nat, continue: U32 -> Nat -> M.VM -> M.VM) -> M.VM:
   +ready = ensure_throw(vm, error)
-  +wrapped = proxy_wrap_exception(ready, error)
-  exception_resume_found(error, wrapped, frame, fuel, continue, exception_handler(wrapped, S.pc(frame), thrown_class_of(wrapped), method_handlers(method)))
+  exception_resume_found(error, ready, frame, fuel, continue, exception_handler(ready, S.pc(frame), thrown_class_of(ready), method_handlers(method)))
 
 def exception_resume_kind(java: Bool, error: String, +vm: M.VM, +frame: M.Frame, method: M.LoadedMethod, fuel: Nat, continue: U32 -> Nat -> M.VM -> M.VM) -> M.VM:
   match java:
@@ -1984,10 +2065,23 @@ def run_instruction(found: Maybe<&2, M.Instruction>, fuel: Nat, +vm: M.VM, +fram
     case None{}: exception_resume("InvalidState: program counter", vm, frame, method, fuel, continue)
     case Some{instruction}: step_continue(step(vm, frame, method, instruction), fuel, vm, frame, method, continue)
 
+def run_native_initializer(fuel: Nat, +vm: M.VM, frame: M.Frame, method: M.LoadedMethod, continue: U32 -> Nat -> M.VM -> M.VM, result: Result<&2, &2, String, O.Outcome>) -> M.VM:
+  match result:
+    case Done{O.Returned{+updated, value}}:
+      +next : M.VM = finish_void(S.set_class_state(updated, M.loaded_method_owner(method), 2))
+      continue(S.status(next), fuel, next)
+    case Fail{error}: exception_resume(error, vm, frame, method, fuel, continue)
+    case _: S.fail(vm, "InvalidState: native initializer outcome")
+def run_method_intrinsic(intrinsic: U32, fuel: Nat, +vm: M.VM, +frame: M.Frame, +method: M.LoadedMethod, continue: U32 -> Nat -> M.VM -> M.VM) -> M.VM:
+  match intrinsic:
+    case 317: run_native_initializer(fuel, vm, frame, method, continue, L.standard_enum_clinit(vm, Nil{}, M.loaded_method_owner(method)))
+    case _: run_instruction(method_instruction(method, S.pc(frame)), fuel, vm, frame, method, continue)
 def run_method(found: Maybe<&2, M.LoadedMethod>, fuel: Nat, +vm: M.VM, +frame: M.Frame, continue: U32 -> Nat -> M.VM -> M.VM) -> M.VM:
   match found:
     case None{}: S.fail(vm, "InvalidState: method id")
-    case Some{+method}: run_instruction(method_instruction(method, S.pc(frame)), fuel, vm, frame, method, continue)
+    case Some{+method}: run_method_intrinsic(method_intrinsic(method), fuel, vm, frame, method, continue)
+
+
 
 def run_frames(fuel: Nat, +vm: M.VM, frames: +List<M.Frame>, continue: U32 -> Nat -> M.VM -> M.VM) -> M.VM:
   match frames:
@@ -2092,8 +2186,11 @@ def resume_ok_effect(+vm: M.VM, +handle: U32, extra: U32, bytes: +List<U32>, eff
     case M.Idle{}: resume_clear(vm)
     case M.ReflectCall{}: resume_clear(vm)
     case M.ReflectConstructor{reference}: resume_clear(vm)
-    case M.ProxyCall{descriptor, exceptions}: resume_clear(vm)
+    case M.ProxyCall{descriptor, method_id, owners}: resume_clear(vm)
     case M.ClassForName{target}: resume_clear(vm)
+    case M.RuntimeClass{name, initialize, loader}: resume_clear(vm)
+    case M.InitCall{target, intrinsic, args}: resume_clear(vm)
+    case M.ReadResource{name, origin}: resume_clear(vm)
     case M.OpenFile{path, mode, receiver}: resume_open_to(vm, handle, receiver)
     case M.StatPath{path, op}: resume_int(vm, extra)
     case M.ReadBytes{old, count, timeout}: resume_read_bytes(bytes, vm)

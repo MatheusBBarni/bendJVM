@@ -3139,10 +3139,22 @@ recursive `@Inherited` lookup, repeatable containers, structural equality, and
 enum identity. Interface dynamic proxies route supported calls through
 `InvocationHandler`, retain generated proxy/interface identity in VM-managed
 mirrors, box category-one arguments, and wrap undeclared checked throwables.
-Category-two annotation values are retained but rejected at materialization.
-Complete Java access-edge compatibility, proxy method-conflict/default-method
-and loader-namespace rules, parent/complex static-initialization semantics,
-URL escaping, and exact annotation formatting remain bounded or unsupported.
+Supported generic accessors are `Method.getGenericReturnType`,
+`Method.getGenericParameterTypes`, `Method.getGenericExceptionTypes`,
+`Field.getGenericType`, and `Class.getGenericSuperclass`.
+
+Java 8 `Signature` metadata exposes generic method return/parameter/exception,
+field, and superclass types through `Type`, `ParameterizedType`, `TypeVariable`,
+`GenericArrayType`, and `WildcardType`. `AnnotatedType` covers method
+return/parameter types and field type-argument paths. Class type parameters,
+generic interfaces, and local-variable/expression type-annotation queries
+remain unsupported; parsed metadata is retained.
+Wide annotation constants materialize as boxed raw-word `Long`/`Double`
+reflection values; general category-two bytecode, field, and call execution
+remains unsupported. Complete Java access-edge compatibility, default-method
+proxy dispatch and loader-namespace rules, parent/complex static-initialization
+semantics, URL escaping, and exact annotation formatting remain bounded or
+unsupported.
 Structured annotation attributes are validated and
 retained through catalog linking, including visible/invisible declaration,
 parameter, type, default, and `Exceptions` records.

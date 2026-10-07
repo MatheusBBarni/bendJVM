@@ -9,7 +9,7 @@ import ./library.bend as L
 import ../runtime/wide.bend as W
 type LongState is Data:
   Pending{division: W.Division}
-  Ready{quotient: W.Words, remainder: W.Words, zero: Bool}
+  DivisionReady{quotient: W.Words, remainder: W.Words, zero: Bool}
 
 
 
@@ -71,8 +71,8 @@ def float_show(+bits: U32) -> String:
     case 1n+p Some{Pending{division}}:
       match division:
         case W.Division{+quotient, remainder}:
-          long_digits(n, value, acc, Some{Ready{quotient, remainder, W.long_zero(quotient)}})
-    case 1n+p Some{Ready{quotient, remainder, zero}}:
+          long_digits(n, value, acc, Some{DivisionReady{quotient, remainder, W.long_zero(quotient)}})
+    case 1n+p Some{DivisionReady{quotient, remainder, zero}}:
       match zero:
         case True{}:
           SCon{Chr{U32.add(48, W.long_to_int(remainder))}, acc}
@@ -159,7 +159,7 @@ def execute(id: U32, +heap: +List<M.HeapEntry>, +args: +List<M.Slot>) -> Result<
       Fail{"MissingMethod: unknown intrinsic"}
 
 def resource_match(resource: M.Resource, +name: String) -> Bool:
-  M.Resource{resource_name, bytes, origin} = resource
+  M.Resource{resource_name, origin} = resource
   String.eq(resource_name, name)
 
 def resource_find(resources: +List<M.Resource>, +name: String) -> Maybe<&2, M.Resource>:
@@ -183,22 +183,9 @@ def receiver(args: +List<M.Slot>) -> Result<&2, &2, String, U32>:
     case _:
       Fail{"InvalidState: intrinsic argument count"}
 
-def open_resource_allocation(+vm: M.VM, allocation: Result<&2, &2, String, H.Allocation>) -> Result<&2, &2, String, O.Outcome>:
-  match allocation:
-    case Fail{error}: Fail{error}
-    case Done{allocation_value}:
-      match allocation_value:
-        case H.Allocation{updated, reference}:
-          Done{O.Returned{updated, Some{M.Slot{3, reference}}}}
 
 def open_resource_found(+vm: M.VM, found: Maybe<&2, M.Resource>) -> Result<&2, &2, String, O.Outcome>:
-  match found:
-    case None{}:
-      Done{O.Returned{vm, Some{M.Slot{3, 0}}}}
-    case Some{resource}:
-      match resource:
-        case M.Resource{resource_name, +bytes, origin}:
-          open_resource_allocation(vm, H.allocate(vm, H.stream_entry(class_id_find(S.classes(vm), S.symbols(vm), "java/io/InputStream"), bytes)))
+  L.resource_stream_found(vm, found)
 
 def open_resource(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
@@ -218,8 +205,7 @@ def stream_eof(+vm: M.VM) -> Result<&2, &2, String, O.Outcome>:
 
 def stream_read_state(+vm: M.VM, +reference: U32, class: U32, +position: U32, fields: +List<M.Binding>, +values: +List<M.Slot>, chars: +List<U32>, closed: Bool) -> Result<&2, &2, String, O.Outcome>:
   match closed:
-    case True{}:
-      stream_eof(vm)
+    case True{}: Fail{"java/io/IOException"}
     case False{}:
       Bool.pick(Result<&2, &2, String, O.Outcome>, U32.is_ge(position, M.length(M.Slot, values)), stream_eof(vm), stream_read_byte(vm, reference, class, position, fields, values, chars))
 
@@ -757,6 +743,33 @@ def println_out(+vm: M.VM, +args: +List<M.Slot>, id: U32) -> Result<&2, &2, Stri
     result : O.Outcome <- println_emit(vm, output)
     return result
 
+
+def println_object_string(name: String, +heap: +List<M.HeapEntry>, +ref: U32, string: Bool) -> Result<&2, &2, String, String>:
+  match string:
+    case True{}: string_value(heap, ref, False{})
+    case False{}: Done{name}
+
+def println_object_ref(+vm: M.VM, +reference: U32, null: Bool) -> Result<&2, &2, String, String>:
+  match null:
+    case True{}: Done{"null"}
+    case False{}:
+      do Result<&2, &2, String, String>:
+        +heap : +List<M.HeapEntry> = S.heap(vm)
+        +entry : M.HeapEntry <- H.get(heap, reference)
+        +name : String = class_text(vm, H.entry_class(entry))
+        text : String <- println_object_string(name, heap, reference, String.eq(name, "java/lang/String"))
+        return text
+
+def println_object_text(+vm: M.VM, +reference: U32) -> Result<&2, &2, String, String>:
+  println_object_ref(vm, reference, U32.is_eq(reference, 0))
+
+def println_object(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    reference : U32 <- argument(args, 3)
+    text : String <- println_object_text(vm, reference)
+    result : O.Outcome <- L.void_out(S.emit(vm, text))
+    return result
+
 def execute_vm(id: U32, +vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   match id:
     case 1: L.object_init(vm, args)
@@ -767,6 +780,8 @@ def execute_vm(id: U32, +vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, Strin
     case 6: println_out(vm, args, 6)
     case 281: println_out(vm, args, 281)
     case 282: println_out(vm, args, 282)
+    case 318: println_object(vm, args)
+
     case 9: open_resource(vm, args)
     case 10: read_stream(vm, args)
     case 11: close_stream(vm, args)
@@ -859,13 +874,20 @@ def execute_vm(id: U32, +vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, Strin
     case 302: L.reflect_field_generic_type(vm, args)
     case 303: L.reflect_field_annotated_type(vm, args)
     case 304: L.class_generic_superclass(vm, args)
+    case 310: L.standard_enum_values(vm, args, L.class_id(vm, "java/lang/annotation/RetentionPolicy"))
+    case 311: L.standard_enum_value_of(vm, args, L.class_id(vm, "java/lang/annotation/RetentionPolicy"))
+    case 312: L.standard_enum_values(vm, args, L.class_id(vm, "java/lang/annotation/ElementType"))
+    case 313: L.standard_enum_value_of(vm, args, L.class_id(vm, "java/lang/annotation/ElementType"))
+    case 314: L.annotation_exception_init(vm, args)
+    case 315: L.annotation_exception_first(vm, args)
+    case 316: L.annotation_exception_second(vm, args)
     case 137: L.reflect_constructor_name(vm, args)
     case 138: L.reflect_constructor_modifiers(vm, args)
     case 139: L.reflect_constructor_parameter_types(vm, args)
     case 179: L.reflect_field_get(vm, args)
     case 180: L.reflect_field_set(vm, args)
-    case 181: L.reflect_field_get(vm, args)
-    case 182: L.reflect_field_set(vm, args)
+    case 181: L.reflect_field_get_int(vm, args)
+    case 182: L.reflect_field_set_int(vm, args)
     case 183: L.reflect_method_invoke(vm, args)
     case 184: L.reflect_constructor_new_instance(vm, args)
     case 185: L.class_is_instance(vm, args)
@@ -940,6 +962,7 @@ def execute_vm(id: U32, +vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, Strin
     case 253: L.reflect_method_is_bridge(vm, args)
     case 254: L.reflect_method_is_synthetic(vm, args)
     case 255: L.reflect_method_is_varargs(vm, args)
+    case 244: L.reflect_method_get_exception_types(vm, args)
     case 256: L.reflect_constructor_get_exception_types(vm, args)
     case 257: L.reflect_constructor_is_synthetic(vm, args)
     case 258: L.reflect_constructor_is_varargs(vm, args)

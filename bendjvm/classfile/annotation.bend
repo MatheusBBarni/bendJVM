@@ -258,15 +258,15 @@ type ParsedAttribute is Data:
   ParsedExceptions{values: +List<U32>}
 
 type MetaState is Data:
-  MetaState{flags: U32, exceptions: +List<U32>, annotations: +List<M.Annotation>, parameters: +List<+List<M.Annotation>>, types: +List<M.TypeAnnotation>, defaultValue: Maybe<&2, M.AnnotationValue>}
+  MetaState{flags: U32, exceptions: +List<U32>, annotations: +List<M.Annotation>, parameters: +List<+List<M.Annotation>>, types: +List<M.TypeAnnotation>, defaultValue: Maybe<&2, M.AnnotationValue>, invisibleAnnotations: +List<M.Annotation>, invisibleParameters: +List<+List<M.Annotation>>, invisibleTypes: +List<M.TypeAnnotation>}
 
 def meta_empty() -> MetaState:
-  MetaState{0, Nil{}, Nil{}, Nil{}, Nil{}, None{}}
+  MetaState{0, Nil{}, Nil{}, Nil{}, Nil{}, None{}, Nil{}, Nil{}, Nil{}}
 
 def meta_result(state: MetaState) -> M.AnnotationMetadata:
   match state:
-    case MetaState{flags, exceptions, annotations, parameters, types, defaultValue}:
-      M.AnnotationMetadata{flags, exceptions, annotations, parameters, types, defaultValue}
+    case MetaState{flags, exceptions, annotations, parameters, types, defaultValue, ia, ip, it}:
+      M.AnnotationMetadata{flags, exceptions, annotations, parameters, types, defaultValue, ia, ip, it}
 
 def kind_after_invisible_annotations(ok: Bool) -> AttrKind:
   match ok:
@@ -419,7 +419,7 @@ def localvar_target(length_word: R.RWord) -> Result<&2, &2, String, WordsRead>:
     case R.RWord{reader, +value}:
       do Result<&2, &2, String, WordsRead>:
         count_table(value)
-        words_u2(U32.to_nat((1 + value * 3 : U32)), reader, Con{value, Nil{}})
+        words_u2(U32.to_nat((value * 3 : U32)), reader, Con{value, Nil{}})
 
 def target_offset_word(word: R.RWord) -> Result<&2, &2, String, WordsRead>:
   match word:
@@ -469,6 +469,10 @@ def target_info(target: U32, reader: R.Reader) -> Result<&2, &2, String, WordsRe
       words_u2(1n, reader, Nil{})
     case 68:
       words_u2(1n, reader, Nil{})
+    case 69:
+      words_u2(1n, reader, Nil{})
+    case 70:
+      words_u2(1n, reader, Nil{})
     case 71:
       target_offset(R.read_u2(reader))
     case 72:
@@ -485,9 +489,10 @@ def target_info(target: U32, reader: R.Reader) -> Result<&2, &2, String, WordsRe
 
 def path_index_word(count: Nat, +kind: U32, acc: +List<U32>, word: R.RWord, next: Nat -> R.Reader -> +List<U32> -> Result<&2, &2, String, PathRead>) -> Result<&2, &2, String, PathRead>:
   match word:
-    case R.RWord{reader, value}:
+    case R.RWord{reader, +value}:
       do Result<&2, &2, String, PathRead>:
         require_annotation(U32.is_le(kind, 3), "invalid type_path kind")
+        require_annotation(Bool.or(U32.is_eq(kind, 3), U32.is_eq(value, 0)), "nonzero type_path index")
         next(count, reader, Con{value, Con{kind, acc}})
 
 def path_index_result(count: Nat, kind: U32, acc: +List<U32>, result: Result<&2, &2, String, R.RWord>, next: Nat -> R.Reader -> +List<U32> -> Result<&2, &2, String, PathRead>) -> Result<&2, &2, String, PathRead>:
@@ -559,12 +564,19 @@ def enum_type_result(+pool: +List<M.Constant>, result: Result<&2, &2, String, R.
 def enum_type(reader: R.Reader, +pool: +List<M.Constant>, depth: U32) -> Result<&2, &2, String, ValueRead>:
   enum_type_result(pool, R.read_u2(reader))
 
+def class_value_descriptor_result(result: Result<&2, &2, String, M.JvmType>) -> Bool:
+  match result:
+    case Done{value}: True{}
+    case Fail{error}: False{}
+
+def class_value_descriptor(text: String) -> Bool:
+  class_value_descriptor_result(D.parse_field(text))
 def class_value_word(+pool: +List<M.Constant>, word: R.RWord) -> Result<&2, &2, String, ValueRead>:
   match word:
     case R.RWord{reader, +value}:
       do Result<&2, &2, String, ValueRead>:
-        text : String <- utf_annotation(pool, value)
-        field_descriptor_result(D.parse_field(text))
+        +text : String <- utf_annotation(pool, value)
+        require_annotation(Bool.or(String.eq(text, "V"), class_value_descriptor(text)), "invalid class descriptor")
         return ValueRead{reader, M.AnnotationClass{value}}
 
 def class_value_result(+pool: +List<M.Constant>, result: Result<&2, &2, String, R.RWord>) -> Result<&2, &2, String, ValueRead>:
@@ -576,6 +588,7 @@ def class_value_result(+pool: +List<M.Constant>, result: Result<&2, &2, String, 
 
 def class_value(reader: R.Reader, +pool: +List<M.Constant>) -> Result<&2, &2, String, ValueRead>:
   class_value_result(pool, R.read_u2(reader))
+
 
 
 @unsafe def nested_elements(elements: +List<M.AnnotationElement>) -> +List<M.AnnotationValue>:
@@ -674,9 +687,13 @@ def primitive_value(tag: U32, reader: R.Reader, +pool: +List<M.Constant>, depth:
         case 115:
           primitive_value(tag, reader, pool, depth)
         case 101:
-          enum_type(reader, pool, depth)
+          do Result<&2, &2, String, ValueRead>:
+            depth_check(depth)
+            enum_type(reader, pool, depth)
         case 99:
-          class_value(reader, pool)
+          do Result<&2, &2, String, ValueRead>:
+            depth_check(depth)
+            class_value(reader, pool)
         case 64:
           do Result<&2, &2, String, ValueRead>:
             result : ValueRead <- nested_annotation(annotation_cb(reader, pool, (depth + 1 : U32)))
@@ -687,7 +704,7 @@ def primitive_value(tag: U32, reader: R.Reader, +pool: +List<M.Constant>, depth:
             +count_word : R.RWord <- R.read_u2(reader)
             +array_count : U32 = word_value(count_word)
             count_elements(array_count)
-            result : ValueRead <- parse_value_core(~annotation_cb, 1, U32.to_nat(array_count), 0, word_reader(count_word), pool, depth, Nil{})
+            result : ValueRead <- parse_value_core(~annotation_cb, 1, U32.to_nat(array_count), 0, word_reader(count_word), pool, (depth + 1 : U32), Nil{})
             return result
         case _:
           Fail{"VmError.InvalidAnnotation: unknown annotation element_value tag"}
@@ -711,8 +728,9 @@ def primitive_value(tag: U32, reader: R.Reader, +pool: +List<M.Constant>, depth:
         next : ElementsRead <- elements_go(~annotation_cb, p, value_reader(value), pool, depth, Con{M.AnnotationElement{name, value_value(value)}, acc})
         return next
 
-@unsafe def annotation_core(~annotation_cb: @reader: R.Reader -> @+pool: +List<M.Constant> -> @depth: U32 -> Result<&2, &2, String, AnnotationRead>, reader: R.Reader, +pool: +List<M.Constant>, depth: U32) -> Result<&2, &2, String, AnnotationRead>:
+@unsafe def annotation_core(~annotation_cb: @reader: R.Reader -> @+pool: +List<M.Constant> -> @depth: U32 -> Result<&2, &2, String, AnnotationRead>, reader: R.Reader, +pool: +List<M.Constant>, +depth: U32) -> Result<&2, &2, String, AnnotationRead>:
   do Result<&2, &2, String, AnnotationRead>:
+    depth_check(depth)
     +type_word : R.RWord <- R.read_u2(reader)
     +type_index : U32 = word_value(type_word)
     annotation_descriptor(pool, type_index)
@@ -997,40 +1015,50 @@ def duplicate(bit: U32, flags: U32) -> Result<&2, &2, String, Unit>:
 
 def add_parsed(parsed: ParsedAttribute, state: MetaState) -> Result<&2, &2, String, MetaState>:
   match parsed state:
-    case ParsedUnknown{} MetaState{flags, exceptions, annotations, parameters, types, defaultValue}:
-      Done{MetaState{flags, exceptions, annotations, parameters, types, defaultValue}}
-    case ParsedVisibleAnnotations{values} MetaState{+flags, exceptions, annotations, parameters, types, defaultValue}:
+    case ParsedUnknown{} MetaState{flags, exceptions, annotations, parameters, types, defaultValue, ia, ip, it}:
+      Done{MetaState{flags, exceptions, annotations, parameters, types, defaultValue, ia, ip, it}}
+    case ParsedVisibleAnnotations{values} MetaState{+flags, exceptions, annotations, parameters, types, defaultValue, ia, ip, it}:
       do Result<&2, &2, String, MetaState>:
         duplicate(1, flags)
-        return MetaState{U32.or(flags, 1), exceptions, values, parameters, types, defaultValue}
-    case ParsedInvisibleAnnotations{values} MetaState{+flags, exceptions, annotations, parameters, types, defaultValue}:
+        return MetaState{U32.or(flags, 1), exceptions, values, parameters, types, defaultValue, ia, ip, it}
+    case ParsedInvisibleAnnotations{values} MetaState{+flags, exceptions, annotations, parameters, types, defaultValue, ia, ip, it}:
       do Result<&2, &2, String, MetaState>:
         duplicate(2, flags)
-        return MetaState{U32.or(flags, 2), exceptions, annotations, parameters, types, defaultValue}
-    case ParsedVisibleParameters{values} MetaState{+flags, exceptions, annotations, parameters, types, defaultValue}:
+        return MetaState{U32.or(flags, 2), exceptions, annotations, parameters, types, defaultValue, values, ip, it}
+    case ParsedVisibleParameters{values} MetaState{+flags, exceptions, annotations, parameters, types, defaultValue, ia, ip, it}:
       do Result<&2, &2, String, MetaState>:
         duplicate(4, flags)
-        return MetaState{U32.or(flags, 4), exceptions, annotations, values, types, defaultValue}
-    case ParsedInvisibleParameters{values} MetaState{+flags, exceptions, annotations, parameters, types, defaultValue}:
+        return MetaState{U32.or(flags, 4), exceptions, annotations, values, types, defaultValue, ia, ip, it}
+    case ParsedInvisibleParameters{values} MetaState{+flags, exceptions, annotations, parameters, types, defaultValue, ia, ip, it}:
       do Result<&2, &2, String, MetaState>:
         duplicate(8, flags)
-        return MetaState{U32.or(flags, 8), exceptions, annotations, parameters, types, defaultValue}
-    case ParsedVisibleTypes{values} MetaState{+flags, exceptions, annotations, parameters, types, defaultValue}:
+        return MetaState{U32.or(flags, 8), exceptions, annotations, parameters, types, defaultValue, ia, values, it}
+    case ParsedVisibleTypes{values} MetaState{+flags, exceptions, annotations, parameters, types, defaultValue, ia, ip, it}:
       do Result<&2, &2, String, MetaState>:
         duplicate(16, flags)
-        return MetaState{U32.or(flags, 16), exceptions, annotations, parameters, values, defaultValue}
-    case ParsedInvisibleTypes{values} MetaState{+flags, exceptions, annotations, parameters, types, defaultValue}:
+        return MetaState{U32.or(flags, 16), exceptions, annotations, parameters, values, defaultValue, ia, ip, it}
+    case ParsedInvisibleTypes{values} MetaState{+flags, exceptions, annotations, parameters, types, defaultValue, ia, ip, it}:
       do Result<&2, &2, String, MetaState>:
         duplicate(32, flags)
-        return MetaState{U32.or(flags, 32), exceptions, annotations, parameters, types, defaultValue}
-    case ParsedDefault{value} MetaState{+flags, exceptions, annotations, parameters, types, defaultValue}:
+        return MetaState{U32.or(flags, 32), exceptions, annotations, parameters, types, defaultValue, ia, ip, values}
+    case ParsedDefault{value} MetaState{+flags, exceptions, annotations, parameters, types, defaultValue, ia, ip, it}:
       do Result<&2, &2, String, MetaState>:
         duplicate(64, flags)
-        return MetaState{U32.or(flags, 64), exceptions, annotations, parameters, types, Some{value}}
-    case ParsedExceptions{values} MetaState{+flags, exceptions, annotations, parameters, types, defaultValue}:
+        return MetaState{U32.or(flags, 64), exceptions, annotations, parameters, types, Some{value}, ia, ip, it}
+    case ParsedExceptions{values} MetaState{+flags, exceptions, annotations, parameters, types, defaultValue, ia, ip, it}:
       do Result<&2, &2, String, MetaState>:
         duplicate(128, flags)
-        return MetaState{U32.or(flags, 128), values, annotations, parameters, types, defaultValue}
+        return MetaState{U32.or(flags, 128), values, annotations, parameters, types, defaultValue, ia, ip, it}
+
+# Sites: class=0, field=1, method=2, Code=3.
+def placement(kind: AttrKind, site: U32) -> Result<&2, &2, String, Unit>:
+  match kind:
+    case Unknown{}: Done{Unit{}}
+    case VisibleTypes{}: Done{Unit{}}
+    case InvisibleTypes{}: Done{Unit{}}
+    case VisibleAnnotations{}: require_annotation(U32.is_ne(site, 3), "declaration annotation in Code")
+    case InvisibleAnnotations{}: require_annotation(U32.is_ne(site, 3), "declaration annotation in Code")
+    case _: require_annotation(U32.is_eq(site, 2), "method annotation attribute on wrong owner")
 
 @unsafe def attributes_go(fuel: Nat, attributes: +List<M.Attribute>, +pool: +List<M.Constant>, state: MetaState) -> Result<&2, &2, String, MetaState>:
   match fuel attributes:
@@ -1040,6 +1068,8 @@ def add_parsed(parsed: ParsedAttribute, state: MetaState) -> Result<&2, &2, Stri
       Fail{"VmError.InvalidAnnotation: too many attributes"}
     case 1n+p Nil{}:
       Done{state}
+    case 1n+p Con{M.ValidatedAnnotations{metadata}, tail}:
+      attributes_go(p, tail, pool, state)
     case 1n+p Con{M.Attribute{name, +bytes}, tail}:
       do Result<&2, &2, String, MetaState>:
         +parsed : ParsedAttribute <- parse_one(classify(name), bytes, pool)
@@ -1063,8 +1093,11 @@ def classify_code(+name: String) -> AttrKind:
       Fail{"VmError.InvalidAnnotation: too many attributes"}
     case 1n+p Nil{}:
       Done{state}
-    case 1n+p Con{M.Attribute{name, +bytes}, tail}:
+    case 1n+p Con{M.ValidatedAnnotations{metadata}, tail}:
+      code_attributes_go(p, tail, pool, state)
+    case 1n+p Con{M.Attribute{+name, +bytes}, tail}:
       do Result<&2, &2, String, MetaState>:
+        placement(classify(name), 3)
         +parsed : ParsedAttribute <- parse_one(classify_code(name), bytes, pool)
         next_state : MetaState <- add_parsed(parsed, state)
         next : MetaState <- code_attributes_go(p, tail, pool, next_state)
@@ -1083,5 +1116,5 @@ def parse_code_metadata_attributes(attributes: +List<M.Attribute>, +pool: +List<
 
 def merge_code_metadata(base: M.AnnotationMetadata, code: M.AnnotationMetadata) -> M.AnnotationMetadata:
   match base code:
-    case M.AnnotationMetadata{+flags, +exceptions, +annotations, +parameters, +types, +defaultValue} M.AnnotationMetadata{codeFlags, codeExceptions, codeAnnotations, codeParameters, +codeTypes, codeDefault}:
-      M.AnnotationMetadata{U32.or(flags, codeFlags), exceptions, annotations, parameters, M.append(M.TypeAnnotation, types, codeTypes), defaultValue}
+    case M.AnnotationMetadata{+flags, +exceptions, +annotations, +parameters, +types, +defaultValue, +ia, +ip, +it} M.AnnotationMetadata{codeFlags, codeExceptions, codeAnnotations, codeParameters, +codeTypes, codeDefault, codeIa, codeIp, +codeIt}:
+      M.AnnotationMetadata{U32.or(flags, codeFlags), exceptions, annotations, parameters, M.append(M.TypeAnnotation, types, codeTypes), defaultValue, ia, ip, M.append(M.TypeAnnotation, it, codeIt)}

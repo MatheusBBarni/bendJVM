@@ -292,7 +292,7 @@ interface abstract (`0x0401`).
 | Collections | `ArrayList`/`List`/`Collection`/`Iterable`/`Iterator` and `HashMap`/`Map` as registered in bootstrap, including iterator `hasNext/next/remove` |
 | Streams | `InputStream.read()I`, `read([B)I`, `read([BII)I`, `close`; `OutputStream.write(I\|[B\|[BII)`, `flush`, `close`; `ByteArrayInputStream([B)`, `ByteArrayOutputStream` `toByteArray/size/reset` |
 | Files | `File(String)` `exists/isFile/isDirectory/getPath`; `FileInputStream(String)`; `FileOutputStream(String)` and `(String,Z)` |
-| Reflection / metadata | `Object.getClass()`, cached primitive/void/array/class mirrors and wrapper `TYPE` fields, `Class` name/superclass/modifier/array/interface/primitive/assignability/instance checks, annotation queries/materialization/defaults/repeatable expansion, `cast`, `forName(String)` and `forName(String,boolean,ClassLoader)`, `ClassLoader.loadClass(String)`, declared member arrays and exact name/parameter lookup, declaring-class/basic metadata accessors, per-handle `AccessibleObject.setAccessible/isAccessible`, `Field.get/set`, `Method.invoke`, and `Constructor.newInstance`; `Proxy`/`InvocationHandler` interface proxies, generated-class identity, category-one boxing, and handler lookup |
+| Reflection / metadata | `Object.getClass()`, cached primitive/void/array/class mirrors and wrapper `TYPE` fields, `Class` name/superclass/modifier/array/interface/primitive/assignability/instance checks, annotation queries/materialization/defaults/repeatable expansion, `cast`, `forName(String)` and `forName(String,boolean,ClassLoader)`, `ClassLoader.loadClass(String)`, declared member arrays and exact name/parameter lookup, declaring-class/basic metadata accessors, per-handle `AccessibleObject.setAccessible/isAccessible`, `Field.get/set`, `Method.invoke`, and `Constructor.newInstance`; generic accessors: `Class.getGenericSuperclass`, `Field.getGenericType`, `Method.getGenericReturnType/getGenericParameterTypes/getGenericExceptionTypes`; annotated accessors: `Field.getAnnotatedType`, `Method.getAnnotatedReturnType/getAnnotatedParameterTypes`; `Proxy`/`InvocationHandler` interface proxies, generated-class identity, category-one boxing, and handler lookup |
 | Resources / configuration | `Class`/`ClassLoader` relative/root lookup, ordered `getResources`, origin-bound `URL.openStream`, local URL path/protocol/string accessors, `Properties.load(InputStream)` and bounded UTF-8 `Properties.load(Reader)` for memory-backed `InputStreamReader`, `getProperty`/default getter/`setProperty`; lookup is ordered and first-match |
 | Text | `Reader.read()I`, `read([CII)I`, `close`; `Writer.write(I\|String\|[CII)`, `flush`, `close`; `InputStreamReader`/`OutputStreamWriter` `(stream, UTF-8)`; `BufferedReader.readLine` |
 | TCP | `InetSocketAddress(String,I)`; `Socket()V`, `(String,I)`, `connect(SocketAddress,I)`, `getInputStream`, `getOutputStream`, `setSoTimeout`, `close`; `ServerSocket(I)`, `getLocalPort`, `accept`, `setSoTimeout`, `close` |
@@ -316,6 +316,9 @@ loader and ordered interfaces, and wrap undeclared checked throwables.
 Method, field, and class `Signature` attributes expose generic return,
 parameter, exception, field, and superclass types, including parameterized
 type arguments and type-variable names.
+`AnnotatedType` covers method return/parameter types and field type-argument
+paths; class type parameters, generic interfaces, and local-variable/expression
+sites remain metadata-only.
 `Class.forName(name, initialize, null)` resolves bootstrap classes through the
 bootstrap loader. Caller package edges, default-method proxy dispatch,
 category-two bytecode execution, and complete OpenJDK formatting remain
@@ -353,10 +356,11 @@ BendJVM accepts Java 8 class files and ordered directory/JAR/ZIP classpaths, but
 intentionally does not provide full JVM or OpenJDK compatibility. It does not
 yet promise:
 
-- full reflection access-edge compatibility (caller package cases),
-  parameter-name reflection, or complete annotation formatting
-- modules, JNI, agents, custom class-loader subclasses, multiple application
-  namespaces, or runtime class publication
+- full reflection access-edge compatibility (caller package cases), complex
+  static-initialization edges, parameter-name reflection, or complete
+  annotation formatting
+- modules, JNI, agents, custom class-loader subclasses, arbitrary `defineClass`,
+  or multiple independent application-loader namespaces
 - `long` and `double` bytecode execution, category-two field/call conversion,
   or complete floating-point edge-case compatibility; annotation reflection
   only exposes boxed raw-word wide values

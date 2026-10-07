@@ -17,6 +17,7 @@ from pathlib import Path
 import random
 import re
 import shutil
+import signal
 import socket
 import struct
 import subprocess
@@ -37,7 +38,11 @@ NAMED = (
     "StaticMethod", "RecursiveMethod", "MultipleArguments", "ObjectCreation",
     "Fields", "VirtualMethod", "IntArray", "ObjectArray", "StringConstant",
     "Println", "ExceptionCaught", "ExceptionUncaught", "MetadataFixture",
-    "ReflectionAccess", "RepeatableAnnotation", "InheritedAnnotation", "EnumAnnotation", "ProxyIntegration", "ProxyExceptions", "DynamicLoadingFailure", "ReflectionIntegration", "CrossPackageReflection", "GenericSignature",
+    "AnnotationParserBoundaries", "ReflectionAccess", "RepeatableAnnotation",
+    "InheritedAnnotation", "EnumAnnotation", "ProxyIntegration", "ProxyExceptions",
+    "DynamicLoadingFailure", "ReflectionIntegration", "CrossPackageReflection",
+    "GenericSignature",
+    "ReflectionFixture",
 )
 EXTENDED = (
     "FloatOperations", "FloatArray", "InheritedFields", "ClassInitialization",
@@ -49,7 +54,8 @@ EXTENDED = (
 )
 SUPPORT = ("FuelLimit", "HeapLimit", "MutationTarget")
 FIXTURE_DEPENDENCIES = {
-    "CrossPackageReflection": ("CrossPackageTarget.java",),
+    "CrossPackageReflection": ("CrossPackageTarget.java", "CrossPackageSubclass.java"),
+    "ProxyIntegration": ("ProxyHidden.java", "ProxyOtherHidden.java"),
 }
 
 FixtureValue = bytes | bytearray | memoryview | str
@@ -220,22 +226,42 @@ def execute(command: list[str], timeout: float, bend: bool = False) -> Run:
     for key in ("JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS"):
         environment.pop(key, None)
     try:
-        result = subprocess.run(command, cwd=ROOT, env=environment,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                timeout=timeout, check=False)
-    except subprocess.TimeoutExpired as error:
-        raise Failure(f"timeout after {timeout}s: {command!r}\n"
-                      f"stdout: {error.stdout!r}\nstderr: {error.stderr!r}") from error
+        process = subprocess.Popen(command, cwd=ROOT, env=environment,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   start_new_session=os.name == "posix")
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            if os.name == "posix":
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            else:
+                process.kill()
+            try:
+                stdout, stderr = process.communicate(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                if os.name == "posix":
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                else:
+                    process.kill()
+                stdout, stderr = process.communicate()
+            raise Failure(f"timeout after {timeout}s: {command!r}\n"
+                          f"stdout: {stdout!r}\nstderr: {stderr!r}") from error
     except OSError as error:
         raise Failure(f"cannot run {command[0]}: {error}") from error
     try:
-        out = result.stdout.decode("utf-8").replace("\r\n", "\n")
-        err = result.stderr.decode("utf-8").replace("\r\n", "\n")
+        out = stdout.decode("utf-8").replace("\r\n", "\n")
+        err = stderr.decode("utf-8").replace("\r\n", "\n")
     except UnicodeDecodeError as error:
         raise Failure(f"non-UTF-8 process output: {command!r}: {error}") from error
     if bend:
         out, err = compiler_output(out), compiler_output(err)
-    return Run(command, result.returncode, out, err)
+    return Run(command, process.returncode, out, err)
 
 
 def same_output(expected: str, actual: str, context: str) -> None:
@@ -549,6 +575,10 @@ class Suite:
         require(probe.code == 0, f"metadata probe failed\n{probe.detail()}")
         same_output("metadata-probe\n", probe.stdout, probe.detail())
         require(not probe.stderr, f"metadata probe stderr\n{probe.detail()}")
+        actual = self.bend(self.classes / "MetadataFixture$Probe.class")
+        require(actual.code == 0, f"Bend metadata probe failed\n{actual.detail()}")
+        same_output(probe.stdout, actual.stdout, actual.detail())
+        require(not actual.stderr, f"Bend metadata stderr\n{actual.detail()}")
 
         original_path = self.classes / "MetadataFixture$Annotated.class"
         original = original_path.read_bytes()
@@ -586,6 +616,8 @@ class Suite:
         require(rejected.code > 0, f"malformed annotation was accepted\n{rejected.detail()}")
         require("AnnotationFormatError" in rejected.stdout + "\n" + rejected.stderr,
                 f"malformed annotation had the wrong rejection\n{rejected.detail()}")
+        self.reject(malformed_root / original_path.name,
+                    r"InvalidAnnotation|InvalidClass", "--dump-class")
 
     def reject(self, path: Path, category: str, *flags: str) -> None:
         result = self.bend(path, *flags)
@@ -645,6 +677,67 @@ class Suite:
 
     def cli(self, *arguments: str) -> Run:
         return execute([self.args.bend, *arguments], self.args.timeout, bend=True)
+
+    def reflective_app(self, directory: Path) -> None:
+        output = directory / "reflective-app-compiled"
+        output.mkdir()
+        compilation = execute(
+            [self.args.javac, "--release", "8", "-encoding", "UTF-8", "-g:none",
+             "-d", str(output), str(FIXTURES / "ReflectiveContainer.java"),
+             str(FIXTURES / "ConfiguredComponent.java")], self.args.timeout)
+        require(compilation.code == 0, f"reflective app compilation failed\n{compilation.detail()}")
+        classes = {
+            path.relative_to(output).as_posix(): path.read_bytes()
+            for path in output.rglob("*.class")
+        }
+        component_name = "fixture/container/ConfiguredComponent.class"
+        component = {component_name: classes.pop(component_name)}
+        first = write_fixture_jar(
+            directory / "components first é.jar", component,
+            resources={"components.properties":
+                       "component=fixture.container.ConfiguredComponent\nbase=7\n"})
+        second = write_fixture_jar(
+            directory / "components second.jar",
+            resources={"components.properties":
+                       "component=fixture.container.ConfiguredComponent\nbase=11\n"})
+        app = write_fixture_jar(
+            directory / "reflective-container.jar", classes,
+            manifest=manifest_bytes(
+                main_class="fixture.container.ReflectiveContainer",
+                class_path=(first.name.replace(" ", "%20"), second.name.replace(" ", "%20"))))
+        reference = execute([self.args.java, "-Dfile.encoding=UTF-8", "-jar", str(app)],
+                            self.args.timeout)
+        actual = self.cli("-jar", str(app))
+        require(reference.code == 0, f"reference reflective app failed\n{reference.detail()}")
+        require(actual.code == 0, f"Bend reflective app failed\n{actual.detail()}")
+        same_output(reference.stdout, actual.stdout, actual.detail())
+        require(not reference.stderr and not actual.stderr,
+                f"reflective app stderr\n{reference.detail()}\n{actual.detail()}")
+        same_output("closed\nconfigured\n13\ntrue\ntarget-failure\n"
+                    "closed\nconfigured\n17\ntrue\ntarget-failure\n2\n",
+                    actual.stdout, actual.detail())
+
+    def resource_contracts(self, directory: Path) -> None:
+        output = directory / "resource-contracts-compiled"
+        output.mkdir()
+        compilation = execute(
+            [self.args.javac, "--release", "8", "-g:none", "-d", str(output),
+             str(FIXTURES / "ResourceContracts.java")], self.args.timeout)
+        require(compilation.code == 0, f"resource contract compilation failed\n{compilation.detail()}")
+        first = write_fixture_jar(directory / "contracts first.jar",
+                                  resources={"empty": b"", "duplicate": b"ab"})
+        second = write_fixture_jar(directory / "contracts second.jar",
+                                   resources={"duplicate": b"z"})
+        classpath = os.pathsep.join(map(str, (output, first, second)))
+        reference = execute(
+            [self.args.java, "-Dfile.encoding=UTF-8", "-cp", classpath,
+             "fixture.resource.ResourceContracts"], self.args.timeout)
+        actual = self.cli("-cp", classpath, "fixture.resource.ResourceContracts")
+        require(reference.code == 0, f"reference resources failed\n{reference.detail()}")
+        require(actual.code == 0, f"Bend resources failed\n{actual.detail()}")
+        same_output(reference.stdout, actual.stdout, actual.detail())
+        require(not reference.stderr and not actual.stderr,
+                f"resource contract stderr\n{reference.detail()}\n{actual.detail()}")
 
     def runtime_app(self, directory: Path) -> None:
         output = directory / "runtime-app-compiled"
@@ -991,18 +1084,22 @@ class Suite:
 
         closed_source = directory / "ClosedStream.java"
         closed_source.write_text(
-            "package fixture.resource; import java.io.InputStream;"
+            "package fixture.resource; import java.io.InputStream; import java.io.IOException;"
             " public class ClosedStream { public static void main(String[] args) throws Exception {"
             " InputStream stream = ClassLoader.getSystemResourceAsStream(\"fixture-resource.bin\");"
-            " stream.close(); System.out.println(stream.read()); } }",
+            " stream.close(); try { System.out.println(stream.read()); }"
+            " catch (IOException closed) { System.out.println(\"closed\"); } } }",
             encoding="utf-8",
         )
         closed = compile_sources(directory / "closed-compiled", closed_source)
         closed_dir = write_fixture_directory(directory / "closed-app", closed)
-        result = self.cli("-cp", os.pathsep.join((str(closed_dir), str(resource_archive))),
-                          "fixture.resource.ClosedStream")
+        closed_cp = os.pathsep.join((str(closed_dir), str(resource_archive)))
+        reference = execute([self.args.java, "-Dfile.encoding=UTF-8", "-cp", closed_cp,
+                             "fixture.resource.ClosedStream"], self.args.timeout)
+        result = self.cli("-cp", closed_cp, "fixture.resource.ClosedStream")
+        require(reference.code == 0, f"reference closed stream failed\n{reference.detail()}")
         require(result.code == 0, f"closed stream failed\n{result.detail()}")
-        same_output("-1\n", result.stdout, result.detail())
+        same_output(reference.stdout, result.stdout, result.detail())
 
 
 def arguments() -> argparse.Namespace:
@@ -1035,7 +1132,7 @@ def main() -> int:
                     f"{name} executable not found: {executable!r}; see --help for tool overrides")
         require((ROOT / "bendjvm" / "main.bend").is_file(), "missing bendjvm/main.bend")
         if Path(args.bend).resolve() == (ROOT / "scripts" / "run.py").resolve():
-            preparation = execute([args.bend, "--prepare"], max(args.timeout, 600.0))
+            preparation = execute([args.bend, "--prepare"], max(args.timeout, 2400.0))
             require(preparation.code == 0, f"Bend runner preparation failed\n{preparation.detail()}")
         selected = list(dict.fromkeys(args.only)) if args.only else list(NAMED + (EXTENDED if args.full else ()))
         print(f"seed={args.seed:#x}; generated={args.generated}; mode={'full' if args.full else 'fast'}", flush=True)
@@ -1068,6 +1165,10 @@ def main() -> int:
                             lambda: suite.metadata(directory))
             if not args.only:
                 suite.check("classpath/archive-manifest-resource", lambda: suite.classpath(directory))
+                suite.check("reflection/packaged-component-container",
+                            lambda: suite.reflective_app(directory))
+                suite.check("resources/ownership-missing-hierarchy",
+                            lambda: suite.resource_contracts(directory))
             if args.full and not args.only:
                 suite.check("runtime-expansion-app", lambda: suite.runtime_app(directory))
             if not args.only:

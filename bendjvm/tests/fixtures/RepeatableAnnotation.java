@@ -42,6 +42,9 @@ public class RepeatableAnnotation {
         ComplexValue second = RepeatableAnnotation.class.getAnnotation(ComplexValue.class);
         System.out.println(first.equals(second));
         System.out.println(first.hashCode() == second.hashCode());
+        int[] returnedValues = first.ints();
+        returnedValues[0] = 99;
+        System.out.println(first.ints()[0]);
         Tag[] classTags = RepeatableAnnotation.class.getAnnotationsByType(Tag.class);
         Tag[] declaredTags = RepeatableAnnotation.class.getDeclaredAnnotationsByType(Tag.class);
         Tag[] fieldTags = null;

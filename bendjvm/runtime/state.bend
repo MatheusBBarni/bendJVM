@@ -134,7 +134,7 @@ def with_effect(+vm: M.VM, effect: M.Effect) -> M.VM:
 
 def with_cont_on(vm: M.VM, cont: +List<M.Cont>, h: M.Host) -> M.VM:
   match h:
-    case M.Host{effect, cwd, caps, maxPayload, cont, metadata}:
+    case M.Host{effect, cwd, caps, maxPayload, old_cont, metadata}:
       with_host(vm, M.Host{effect, cwd, caps, maxPayload, cont, metadata})
 
 def with_cont(+vm: M.VM, cont: +List<M.Cont>) -> M.VM:

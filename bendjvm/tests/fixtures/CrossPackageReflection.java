@@ -1,4 +1,5 @@
 import fixture.target.CrossPackageTarget;
+import fixture.sub.CrossPackageSubclass;
 import java.lang.reflect.Field;
 
 public class CrossPackageReflection {
@@ -33,5 +34,13 @@ public class CrossPackageReflection {
             System.out.println("static-final:denied");
         }
         System.out.println("same-class:" + CrossPackageTarget.selfRead());
+        System.out.println("protected-subclass:" + CrossPackageSubclass.readProtected(
+            new CrossPackageSubclass()));
+        try {
+            CrossPackageSubclass.readProtected(new CrossPackageTarget());
+            System.out.println("protected-base:allowed");
+        } catch (IllegalAccessException error) {
+            System.out.println("protected-base:denied");
+        }
     }
 }

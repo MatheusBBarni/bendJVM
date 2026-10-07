@@ -68,7 +68,8 @@ class ClassInfo:
 class Launch:
     entry: str
     classes: tuple[SourceMatch, ...]
-    resources: tuple[tuple[str, bytes, str], ...]
+    classpath: tuple[str, ...]
+    resources: tuple[tuple[str, str], ...]
     app_args: tuple[str, ...]
     flags: tuple[str, ...]
     mode: int
@@ -78,13 +79,16 @@ class Launch:
 
 BOOTSTRAP_NAMES = {
     "java/lang/Object", "java/lang/String", "java/lang/StringBuilder", "java/lang/Integer",
-    "java/lang/Long", "java/lang/Double",
+    "java/lang/Long", "java/lang/Double", "java/lang/Void",
     "java/lang/Math", "java/util/Objects", "java/lang/System", "java/io/PrintStream",
     "java/lang/Boolean", "java/lang/Enum", "java/util/Enumeration", "java/util/ResourceEnumeration",
     "java/lang/ClassLoader", "java/lang/Class", "java/net/URL",
     "java/lang/reflect/AccessibleObject", "java/lang/reflect/Field", "java/lang/reflect/Method",
+    "java/lang/reflect/Member", "java/lang/reflect/AnnotatedElement",
     "java/lang/reflect/Constructor", "java/lang/reflect/Type", "java/lang/reflect/AnnotatedType", "java/lang/reflect/ParameterizedType", "java/lang/reflect/TypeVariable", "java/lang/reflect/GenericArrayType", "java/lang/reflect/WildcardType", "java/lang/reflect/AnnotatedParameterizedType", "java/lang/reflect/InvocationHandler", "java/lang/reflect/Proxy", "java/lang/annotation/Annotation", "[Ljava/lang/annotation/Annotation;", "[[Ljava/lang/annotation/Annotation;", "java/lang/annotation/Retention", "java/lang/annotation/Target", "java/lang/annotation/Inherited", "java/lang/annotation/Documented", "java/lang/annotation/Repeatable",
-    "java/lang/annotation/RetentionPolicy", "java/lang/AnnotationEnumCache", "java/lang/annotation/ElementType",
+    "java/lang/annotation/RetentionPolicy", "java/lang/annotation/ElementType",
+    "java/lang/annotation/IncompleteAnnotationException", "java/lang/annotation/AnnotationTypeMismatchException",
+    "java/lang/annotation/AnnotationFormatError", "java/lang/TypeNotPresentException", "java/lang/EnumConstantNotPresentException",
     "java/lang/AssertionError",
     "java/lang/Cloneable", "java/io/Serializable",
     "java/lang/Throwable", "java/lang/Exception", "java/lang/ReflectiveOperationException", "java/lang/reflect/InvocationTargetException",
@@ -109,6 +113,7 @@ BOOTSTRAP_NAMES = {
     "java/lang/AutoCloseable", "java/io/Closeable", "java/io/Flushable",
     "java/lang/Iterable", "java/util/Iterator", "java/util/Collection", "java/util/List", "java/util/Properties",
     "java/util/Map", "java/util/ArrayList", "java/util/ArrayList$Itr", "java/util/HashMap",
+    "java/util/Dictionary", "java/util/Hashtable",
     "java/io/InputStream", "java/io/OutputStream",
     "java/io/ByteArrayInputStream", "java/io/ByteArrayOutputStream",
     "java/io/File", "java/io/FileInputStream", "java/io/FileOutputStream",
@@ -250,45 +255,54 @@ def build_artifacts() -> Path:
             try:
                 subprocess.run([BEND, str(source), "-o", str(output)], cwd=ROOT,
                                env=compiler_environment(), check=True, stdout=subprocess.DEVNULL,
-                               stderr=subprocess.PIPE, text=True, timeout=600)
+                               stderr=subprocess.PIPE, text=True, timeout=1800)
             except subprocess.CalledProcessError as error:
                 print(error.stderr, file=sys.stderr, end="")
                 raise
         loader_source = loader_tmp.read_text(encoding="utf-8")
         runtime_source = runtime_tmp.read_text(encoding="utf-8")
-        loader_name = re.search(r"function (\$loader\$class_loader\$load_many_with_resources\$)\(", loader_source)
+        loader_name = re.search(r"function (\$loader\$[^(\n]*load_many_with_resources\$)\(", loader_source)
         inspect_name = re.search(r"function (\$inspect_class_info\$)\(", loader_source)
         runtime_name = re.search(r"function (\$run_loaded_entry\$)\(", runtime_source)
         continue_name = re.search(r"function (\$[^(\n]*continue_run[^(\n]*)\(", runtime_source)
         resume_ok_name = re.search(r"function (\$[^(\n]*resume_ok[^(\n]*)\(", runtime_source)
         resume_fail_name = re.search(r"function (\$[^(\n]*resume_fail[^(\n]*)\(", runtime_source)
-        if loader_name is None or inspect_name is None or runtime_name is None or continue_name is None or resume_ok_name is None or resume_fail_name is None:
+        resume_class_name = re.search(r"function (\$resume_class\$)\(", runtime_source)
+        resume_resource_name = re.search(r"function (\$resume_resource\$)\(", runtime_source)
+        if loader_name is None or inspect_name is None or runtime_name is None or continue_name is None or resume_ok_name is None or resume_fail_name is None or resume_class_name is None or resume_resource_name is None:
             raise RuntimeError("Bend launch API export not found in generated artifact")
         host_tmp = directory / "host.mjs"
-        host_tmp.write_text(host_source(loader_source, runtime_source, loader_name.group(1), runtime_name.group(1), inspect_name.group(1), continue_name.group(1), resume_ok_name.group(1), resume_fail_name.group(1)), encoding="utf-8")
+        host_tmp.write_text(host_source(loader_source, runtime_source, loader_name.group(1), runtime_name.group(1), inspect_name.group(1), continue_name.group(1), resume_ok_name.group(1), resume_fail_name.group(1), resume_class_name.group(1), resume_resource_name.group(1)), encoding="utf-8")
         os.replace(loader_tmp, loader)
         os.replace(runtime_tmp, runtime)
         os.replace(host_tmp, host)
     return host
 
 
-def host_source(loader_source: str, runtime_source: str, loader_name: str, runtime_name: str, inspect_name: str, continue_name: str, resume_ok_name: str, resume_fail_name: str) -> str:
+def host_source(loader_source: str, runtime_source: str, loader_name: str, runtime_name: str, inspect_name: str, continue_name: str, resume_ok_name: str, resume_fail_name: str, resume_class_name: str, resume_resource_name: str) -> str:
     def fragment(source: str) -> str:
-        return re.sub(r"\ncli\(process\.argv\.slice\(2\)\);[\s\S]*$", "\n", source)
+        return re.sub(r"\ncli\(process\.argv\.slice\(\d+\)\);[\s\S]*$", "\n", source)
+    nat_converter = "BigInt" if "=== 0n" in runtime_source else "Number"
+
 
     return f'''import {{ openSync, readSync, writeSync, closeSync, statSync, existsSync }} from "node:fs";
 import net from "node:net";
 import {{ readFileSync }} from "node:fs";
+import {{ spawn }} from "node:child_process";
+import {{ createInterface }} from "node:readline";
 
 const loader = new Function({fragment(loader_source)!r} + `
 return {{ loadManyWithResources: (values, resources, heap) => run_loop({loader_name}(values, resources, heap)), inspectClassInfo: (values) => run_loop({inspect_name}(values)) }};
 `)();
 const runtime = new Function({fragment(runtime_source)!r} + `
+const nat = {nat_converter};
 return {{
-  runLoadedEntry: (vm, fuel, entry, args) => run_loop({runtime_name}(vm, fuel, entry, args)),
-  continueRun: (vm, fuel) => run_loop({continue_name}(vm, fuel)),
+  runLoadedEntry: (vm, fuel, entry, args) => run_loop({runtime_name}(vm, nat(fuel), entry, args)),
+  continueRun: (vm, fuel) => run_loop({continue_name}(vm, nat(fuel))),
   resumeOk: (vm, handle, extra, bytes) => run_loop({resume_ok_name}(vm, handle, extra, bytes)),
-  resumeFail: (vm, name) => run_loop({resume_fail_name}(vm, name))
+  resumeFail: (vm, name) => run_loop({resume_fail_name}(vm, name)),
+  resumeClass: (vm, bytes) => run_loop({resume_class_name}(vm, bytes)),
+  resumeResource: (vm, bytes) => run_loop({resume_resource_name}(vm, bytes))
 }};
 `)();
 
@@ -331,11 +345,37 @@ function once(emitter, event, timeout) {{
     emitter.once("error", err);
   }});
 }}
+let sourceHost;
+let sourcePending;
+function sourceRequest(value) {{
+  if (!sourceHost) {{
+    sourceHost = spawn({sys.executable!r}, [{str(Path(__file__).resolve())!r}, "--host-requests", process.env.BENDJVM_REQUEST], {{ stdio: ["pipe", "pipe", "inherit"] }});
+    createInterface({{ input: sourceHost.stdout }}).on("line", line => {{
+      const pending = sourcePending; sourcePending = null;
+      if (pending) {{ try {{ pending.resolve(JSON.parse(line)); }} catch (error) {{ pending.reject(error); }} }}
+    }});
+    sourceHost.on("exit", () => {{ if (sourcePending) sourcePending.reject(new Error("classpath host exited")); }});
+    process.on("exit", () => sourceHost.kill());
+  }}
+  return new Promise((resolve, reject) => {{
+    sourcePending = {{ resolve, reject }};
+    sourceHost.stdin.write(JSON.stringify(value) + "\\n");
+  }});
+}}
 async function applyEffect(vm) {{
   const effect = vm.host && vm.host.effect;
-  const kind = effect && effect.$;
+  const rawKind = effect && effect.$;
+  const kind = typeof rawKind === "string" ? rawKind.slice(rawKind.lastIndexOf(".") + 1) : rawKind;
   const caps = (vm.host && vm.host.caps) >>> 0;
   try {{
+    if (kind === "RuntimeClass" || kind === "ReadResource") {{
+      const knownSymbols = listValues(vm.symbols);
+      const response = await sourceRequest({{ kind, name: text(effect.name), origin: text(effect.origin),
+        known: listValues(vm.classes).map(value => text(knownSymbols[value.name])) }});
+      if (response.error) return runtime.resumeFail(vm, response.error);
+      if (kind === "RuntimeClass") return runtime.resumeClass(vm, list(response.classes.map(value => list([...Buffer.from(value, "base64")]))));
+      return runtime.resumeResource(vm, list([...Buffer.from(response.bytes, "base64")]));
+    }}
     if (kind === "OpenFile") {{
       if ((caps & 1) === 0) return runtime.resumeFail(vm, "java/io/IOException");
       const path = text(effect.path);
@@ -452,6 +492,7 @@ async function applyEffect(vm) {{
     return runtime.resumeFail(vm, "java/io/IOException");
   }} catch (error) {{
     const message = String(error && error.message || error);
+    if (kind === "RuntimeClass") return runtime.resumeFail(vm, "java/lang/LinkageError");
     if (message.includes("timeout")) return runtime.resumeFail(vm, "java/net/SocketTimeoutException");
     if (message.includes("ENOENT") || message.includes("ENOTDIR")) return runtime.resumeFail(vm, "java/io/FileNotFoundException");
     return runtime.resumeFail(vm, "java/io/IOException");
@@ -472,8 +513,7 @@ const requestText = readFileSync(process.env.BENDJVM_REQUEST || "", "utf8");
 let request;
 try {{ request = JSON.parse(requestText); }} catch (error) {{ console.error(`InvalidLaunchRequest: ${{error}}`); process.exit(1); }}
 if (request.version !== 1 || !Array.isArray(request.classes) || !Array.isArray(request.resources) ||
-    !request.resources.every(value => value && typeof value.name === "string" &&
-      typeof value.bytes === "string" && typeof value.origin === "string")) {{
+    !request.resources.every(value => value && typeof value.name === "string" && typeof value.origin === "string")) {{
   console.error("InvalidLaunchRequest: unsupported protocol"); process.exit(1);
 }}
 if (request.mode === 4) {{
@@ -487,7 +527,7 @@ if (request.mode === 4) {{
   process.exit(0);
 }}
 const bytes = list(request.classes.map(value => list([...Buffer.from(value.bytes, "base64")])));
-const resources = list(request.resources.map(value => ({{ $: "Resource", name: value.name, bytes: list([...Buffer.from(value.bytes, "base64")]), origin: value.origin }})));
+const resources = list(request.resources.map(value => ({{ $: "Resource", name: value.name, origin: value.origin }})));
 const loaded = loader.loadManyWithResources(bytes, resources, request.maxHeap);
 if (loaded.$ === "Fail") fail(loaded.error);
 const symbols = listValues(loaded.value.symbols);
@@ -525,15 +565,16 @@ if (loaded.value.host) {{
   loaded.value.host.caps = request.caps == null ? 3 : request.caps >>> 0;
 }}
 await (async () => {{
-let vm = runtime.runLoadedEntry(loaded.value, BigInt(request.fuel), request.entry, list(request.args));
+let vm = runtime.runLoadedEntry(loaded.value, request.fuel, request.entry, list(request.args));
 let guard = 0;
 while ((vm.status === 5 || vm.status === 6) && guard < 100000) {{
   guard += 1;
   if (vm.status === 5) vm = await applyEffect(vm);
-  if (vm.status === 0 || vm.status === 6) vm = runtime.continueRun(vm, BigInt(request.fuel));
+  if (vm.status === 0 || vm.status === 6) vm = runtime.continueRun(vm, request.fuel);
   else break;
 }}
 closeAll();
+if (sourceHost) sourceHost.stdin.end();
 for (const line of listValues(vm.output).reverse()) console.log(text(line));
 if (vm.status === 3) {{ console.error("OutOfFuel"); process.exit(1); }}
 if (vm.status === 4) fail(vm.error);
@@ -600,39 +641,30 @@ def _inspect_many(matches: list[SourceMatch]) -> list[ClassInfo]:
     return infos
 
 
-def _resources(classpath: Classpath) -> tuple[tuple[str, bytes, str], ...]:
-    found: list[tuple[str, bytes, str]] = []
+def _resources(classpath: Classpath) -> tuple[tuple[str, str], ...]:
+    found: list[tuple[str, str]] = []
     for source in classpath.sources:
         if hasattr(source, "_entries"):
-            names = sorted(getattr(source, "_entries"))
-            for name in names:
-                if name.endswith("/") or name.endswith(".class") or name == "META-INF/MANIFEST.MF":
-                    continue
-                match = source.find_resource(name)
-                if match is not None:
-                    found.append((match.name, match.data, match.origin))
+            for name in sorted(getattr(source, "_entries")):
+                if not name.endswith(("/", ".class")) and name != "META-INF/MANIFEST.MF":
+                    found.append((name, source.entry_origin(name)))
         elif hasattr(source, "path") and Path(source.path).is_dir():
             root = Path(source.path)
             for path in sorted(root.rglob("*")):
-                if not path.is_file():
-                    continue
-                name = path.relative_to(root).as_posix()
-                if name.endswith(".class"):
-                    continue
-                match = source.find_resource(name)
-                if match is not None:
-                    found.append((match.name, match.data, match.origin))
+                if path.is_file() and path.suffix != ".class":
+                    found.append((path.relative_to(root).as_posix(), str(path)))
     return tuple(found)
 
 
-def _closure(classpath: Classpath, entry: str, selected: SourceMatch) -> tuple[SourceMatch, ...]:
+def _closure(classpath: Classpath, entry: str, selected: SourceMatch, known: set[str] | None = None) -> tuple[SourceMatch, ...]:
     matches: dict[str, SourceMatch] = {}
     pending: list[tuple[str, SourceMatch | None, str]] = [(entry, selected, entry)]
+    known = known or set()
     while pending:
         batch: list[tuple[str, SourceMatch]] = []
         while pending:
             name, pinned, requester = pending.pop(0)
-            if name in matches or name in BOOTSTRAP_NAMES:
+            if name in matches or name in BOOTSTRAP_NAMES or name in known:
                 continue
             match = pinned or classpath.find_class(name)
             if match is None:
@@ -647,21 +679,45 @@ def _closure(classpath: Classpath, entry: str, selected: SourceMatch) -> tuple[S
             if info.name != name:
                 raise ClasspathError(f"{match.origin}: declared class {info.name!r} does not match requested {name!r}")
             pending.extend((dependency, None, name) for dependency in info.dependencies if dependency not in matches)
-    for source in classpath.sources:
-        for match in source.class_matches():
-            if not match.data.startswith(b"\xca\xfe\xba\xbe"):
-                continue
-            name = match.name[:-6]
-            if not name or name in matches or name in BOOTSTRAP_NAMES:
-                continue
-            try:
-                info = _inspect_many([match])[0]
-            except ClasspathError:
-                continue
-            if info.name != name:
-                continue
-            matches[name] = match
     return tuple(matches.values())
+
+def _host_requests(request_path: str) -> int:
+    request = json.loads(Path(request_path).read_text(encoding="utf-8"))
+    with Classpath(request.get("classpath", []), expand_manifests=False) as classpath:
+        for line in sys.stdin:
+            operation = {}
+            try:
+                operation = json.loads(line)
+                if operation["kind"] == "RuntimeClass":
+                    name = operation["name"].lstrip("[")
+                    if name.startswith("L") and operation["name"].startswith("["):
+                        name = name[1:-1]
+                    selected = classpath.find_class(name)
+                    if selected is None:
+                        result = {"error": "java/lang/ClassNotFoundException"}
+                    else:
+                        matches = _closure(classpath, name, selected, set(operation["known"]))
+                        for match in matches:
+                            verify_class_bytes(match.data)
+                        result = {"classes": [base64.b64encode(match.data).decode("ascii") for match in matches]}
+                elif operation["kind"] == "ReadResource":
+                    name, origin = operation["name"], operation["origin"]
+                    selected = None
+                    for source in classpath.sources:
+                        expected = source.entry_origin(name) if hasattr(source, "entry_origin") else str(source.path.joinpath(*name.split("/")))
+                        if expected == origin:
+                            selected = source.find_resource(name)
+                            break
+                    result = {"bytes": base64.b64encode(selected.data).decode("ascii")} if selected is not None else {"error": "java/io/IOException"}
+                else:
+                    result = {"error": "java/lang/UnsupportedOperationException"}
+            except (ClasspathError, ValueError, OSError) as error:
+                message = str(error)
+                category = "java/io/IOException" if operation.get("kind") == "ReadResource" else (
+                    "java/lang/UnsupportedOperationException" if "UnsupportedFeature" in message else "java/lang/LinkageError")
+                result = {"error": category, "detail": message}
+            print(json.dumps(result, separators=(",", ":")), flush=True)
+    return 0
 
 
 def _parse_options(args: list[str]) -> tuple[dict[str, Any], str, list[str]]:
@@ -737,7 +793,7 @@ def _make_launch(args: list[str]) -> Launch:
                 raise ClasspathError(f"{archive}: Main-Class {entry!r} was not found")
             classes = _closure(classpath, entry, selected)
             resources = _resources(classpath)
-            return Launch(entry, classes, resources, tuple(app_args), tuple(options["flags"]), mode, fuel, max_heap)
+            return Launch(entry, classes, tuple(str(source.path) for source in classpath.sources), resources, tuple(app_args), tuple(options["flags"]), mode, fuel, max_heap)
     if target.endswith(".class"):
         selected_path = Path(target).resolve()
         try:
@@ -756,7 +812,7 @@ def _make_launch(args: list[str]) -> Launch:
         with Classpath(paths) as classpath:
             classes = _closure(classpath, entry, selected)
             resources = _resources(classpath)
-            return Launch(entry, classes, resources, tuple(app_args), tuple(options["flags"]), mode, fuel, max_heap)
+            return Launch(entry, classes, tuple(str(source.path) for source in classpath.sources), resources, tuple(app_args), tuple(options["flags"]), mode, fuel, max_heap)
     entry = target.replace(".", "/")
     paths = _split_classpath(options["classpath"] if options["classpath"] is not None else os.environ.get("CLASSPATH"))
     with Classpath(paths) as classpath:
@@ -765,7 +821,7 @@ def _make_launch(args: list[str]) -> Launch:
             raise ClasspathError(f"MissingClass: {entry}; searched {', '.join(source.origin for source in classpath.sources)}")
         classes = _closure(classpath, entry, selected)
         resources = _resources(classpath)
-        return Launch(entry, classes, resources, tuple(app_args), tuple(options["flags"]), mode, fuel, max_heap)
+        return Launch(entry, classes, tuple(str(source.path) for source in classpath.sources), resources, tuple(app_args), tuple(options["flags"]), mode, fuel, max_heap)
 
 
 def _request(launch: Launch) -> str:
@@ -778,8 +834,9 @@ def _request(launch: Launch) -> str:
         "mode": launch.mode,
         "cwd": os.getcwd(),
         "caps": (0 if "--no-files" in launch.flags else 1) | (0 if "--no-net" in launch.flags else 2),
+        "classpath": list(launch.classpath),
         "classes": [{"name": match.name, "origin": match.origin, "bytes": base64.b64encode(match.data).decode("ascii")} for match in launch.classes],
-        "resources": [{"name": name, "bytes": base64.b64encode(data).decode("ascii"), "origin": origin} for name, data, origin in launch.resources],
+        "resources": [{"name": name, "origin": origin} for name, origin in launch.resources],
     }
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
@@ -793,6 +850,8 @@ def _write_request(launch: Launch) -> tempfile.NamedTemporaryFile:
 
 def main() -> int:
     args = sys.argv[1:]
+    if args and args[0] == "--host-requests":
+        return _host_requests(args[1])
     if args and args[0] == "--prepare":
         try:
             build_artifacts()

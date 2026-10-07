@@ -5,6 +5,9 @@ import ./runtime/execute.bend as X
 import ./loader/symbols.bend as Sy
 import ./heap/heap.bend as H
 
+import ./loader/class_loader.bend as L
+import ./java/library.bend as J
+import ./java/outcome.bend as O
 type ArgumentAllocation is Data:
   ArgumentAllocation{vm: M.VM, values: +List<M.Slot>}
 
@@ -195,11 +198,44 @@ def resume_ok(+vm: M.VM, handle: U32, extra: U32, bytes: +List<U32>) -> M.VM:
 def resume_fail(+vm: M.VM, name: String) -> M.VM:
   X.resume_fail(vm, name)
 
+def resume_outcome_result(+vm: M.VM, result: Result<&2, &2, String, M.VM>) -> M.VM:
+  match result:
+    case Fail{error}: X.resume_fail(vm, error)
+    case Done{updated}: updated
+
+def resume_outcome_frames(+vm: M.VM, frames: +List<M.Frame>, result: Result<&2, &2, String, O.Outcome>) -> M.VM:
+  match frames:
+    case Nil{}: S.fail(vm, "InvalidState: no suspended intrinsic frame")
+    case Con{frame, rest}: resume_outcome_result(vm, X.intrinsic_result(frame, 256, result))
+
+def resume_class_loaded(+vm: M.VM, +name: String, initialize: Bool, loader: U32, loaded: Result<&2, &2, String, M.VM>) -> M.VM:
+  match loaded:
+    case Fail{error}: X.resume_fail(vm, Bool.pick(String, String.starts_with(error, "UnsupportedFeature"), "java/lang/UnsupportedOperationException", "java/lang/LinkageError"))
+    case Done{+updated}:
+      +ready : M.VM = X.resume_clear(updated)
+      resume_outcome_frames(ready, S.frames(ready), J.class_resolve_runtime(ready, name, initialize, loader))
+
+def resume_class_effect(+vm: M.VM, bytes: +List<+List<U32>>, effect: M.Effect) -> M.VM:
+  match effect:
+    case M.RuntimeClass{name, initialize, loader}: resume_class_loaded(vm, name, initialize, loader, L.append_runtime(vm, bytes))
+    case _: S.fail(vm, "InvalidState: no runtime class request")
+
+def resume_class(+vm: M.VM, bytes: +List<+List<U32>>) -> M.VM:
+  resume_class_effect(vm, bytes, S.host_effect(vm))
+
+def resume_resource_allocation(+vm: M.VM, allocation: Result<&2, &2, String, H.Allocation>) -> M.VM:
+  match allocation:
+    case Fail{error}: X.resume_fail(vm, error)
+    case Done{H.Allocation{updated, reference}}: X.resume_ref(updated, reference)
+
+def resume_resource(+vm: M.VM, bytes: +List<U32>) -> M.VM:
+  resume_resource_allocation(vm, H.allocate(vm, H.stream_entry(H.named_class(S.classes(vm), S.symbols(vm), "java/io/InputStream"), bytes)))
+
 def make_vm() -> M.VM:
   M.VM{Nil{}, Nil{}, Nil{}, Nil{}, Nil{}, Nil{}, Nil{}, Nil{}, 0, 0, M.Slot{0, 0}, Nil{}, "", 1, 0n, M.idle_host()}
 
 def keep_host_api(vm: M.VM) -> M.VM:
-  continue_run(resume_ok(resume_fail(vm, ""), 0, 0, Nil{}), 0n)
+  continue_run(resume_resource(resume_class(resume_ok(resume_fail(vm, ""), 0, 0, Nil{}), Nil{}), Nil{}), 0n)
 
 def main() -> IO(Unit):
   result = run_loaded_entry(keep_host_api(make_vm()), 1n, "", Nil{})

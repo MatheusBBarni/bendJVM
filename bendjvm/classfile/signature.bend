@@ -189,15 +189,15 @@ def once(value: Work) -> Result<&2, &2, String, Next>:
 
 type Loop is Data:
   Again{value: Work}
-  Ready{parsed: Result<&2, &2, String, Next>}
+  SignatureReady{parsed: Result<&2, &2, String, Next>}
 
 @unsafe def run(fuel: Nat, loop: Loop) -> Result<&2, &2, String, MethodSignature>:
   match fuel loop:
     case 0n _: fail(MethodSignature, "truncated")
-    case 1n+p Again{value}: run(p, Ready{once(value)})
-    case 1n+p Ready{Fail{error}}: Fail{error}
-    case 1n+p Ready{Done{Stop{result}}}: Done{result}
-    case 1n+p Ready{Done{Continue{next}}}: run(p, Again{next})
+    case 1n+p Again{value}: run(p, SignatureReady{once(value)})
+    case 1n+p SignatureReady{Fail{error}}: Fail{error}
+    case 1n+p SignatureReady{Done{Stop{result}}}: Done{result}
+    case 1n+p SignatureReady{Done{Continue{next}}}: run(p, Again{next})
 
 def parse_method(text: String) -> Result<&2, &2, String, MethodSignature>:
   run(8192n, Again{work(15, text, "", Nil{}, Nil{}, "", "", False{}, Nil{}, empty_signature())})

@@ -6,6 +6,7 @@ import ../classfile/constant_pool.bend as CP
 import ./catalog.bend as C
 import ./bootstrap.bend as B
 import ./symbols.bend as S
+import ../runtime/state.bend as V
 
 type Inspected is Data:
   Inspected{name: String, dependencies: +List<String>}
@@ -207,11 +208,22 @@ def add_pool(entries: +List<M.Constant>, +pool: +List<M.Constant>, acc: +List<St
         result : +List<String> <- add_pool(t, pool, next)
         return result
 
-def without_self(names: +List<String>, +self: String) -> +List<String>:
+def without_self_acc(same: Bool, +name: String, +acc: +List<String>) -> +List<String>:
+  match same:
+    case True{}: acc
+    case False{}: Con{name, acc}
+
+def without_self_go(names: +List<String>, +self: String, +acc: +List<String>) -> +List<String>:
   match names:
-    case Nil{}: Nil{}
-    case Con{+h, +t}:
-      Bool.pick(+List<String>, String.eq(h, self), without_self(t, self), Con{h, without_self(t, self)})
+    case Nil{}: M.reverse(String, acc)
+    case Con{+head, +tail}:
+      +next_acc : +List<String> = without_self_acc(String.eq(head, self), head, acc)
+      without_self_go(tail, self, next_acc)
+
+def without_self(names: +List<String>, +self: String) -> +List<String>:
+  without_self_go(names, self, Nil{})
+
+
 
 def class_dependencies(value: M.ClassFile) -> Result<&2, &2, String, Inspected>:
   M.ClassFile{minor, major, flags, +name, +parent, +interfaces, +pool, +fields, +methods, attributes} = value
@@ -227,3 +239,91 @@ def inspect_class_info(+bytes: +List<U32>) -> Result<&2, &2, String, Inspected>:
     value : M.ClassFile <- inspect_class(bytes)
     result : Inspected <- class_dependencies(value)
     return result
+
+# Runtime publication builds only new records. The old VM is the transaction
+# snapshot; no IDs, heap references, live frames, or static bindings are rebuilt.
+def vm_names(classes: +List<M.LoadedClass>, +symbols: +List<String>) -> +List<String>:
+  match classes:
+    case Nil{}: Nil{}
+    case Con{+class, rest}: Con{S.text(symbols, M.loaded_class_name(class)), vm_names(rest, symbols)}
+
+def check_new_names(classes: +List<M.ClassFile>, +known: +List<String>) -> Result<&2, &2, String, Unit>:
+  match classes:
+    case Nil{}: Done{Unit{}}
+    case Con{+class, rest}:
+      +name : String = class_internal_name(class)
+      do Result<&2, &2, String, Unit>:
+        C.check(Bool.not(has_name(known, name)), "LinkageError: duplicate runtime class " ++ name)
+        result : Unit <- check_new_names(rest, M.append(String, known, [name]))
+        return result
+
+
+def check_dependency_names(dependencies: +List<String>, +known: +List<String>) -> Result<&2, &2, String, Unit>:
+  match dependencies:
+    case Nil{}: Done{Unit{}}
+    case Con{+name, rest}:
+      do Result<&2, &2, String, Unit>:
+        checked : Unit <- C.check(has_name(known, name), "MissingClass: runtime dependency " ++ name)
+        result : Unit <- check_dependency_names(rest, known)
+        return result
+
+def check_inspected_dependencies(value: Inspected, +known: +List<String>) -> Result<&2, &2, String, Unit>:
+  match value:
+    case Inspected{name, dependencies}: check_dependency_names(dependencies, known)
+
+def check_dependencies(classes: +List<M.ClassFile>, +known: +List<String>) -> Result<&2, &2, String, Unit>:
+  match classes:
+    case Nil{}: Done{Unit{}}
+    case Con{class, rest}:
+      do Result<&2, &2, String, Unit>:
+        inspected : Inspected <- class_dependencies(class)
+        checked : Unit <- check_inspected_dependencies(inspected, known)
+        result : Unit <- check_dependencies(rest, known)
+        return result
+
+
+def published(+vm: M.VM, +appended: +List<M.LoadedClass>, +fields: +List<M.LoadedField>, +methods: +List<M.LoadedMethod>, +symbols: +List<String>, metadata: M.Metadata, oldFields: U32) -> M.VM:
+  match vm:
+    case M.VM{+classes, old_methods, old_fields, old_symbols, heap, +statics, resources, frames, status, exception, result, output, error, maxHeap, steps, M.Host{effect, cwd, caps, maxPayload, cont, old_metadata}}:
+      +fresh : +List<M.Binding> = C.static_fields(M.drop(M.LoadedField, fields, U32.to_nat(oldFields)), Nil{})
+      M.VM{M.append(M.LoadedClass, classes, appended), methods, fields, symbols, heap, M.append(M.Binding, statics, fresh), resources, frames, status, exception, result, output, error, maxHeap, steps, M.Host{effect, cwd, caps, maxPayload, cont, metadata}}
+
+def publish_catalog(+vm: M.VM, catalog: C.Catalog, oldClasses: U32, oldFields: U32) -> Result<&2, &2, String, M.VM>:
+  match catalog:
+    case C.Catalog{+sources, +names, +symbols, +fields, +methods, metadata}:
+      do Result<&2, &2, String, M.VM>:
+        appended : +List<M.LoadedClass> <- C.classes_go(sources, names, names, symbols, fields, methods, oldClasses, Nil{})
+        return published(vm, appended, fields, methods, symbols, metadata, oldFields)
+
+def append_parsed(+vm: M.VM, +parsed: +List<M.ClassFile>) -> Result<&2, &2, String, M.VM>:
+  +known : +List<String> = vm_names(V.classes(vm), V.symbols(vm))
+  +all_names : +List<String> = M.append(String, known, C.names(parsed))
+  +fields : +List<M.LoadedField> = V.fields(vm)
+  +methods : +List<M.LoadedMethod> = V.methods(vm)
+  do Result<&2, &2, String, M.VM>:
+    unique : Unit <- check_new_names(parsed, known)
+    closure : Unit <- check_dependencies(parsed, all_names)
+    catalog : C.Catalog <- C.collect(parsed, parsed, all_names, C.symbols(parsed, V.symbols(vm)), fields, methods, V.metadata(vm), M.length(M.LoadedClass, V.classes(vm)))
+    updated : M.VM <- publish_catalog(vm, catalog, M.length(M.LoadedClass, V.classes(vm)), M.length(M.LoadedField, fields))
+    return updated
+
+def new_array_sources_go(values: +List<M.ClassFile>, +known: +List<String>, +acc: +List<M.ClassFile>) -> +List<M.ClassFile>:
+  match values:
+    case Nil{}: M.reverse(M.ClassFile, acc)
+    case Con{+value, +rest}:
+      +next : +List<M.ClassFile> = Bool.pick(+List<M.ClassFile>, has_name(known, class_internal_name(value)), acc, Con{value, acc})
+      new_array_sources_go(rest, known, next)
+
+def new_array_sources(values: +List<M.ClassFile>, +known: +List<String>) -> +List<M.ClassFile>:
+  new_array_sources_go(values, known, Nil{})
+
+def append_augmented(+vm: M.VM, value: C.AugmentedClasses) -> Result<&2, &2, String, M.VM>:
+  match value:
+    case C.AugmentedClasses{classes, arrays}:
+      append_parsed(vm, M.append(M.ClassFile, classes, new_array_sources(arrays, vm_names(V.classes(vm), V.symbols(vm)))))
+
+def append_runtime(+vm: M.VM, values: +List<+List<U32>>) -> Result<&2, &2, String, M.VM>:
+  do Result<&2, &2, String, M.VM>:
+    parsed : +List<M.ClassFile> <- parse_classes(values, Nil{})
+    updated : M.VM <- append_augmented(vm, C.augment_classes(parsed, Nil{}, Nil{}))
+    return updated

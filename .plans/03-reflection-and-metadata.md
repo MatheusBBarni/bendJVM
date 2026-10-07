@@ -1,8 +1,13 @@
 # Plan: Reflection and metadata
 
-Status: substantially implemented; parser/linker metadata, bounded reflection,
-runtime annotation materialization, interface proxies, ordered resources, and
-bounded memory-Reader Properties are implemented.
+Status: complete for the documented bounded scope. Current source artifacts
+prepare with isolated Bend 2.0.36; `scripts/test.py --fast --bend scripts/run.py`
+passes 54 tests and `--full` passes 105. The full CLI suite includes the packaged
+component-container fixture. `bend PROOF.bend` reports `ALL PROOFS CHECK`.
+Low-fuel proxy and configuration-only loading probes stop with `OutOfFuel`;
+annotation materialization under a 16-entry heap limit stops with
+`OutOfMemoryError`. OpenJDK parity and the exclusions below remain out of scope.
+
 Source: `ROADMAP.md`, milestone 3.
 Dependencies: [JAR and classpath loading](01-jar-and-classpath-loading.md) and [Java runtime expansion](02-java-runtime-expansion.md).
 
@@ -307,14 +312,16 @@ Candidate `LAWS.bend`/`PROOF.bend` invariants: appending types preserves existin
   default-method limitations remain explicit in documentation.
 - Documentation and proof gates are updated after behavior verification.
 
+Verification used isolated Bend 2.0.36. `python3 scripts/run.py --prepare`
+succeeded. `python3 scripts/test.py --fast --bend scripts/run.py` passed 54
+tests; `python3 scripts/test.py --full --bend scripts/run.py` passed 105,
+including the packaged component-container CLI fixture; `bend PROOF.bend`
+reported `ALL PROOFS CHECK`. Stress probes confirmed `OutOfFuel` in proxy and
+configuration-only loading paths, and `OutOfMemoryError` during annotation
+materialization at a 16-entry heap limit.
 
-Planning verification: the bounded milestone is exercised by repository checks.
-Parser/linker metadata, reflective member access, runtime annotation objects
-including repeatable containers, interface proxies, resources, and both
-bounded Properties paths have permanent fixtures or suite coverage. Remaining
-limits are recorded in `README.md` and this plan: general category-two
-bytecode/field/call execution, complete access-edge compatibility, custom
-loader subclasses and multiple application namespaces, default-method proxy
-dispatch, parameter-name reflection, and full OpenJDK reflection
-compatibility. Method, field, and class signatures and method-return and field
-type-argument annotations are implemented.
+Remaining exclusions: general category-two bytecode/field/call execution,
+complete access-edge compatibility, custom loader subclasses and multiple
+application namespaces, default-method proxy dispatch, parent/complex
+static-initialization semantics, parameter-name reflection, complete URL
+escaping/annotation formatting, and full OpenJDK reflection compatibility.

@@ -2,6 +2,8 @@ import Base
 import ./model.bend as M
 import ./runtime/state.bend as S
 import ./runtime/execute.bend as X
+import ./runtime/scheduler.bend as Sch
+import ./runtime/threads.bend as Th
 import ./loader/symbols.bend as Sy
 import ./heap/heap.bend as H
 
@@ -15,7 +17,7 @@ type ArrayAllocation is Data:
   ArrayAllocation{vm: M.VM, reference: U32}
 def method_locals(value: M.LoadedMethod) -> +List<M.Slot>:
   match value:
-    case M.LoadedMethod{id, owner, name, descriptor, flags, parameters, resultTag, maxStack, maxLocals, instructions, handlers, intrinsic}:
+    case M.LoadedMethod{id, owner, name, descriptor, flags, parameters, resultTag, maxStack, maxLocals, instructions, handlers, intrinsic, switches}:
       M.zeros(U32.to_nat(maxLocals))
 
 def method_locals_args(value: M.LoadedMethod, argument: M.Slot) -> +List<M.Slot>:
@@ -31,7 +33,7 @@ def start_class_chain_method(fuel: Nat, +vm: M.VM, +id: U32, parent: U32, +tail:
     case None{}: S.fail(vm, "NoSuchMethodError: <clinit>")
     case Some{+method}:
       +updated : M.VM = S.set_class_state(vm, id, 1)
-      +frame : M.Frame = M.Frame{M.loaded_method_id(method), 0, 0, method_locals(method), Nil{}, id}
+      +frame : M.Frame = M.Frame{M.loaded_method_id(method), 0, 0, method_locals(method), Nil{}, id, 0}
       +next_tail : +List<M.Frame> = Con{frame, tail}
       start_class_chain_parent(fuel, updated, parent, next_tail, next)
 def start_class_chain_initializer(fuel: Nat, +vm: M.VM, id: U32, parent: U32, initializer: U32, +tail: +List<M.Frame>, next: M.VM -> U32 -> +List<M.Frame> -> M.VM) -> M.VM:
@@ -53,7 +55,7 @@ def start_class_chain_state(fuel: Nat, +vm: M.VM, id: U32, +parent: U32, initial
 
 def start_class_chain_class(fuel: Nat, +vm: M.VM, +tail: +List<M.Frame>, class: M.LoadedClass, next: M.VM -> U32 -> +List<M.Frame> -> M.VM) -> M.VM:
   match class:
-    case M.LoadedClass{id, name, parent, interfaces, fields, methods, initializer, state}:
+    case M.LoadedClass{id, name, parent, interfaces, fields, methods, initializer, state, bootstrapMethods}:
       start_class_chain_state(fuel, vm, id, parent, initializer, state, tail, next)
 
 def start_class_chain_found(fuel: Nat, +vm: M.VM, owner: U32, +tail: +List<M.Frame>, found: Maybe<&2, M.LoadedClass>, next: M.VM -> U32 -> +List<M.Frame> -> M.VM) -> M.VM:
@@ -76,7 +78,7 @@ def entry_match(+method: M.LoadedMethod, +symbols: +List<String>) -> Bool:
 
 def public_static_entry(+method: M.LoadedMethod, +symbols: +List<String>) -> Bool:
   match method:
-    case M.LoadedMethod{id, owner, name, descriptor, flags, parameters, resultTag, maxStack, maxLocals, instructions, handlers, intrinsic}:
+    case M.LoadedMethod{id, owner, name, descriptor, flags, parameters, resultTag, maxStack, maxLocals, instructions, handlers, intrinsic, switches}:
       Bool.and(U32.is_eq(U32.and(flags, 9), 9), entry_match(method, symbols))
 
 def entry_method(methods: +List<M.LoadedMethod>, +symbols: +List<String>) -> Maybe<&2, M.LoadedMethod>:
@@ -96,7 +98,7 @@ def entry_method_owner(methods: +List<M.LoadedMethod>, +symbols: +List<String>, 
     case Nil{}: None{}
     case Con{+method, rest}:
       match method:
-        case M.LoadedMethod{id, method_owner, name, descriptor, flags, parameters, resultTag, maxStack, maxLocals, instructions, handlers, intrinsic}:
+        case M.LoadedMethod{id, method_owner, name, descriptor, flags, parameters, resultTag, maxStack, maxLocals, instructions, handlers, intrinsic, switches}:
           Bool.pick(Maybe<&2, M.LoadedMethod>, U32.is_eq(method_owner, owner) && public_static_entry(method, symbols), Some{method}, entry_method_owner(rest, symbols, owner))
 
 def start_found_args(+vm: M.VM, found: Maybe<&2, M.LoadedMethod>, +argument: M.Slot) -> M.VM:
@@ -105,7 +107,7 @@ def start_found_args(+vm: M.VM, found: Maybe<&2, M.LoadedMethod>, +argument: M.S
     case Some{+method}:
       +id = M.loaded_method_id(method)
       +owner = M.loaded_method_owner(method)
-      start_class(vm, M.Frame{id, 0, 0, method_locals_args(method, argument), Nil{}, 4294967295}, owner)
+      start_class(vm, M.Frame{id, 0, 0, method_locals_args(method, argument), Nil{}, 4294967295, 0}, owner)
 
 def start_found(+vm: M.VM, found: Maybe<&2, M.LoadedMethod>) -> M.VM:
   match found:
@@ -113,7 +115,7 @@ def start_found(+vm: M.VM, found: Maybe<&2, M.LoadedMethod>) -> M.VM:
     case Some{+method}:
       +id = M.loaded_method_id(method)
       +owner = M.loaded_method_owner(method)
-      start_class(vm, M.Frame{id, 0, 0, method_locals(method), Nil{}, 4294967295}, owner)
+      start_class(vm, M.Frame{id, 0, 0, method_locals(method), Nil{}, 4294967295, 0}, owner)
 
 def start_loaded(+vm: M.VM) -> M.VM:
   start_found(vm, entry_method(S.methods(vm), S.symbols(vm)))
@@ -183,14 +185,25 @@ def start_entry_alloc(+vm: M.VM, name: String, +args: +List<String>, allocated: 
 def start_loaded_entry(+vm: M.VM, name: String, +args: +List<String>) -> M.VM:
   start_entry_alloc(vm, name, args, allocate_argument_strings(args, vm, Nil{}))
 
-def run_loaded(+vm: M.VM, fuel: Nat) -> M.VM:
-  X.run(start_loaded(vm), fuel)
+def clock(high: U32, low: U32) -> M.Clock:
+  M.Clock{high, low}
 
-def run_loaded_entry(+vm: M.VM, fuel: Nat, entryBinaryName: String, applicationArgs: +List<String>) -> M.VM:
-  X.run(start_loaded_entry(vm, entryBinaryName, applicationArgs), fuel)
+# Host API (plan 05). Every call returns after one bounded scheduler round;
+# `nowHigh/nowLow` are the host's monotonic nanoseconds and `wallHigh/wallLow`
+# its wall clock in milliseconds since the epoch. See runtime/scheduler.bend
+# for the status values a round leaves.
+@unsafe def run_loaded(+vm: M.VM, fuel: Nat) -> M.VM:
+  Sch.start(start_loaded(vm), fuel, clock(0, 0), clock(0, 0))
 
-def continue_run(vm: M.VM, fuel: Nat) -> M.VM:
-  X.continue_run(vm, fuel)
+@unsafe def run_loaded_entry(+vm: M.VM, fuel: Nat, entryBinaryName: String, applicationArgs: +List<String>, quantum: U32, nowHigh: U32, nowLow: U32, wallHigh: U32, wallLow: U32) -> M.VM:
+  Sch.start(start_loaded_entry(Th.with_quantum(vm, U32.to_nat(quantum)), entryBinaryName, applicationArgs), fuel, clock(nowHigh, nowLow), clock(wallHigh, wallLow))
+
+@unsafe def continue_run(vm: M.VM, nowHigh: U32, nowLow: U32, wallHigh: U32, wallLow: U32) -> M.VM:
+  Sch.continue_run(vm, clock(nowHigh, nowLow), clock(wallHigh, wallLow))
+
+# The host printed `output` and `host.errors`; clear both.
+def take_output(vm: M.VM) -> M.VM:
+  S.take_output(vm)
 
 def resume_ok(+vm: M.VM, handle: U32, extra: U32, bytes: +List<U32>) -> M.VM:
   X.resume_ok(vm, handle, extra, bytes)
@@ -203,14 +216,27 @@ def resume_outcome_result(+vm: M.VM, result: Result<&2, &2, String, M.VM>) -> M.
     case Fail{error}: X.resume_fail(vm, error)
     case Done{updated}: updated
 
-def resume_outcome_frames(+vm: M.VM, frames: +List<M.Frame>, result: Result<&2, &2, String, O.Outcome>) -> M.VM:
+@unsafe def resume_outcome_frames(+vm: M.VM, frames: +List<M.Frame>, result: Result<&2, &2, String, O.Outcome>) -> M.VM:
   match frames:
     case Nil{}: S.fail(vm, "InvalidState: no suspended intrinsic frame")
-    case Con{frame, rest}: resume_outcome_result(vm, X.intrinsic_result(frame, 256, result))
+    case Con{+frame, +rest}: resume_outcome_route(X.callback_pending(X.host_cont(vm), M.length(M.Frame, Con{frame, rest})), vm, frame, result)
+
+# A native an intrinsic called back resumes the intrinsic's continuation.
+@unsafe def resume_outcome_route(pending: Bool, +vm: M.VM, frame: M.Frame, result: Result<&2, &2, String, O.Outcome>) -> M.VM:
+  match pending:
+    case True{}: X.invoke_job(vm, X.JResult{frame, result})
+    case False{}: resume_outcome_result(vm, X.intrinsic_result(frame, 256, result))
+
+# Runtime loading failures surface as the JVMS error class for their cause.
+def runtime_load_error(+error: String) -> String:
+  Bool.pick(String, String.starts_with(error, "UnsupportedFeature"), "java/lang/UnsupportedOperationException",
+    Bool.pick(String, String.starts_with(error, "VerifyError"), "java/lang/VerifyError",
+      Bool.pick(String, String.starts_with(error, "VmError.Invalid") || String.starts_with(error, "InvalidBytecode") || String.starts_with(error, "VmError.UnsupportedClassVersion"), "java/lang/ClassFormatError",
+        "java/lang/LinkageError")))
 
 def resume_class_loaded(+vm: M.VM, +name: String, initialize: Bool, loader: U32, loaded: Result<&2, &2, String, M.VM>) -> M.VM:
   match loaded:
-    case Fail{error}: X.resume_fail(vm, Bool.pick(String, String.starts_with(error, "UnsupportedFeature"), "java/lang/UnsupportedOperationException", "java/lang/LinkageError"))
+    case Fail{+error}: X.resume_fail_message(vm, runtime_load_error(error), error)
     case Done{+updated}:
       +ready : M.VM = X.resume_clear(updated)
       resume_outcome_frames(ready, S.frames(ready), J.class_resolve_runtime(ready, name, initialize, loader))
@@ -231,12 +257,26 @@ def resume_resource_allocation(+vm: M.VM, allocation: Result<&2, &2, String, H.A
 def resume_resource(+vm: M.VM, bytes: +List<U32>) -> M.VM:
   resume_resource_allocation(vm, H.allocate(vm, H.stream_entry(H.named_class(S.classes(vm), S.symbols(vm), "java/io/InputStream"), bytes)))
 
+# Completions of host operation `op` (the HostOp a thread waits on). They
+# resume that thread only; stale or duplicate completions change nothing.
+@unsafe def complete_ok(+vm: M.VM, op: U32, handle: U32, extra: U32, bytes: +List<U32>) -> M.VM:
+  Sch.complete(vm, op, ready => resume_ok(ready, handle, extra, bytes))
+
+@unsafe def complete_fail(+vm: M.VM, op: U32, name: String) -> M.VM:
+  Sch.complete(vm, op, ready => resume_fail(ready, name))
+
+@unsafe def complete_class(+vm: M.VM, op: U32, bytes: +List<+List<U32>>) -> M.VM:
+  Sch.complete(vm, op, ready => resume_class(ready, bytes))
+
+@unsafe def complete_resource(+vm: M.VM, op: U32, bytes: +List<U32>) -> M.VM:
+  Sch.complete(vm, op, ready => resume_resource(ready, bytes))
+
 def make_vm() -> M.VM:
   M.VM{Nil{}, Nil{}, Nil{}, Nil{}, Nil{}, Nil{}, Nil{}, Nil{}, 0, 0, M.Slot{0, 0}, Nil{}, "", 1, 0n, M.idle_host()}
 
-def keep_host_api(vm: M.VM) -> M.VM:
-  continue_run(resume_resource(resume_class(resume_ok(resume_fail(vm, ""), 0, 0, Nil{}), Nil{}), Nil{}), 0n)
+@unsafe def keep_host_api(vm: M.VM) -> M.VM:
+  take_output(continue_run(complete_resource(complete_class(complete_ok(complete_fail(vm, 0, ""), 0, 0, 0, Nil{}), 0, Nil{}), 0, Nil{}), 0, 0, 0, 0))
 
 def main() -> IO(Unit):
-  result = run_loaded_entry(keep_host_api(make_vm()), 1n, "", Nil{})
+  result = run_loaded_entry(keep_host_api(make_vm()), 1n, "", Nil{}, 1000, 0, 0, 0, 0)
   IO.print(U32.show(S.status(result)))

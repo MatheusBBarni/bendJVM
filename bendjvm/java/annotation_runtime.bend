@@ -5,21 +5,18 @@ import ../heap/heap.bend as H
 import ../loader/symbols.bend as Sy
 import ../classfile/constant_pool.bend as CP
 import ./outcome.bend as O
+import ../loader/class_loader.bend as CL
 
 type Value is Data:
   Value{vm: M.VM, slot: M.Slot}
-type Values is Data:
-  Values{vm: M.VM, slots: +List<M.Slot>}
 type Bindings is Data:
   Bindings{vm: M.VM, fields: +List<M.Binding>}
 
 def bits(slot: M.Slot) -> U32:
-  M.Slot{tag, value} = slot
-  value
+  M.slot_bits(slot)
 
 def tag(slot: M.Slot) -> U32:
-  M.Slot{kind, value} = slot
-  kind
+  M.slot_tag(slot)
 
 def fields(entry: M.HeapEntry) -> +List<M.Binding>:
   M.HeapEntry{class, kind, element, bindings, values, chars} = entry
@@ -112,11 +109,20 @@ def allocated(result: Result<&2, &2, String, H.Allocation>) -> Result<&2, &2, St
 def node(+vm: M.VM, tag: U32, +slots: +List<M.Slot>, name: String) -> Result<&2, &2, String, Value>:
   allocated(H.allocate(vm, M.HeapEntry{id(vm, "java/lang/Object"), 11, tag, Nil{}, slots, units(name)}))
 
+def pair_constant_node(+vm: M.VM, tag: U32, +high: U32, +low: U32) -> Result<&2, &2, String, Value>:
+  match tag:
+    case 74: node(vm, tag, [M.Wide{4, high, low}], "")
+    case 68: node(vm, tag, [M.Wide{5, high, low}], "")
+    case _: Fail{"VmError.InvalidAnnotation: constant kind"}
+
+
 def constant_node(+vm: M.VM, +tag: U32, value: M.Constant) -> Result<&2, &2, String, Value>:
   match value:
     case M.Number{kind, bits}: node(vm, tag, [M.Slot{Bool.pick(U32, U32.is_eq(tag, 70), 2, 1), bits}], "")
-    case M.PairIndex{kind, high, low}: node(vm, tag, [M.Slot{1, high}, M.Slot{1, low}], "")
-    case _: Fail{"VmError.InvalidAnnotation: constant kind"}
+    case M.PairIndex{kind, high, low}: pair_constant_node(vm, tag, high, low)
+    case M.Unused{}: Fail{"VmError.InvalidAnnotation: constant kind"}
+    case M.Utf{text}: Fail{"VmError.InvalidAnnotation: constant kind"}
+    case M.Index{kind, index}: Fail{"VmError.InvalidAnnotation: constant kind"}
 def constant(+vm: M.VM, +pool: +List<M.Constant>, +tag: U32, index: U32) -> Result<&2, &2, String, Value>:
   match tag:
     case 115:
@@ -419,25 +425,23 @@ def first(values: +List<M.Slot>) -> M.Slot:
     case Con{slot, rest}: slot
     case Nil{}: M.Slot{3, 0}
 
-def wide(+vm: M.VM, wrapper: String, slots: +List<M.Slot>) -> Result<&2, &2, String, Value>:
-  match slots:
-    case Con{high, Con{low, rest}}: allocated(H.allocate(vm, H.object_entry(id(vm, wrapper), [M.Binding{0, high}, M.Binding{1, low}])))
-    case _: Fail{"VmError.InvalidAnnotation: wide constant"}
-
 def resolve_enum(+vm: M.VM, +entry: M.HeapEntry) -> Result<&2, &2, String, Value>:
   +name : String = class_name(text(chars(entry)))
   +owner : U32 = id(vm, name)
   Bool.pick(Result<&2, &2, String, Value>, U32.is_eq(owner, 4294967295), string_error(vm, "java/lang/TypeNotPresentException", name, M.Slot{3, 0}), enum_lookup(vm, owner, first(values(entry))))
 
+# A Class value names a loaded class, or an array class created on first use.
+def resolve_class_value(ensured: Result<&2, &2, String, M.VM>, +name: String) -> Result<&2, &2, String, Value>:
+  match ensured:
+    case Fail{error}: Fail{error}
+    case Done{+vm}:
+      +target : U32 = id(vm, name)
+      Bool.pick(Result<&2, &2, String, Value>, U32.is_eq(target, 4294967295), string_error(vm, "java/lang/TypeNotPresentException", name, M.Slot{3, 0}), mirror(vm, target))
+
 def resolve_scalar(+vm: M.VM, +entry: M.HeapEntry, tag: U32) -> Result<&2, &2, String, Value>:
   match tag:
     case 115: allocated(H.allocate(vm, H.string_entry(id(vm, "java/lang/String"), chars(entry))))
-    case 99:
-      +name : String = class_name(text(chars(entry)))
-      +target : U32 = id(vm, name)
-      Bool.pick(Result<&2, &2, String, Value>, U32.is_eq(target, 4294967295), string_error(vm, "java/lang/TypeNotPresentException", name, M.Slot{3, 0}), mirror(vm, target))
-    case 74: wide(vm, "java/lang/Long", values(entry))
-    case 68: wide(vm, "java/lang/Double", values(entry))
+    case 99: resolve_class_value(CL.ensure_array_class(vm, class_name(text(chars(entry)))), class_name(text(chars(entry))))
     case _: Done{Value{vm, first(values(entry))}}
 
 type ResolveJob is Data:
@@ -477,7 +481,7 @@ def metadata_default(metadata: M.AnnotationMetadata) -> Maybe<&2, M.AnnotationVa
 def default_found(found: Maybe<&2, M.MethodMetadata>) -> Maybe<&2, M.AnnotationValue>:
   match found:
     case None{}: None{}
-    case Some{M.MethodMetadata{owner, method, metadata, signature}}: metadata_default(metadata)
+    case Some{M.MethodMetadata{owner, method, metadata, signature, parameters, lines}}: metadata_default(metadata)
 def default_metadata(metadata: M.Metadata, method: U32) -> Maybe<&2, M.AnnotationValue>:
   M.Metadata{classes, fields, methods} = metadata
   default_found(M.nth(M.MethodMetadata, methods, method))
@@ -486,7 +490,7 @@ def default_metadata(metadata: M.Metadata, method: U32) -> Maybe<&2, M.Annotatio
 def pool_found(found: Maybe<&2, M.ClassMetadata>) -> +List<M.Constant>:
   match found:
     case None{}: Nil{}
-    case Some{M.ClassMetadata{owner, flags, metadata, names, pool, signature}}: pool
+    case Some{M.ClassMetadata{owner, flags, metadata, names, pool, signature, nesting, source}}: pool
 def pool_metadata(metadata: M.Metadata, owner: U32) -> +List<M.Constant>:
   M.Metadata{classes, fields, methods} = metadata
   pool_found(M.nth(M.ClassMetadata, classes, owner))
@@ -540,7 +544,7 @@ def outcome(value: Value) -> Result<&2, &2, String, O.Outcome>:
 def pending_found(found: Maybe<&2, M.LoadedClass>, owner: U32) -> U32:
   match found:
     case None{}: 4294967295
-    case Some{M.LoadedClass{id, name, parent, interfaces, fields, methods, initializer, state}}:
+    case Some{M.LoadedClass{id, name, parent, interfaces, fields, methods, initializer, state, bootstrapMethods}}:
       Bool.pick(U32, U32.is_eq(state, 0), owner, 4294967295)
 
 type PendingJob is Data:
@@ -622,15 +626,13 @@ def field_bits(bindings: +List<M.Binding>, field: U32) -> U32:
 def bool_value(vm: M.VM, equal: Bool) -> Value:
   Value{vm, M.Slot{1, Bool.pick(U32, equal, 1, 0)}}
 
+# Wide element values are primitive Wide slots. Long.equals compares raw
+# bits; Double.equals compares doubleToLongBits (canonical NaN, signed zero).
 def wide_equal(+vm: M.VM, left: M.Slot, right: M.Slot, +double: Bool) -> Result<&2, &2, String, Value>:
-  do Result<&2, &2, String, Value>:
-    +l : M.HeapEntry <- H.get(S.heap(vm), bits(left))
-    +r : M.HeapEntry <- H.get(S.heap(vm), bits(right))
-    +lh : U32 = field_bits(fields(l), 0)
-    +ll : U32 = field_bits(fields(l), 1)
-    +rh : U32 = field_bits(fields(r), 0)
-    +rl : U32 = field_bits(fields(r), 1)
-    return bool_value(vm, U32.is_eq(Bool.pick(U32, double, double_high(lh, ll), lh), Bool.pick(U32, double, double_high(rh, rl), rh)) && U32.is_eq(Bool.pick(U32, double, double_low(lh, ll), ll), Bool.pick(U32, double, double_low(rh, rl), rl)))
+  match left right:
+    case M.Wide{lt, +lh, +ll} M.Wide{rt, +rh, +rl}:
+      Done{bool_value(vm, U32.is_eq(Bool.pick(U32, double, double_high(lh, ll), lh), Bool.pick(U32, double, double_high(rh, rl), rh)) && U32.is_eq(Bool.pick(U32, double, double_low(lh, ll), ll), Bool.pick(U32, double, double_low(rh, rl), rl)))}
+    case _ _: Fail{"VmError.InvalidAnnotation: wide element value"}
 
 type EqJob is Data:
   ESlot{left: M.Slot, right: M.Slot, descriptor: String}
@@ -706,12 +708,12 @@ def string_hash(chars: +List<U32>, acc: U32) -> U32:
     case Nil{}: acc
     case Con{c, rest}: string_hash(rest, (31 * acc + c : U32))
 
+# Long.hashCode / Double.hashCode: high word xor low word of the (canonical) bits.
 def hash_wide(+vm: M.VM, slot: M.Slot, +double: Bool) -> Result<&2, &2, String, Value>:
-  do Result<&2, &2, String, Value>:
-    +entry : M.HeapEntry <- H.get(S.heap(vm), bits(slot))
-    +high : U32 = field_bits(fields(entry), 0)
-    +low : U32 = field_bits(fields(entry), 1)
-    return Value{vm, M.Slot{1, U32.xor(Bool.pick(U32, double, double_high(high, low), high), Bool.pick(U32, double, double_low(high, low), low))}}
+  match slot:
+    case M.Wide{tag, +high, +low}:
+      Done{Value{vm, M.Slot{1, U32.xor(Bool.pick(U32, double, double_high(high, low), high), Bool.pick(U32, double, double_low(high, low), low))}}}
+    case _: Fail{"VmError.InvalidAnnotation: wide element value"}
 
 type HashJob is Data:
   HSlot{slot: M.Slot, descriptor: String}

@@ -9,6 +9,22 @@ type RWord is Data:
 
 type RBytes is Data:
   RBytes{reader: Reader, value: +List<U32>}
+def word_reader(word: RWord) -> Reader:
+  match word:
+    case RWord{reader, value}: reader
+
+def word_value(word: RWord) -> U32:
+  match word:
+    case RWord{reader, value}: value
+
+def bytes_reader(bytes: RBytes) -> Reader:
+  match bytes:
+    case RBytes{reader, value}: reader
+
+def bytes_value(bytes: RBytes) -> +List<U32>:
+  match bytes:
+    case RBytes{reader, value}: value
+
 
 def require(ok: Bool, message: String) -> Result<&2, &2, String, Unit>:
   match ok:

@@ -170,6 +170,9 @@ def once(value: Work) -> Result<&2, &2, String, Next>:
               Done{Continue{start_ref(rest, WantThrow{variables, parameters, result, types}, stack, MethodSignature{variables, parameters, result, thrown})}}
         case 8 _: fail(Next, "throws")
         case 9 SNil{}: fail(Next, "type parameter")
+        # JVMS 4.7.9.1: the class bound may be empty ("T::LIface;"), leaving
+        # only interface bounds, which mode 10 reads.
+        case 9 SCon{Chr{58}, SCon{Chr{58}, rest}}: go(10, SCon{Chr{58}, rest}, "", Nil{}, params, acc, "", stack, signature)
         case 9 SCon{Chr{58}, rest}: Done{Continue{start_ref(rest, WantBound{acc, Nil{}, params}, stack, signature)}}
         case 9 SCon{head, rest}: go(9, rest, acc ++ char_text(head), Nil{}, params, "", "", stack, signature)
         case 10 SCon{Chr{58}, SCon{Chr{58}, rest}}: go(10, SCon{Chr{58}, rest}, "", types, params, name, "", stack, signature)

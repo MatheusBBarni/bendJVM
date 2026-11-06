@@ -80,17 +80,17 @@ def string(+pool: +List<M.Constant>, index: U32) -> Result<&2, &2, String, Strin
     return text
 
 
-def expect_class(pool: +List<M.Constant>, value: M.Constant) -> Result<&2, &2, String, String>:
+def expect_class(pool: +List<M.Constant>, +position: U32, value: M.Constant) -> Result<&2, &2, String, String>:
   match value:
     case M.Index{7, index}:
       utf(pool, index)
-    case _:
-      Fail{"VmError.InvalidConstantPool: expected Class"}
+    case other:
+      Fail{"VmError.InvalidConstantPool: expected Class at #" ++ U32.show(position) ++ ", found tag " ++ U32.show(tag(other))}
 
-def class_name(+pool: +List<M.Constant>, index: U32) -> Result<&2, &2, String, String>:
+def class_name(+pool: +List<M.Constant>, +index: U32) -> Result<&2, &2, String, String>:
   do Result<&2, &2, String, String>:
     value : M.Constant <- get(pool, index)
-    name : String <- expect_class(pool, value)
+    name : String <- expect_class(pool, index, value)
     return name
 
 def expect_name_type(+pool: +List<M.Constant>, value: M.Constant) -> Result<&2, &2, String, NameType>:

@@ -3,8 +3,8 @@
 No host annotation parser or Java execution is involved. Each case supplies its
 expected structural result so the harness can feed bytes to P.parse directly.
 """
-from dataclasses import dataclass
 import struct
+from dataclasses import dataclass
 
 
 def u2(value):
@@ -135,32 +135,32 @@ def metadata_cases():
                 # Nested annotation is itself an additional recursive entry.
                 wrappers = depth - (1 if leaf_name == "empty-annotation" else 0)
                 return c.annotations((b"[" + u2(1)) * wrappers + leaves[leaf_name])
-            declaration("array-depth-%s-%d" % (leaf_name, depth), payload, depth == 64)
+            declaration(f"array-depth-{leaf_name}-{depth}", payload, depth == 64)
     for depth in (64, 65):
         def nested(c, depth=depth):
             value = c.annotation_value()
             for _ in range(depth):
                 value = c.annotation_value(b"@" + value)
             return u2(1) + value
-        declaration("annotation-depth-%d" % depth, nested, depth == 64)
+        declaration(f"annotation-depth-{depth}", nested, depth == 64)
 
     for target in (0x43, 0x44, 0x45, 0x46):
-        declaration("code-offset-target-%02x" % target,
+        declaration(f"code-offset-target-{target:02x}",
                     lambda c, target=target: c.type_annotation(target, u2(0)), True,
                     attr="RuntimeVisibleTypeAnnotations", site="code")
     for target in range(0x47, 0x4c):
-        declaration("code-typeargument-target-%02x" % target,
+        declaration(f"code-typeargument-target-{target:02x}",
                     lambda c, target=target: c.type_annotation(target, u2(0) + b"\x00"), True,
                     attr="RuntimeInvisibleTypeAnnotations", site="code")
     for target in (0x40, 0x41):
-        declaration("localvar-zero-table-%02x" % target,
+        declaration(f"localvar-zero-table-{target:02x}",
                     lambda c, target=target: c.type_annotation(target, u2(0)), True,
                     attr="RuntimeVisibleTypeAnnotations", site="code")
-        declaration("localvar-one-table-%02x" % target,
+        declaration(f"localvar-one-table-{target:02x}",
                     lambda c, target=target: c.type_annotation(target, u2(1) + u2(0) + u2(1) + u2(0)), True,
                     attr="RuntimeVisibleTypeAnnotations", site="code")
     for kind in (0, 1, 2):
-        declaration("nonzero-path-index-%d" % kind,
+        declaration(f"nonzero-path-index-{kind}",
                     lambda c, kind=kind: c.type_annotation(0x13, path=bytes([1, kind, 1])), False,
                     attr="RuntimeVisibleTypeAnnotations", site="field")
     declaration("unknown-path-kind", lambda c: c.type_annotation(0x13, path=b"\x01\x04\x00"), False,
@@ -192,7 +192,7 @@ def metadata_cases():
     # Each member fits its individual byte budget, but the class total does not.
     payload = c.annotations(b"[" + u2(4096) + (b"I" + u2(c.integer)) * 4096)
     attr = c.attribute("RuntimeVisibleAnnotations", payload)
-    fields = [c.member("field%d" % i, "I", [attr], flags=1) for i in range(22)]
+    fields = [c.member(f"field{i}", "I", [attr], flags=1) for i in range(22)]
     cases.append(MetadataCase("aggregate-class-node-budget", c.finish(fields=fields), False))
     c = ClassBytes()
     default = c.attribute("AnnotationDefault", b"c" + u2(c.void))

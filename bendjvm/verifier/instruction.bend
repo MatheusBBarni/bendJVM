@@ -4,15 +4,15 @@ import ../bytecode/decode.bend as Decode
 import ../classfile/descriptor.bend as D
 import ../classfile/constant_pool.bend as CP
 
-# Inputs and outputs are top-first slot tags. Kind 1/2 read/write a local,
-# kind 3 increments an integer local, kind 4 permutes category-one values.
+# Inputs and outputs are top-first logical value tags; tags 4/5 have width 2.
+# kind 1/2 read/write a local, kind 3 increments an integer local, kind 4
+# denotes a stack permutation whose legal form depends on value widths.
 type Rule is Data:
   Rule{kind: U32, tag: U32, inputs: +List<U32>, outputs: +List<U32>}
 
 def supported(value: M.JvmType) -> Bool:
   match value:
-    case M.Primitive{74}: False{}
-    case M.Primitive{68}: False{}
+    case M.Primitive{tag}: Bool.not(U32.is_eq(tag, 86))
     case M.ArrayType{element}: supported(element)
     case _: True{}
 
@@ -22,14 +22,19 @@ def tags(values: +List<M.JvmType>) -> Result<&2, &2, String, +List<U32>>:
       Done{Nil{}}
     case Con{+value, rest}:
       do Result<&2, &2, String, +List<U32>>:
-        Decode.require(supported(value), "VerifyError: category-two descriptor is unsupported")
+        Decode.require(supported(value), "VerifyError: void is not a value type")
         tail : +List<U32> <- tags(rest)
         return Con{D.slot_tag(value), tail}
 
-def result_tag(+value: M.JvmType) -> Result<&2, &2, String, U32>:
+# Field and parameter types must be value types; void is legal only as a
+# method result, where it maps to the empty result tag 0.
+def value_tag(+value: M.JvmType) -> Result<&2, &2, String, U32>:
   do Result<&2, &2, String, U32>:
-    Decode.require(supported(value), "VerifyError: category-two descriptor is unsupported")
+    Decode.require(supported(value), "VerifyError: void is not a value type")
     return D.slot_tag(value)
+
+def return_tag(value: M.JvmType) -> U32:
+  D.slot_tag(value)
 
 def cp_value(value: Maybe<&2, M.Constant>) -> Result<&2, &2, String, M.Constant>:
   match value:
@@ -62,7 +67,9 @@ def ldc(entry: M.Constant, +pool: +List<M.Constant>) -> Result<&2, &2, String, R
       do Result<&2, &2, String, Rule>:
         +text : String <- CP.utf(pool, index)
         return Rule{0, 0, Nil{}, [3]}
-    case _: Fail{"VerifyError: ldc requires Integer, Float, Class, or String constant"}
+    case M.PairIndex{15, kind, index}: Done{Rule{0, 0, Nil{}, [3]}}
+    case M.Index{16, index}: Done{Rule{0, 0, Nil{}, [3]}}
+    case _: Fail{"VerifyError: ldc requires Integer, Float, Class, String, MethodHandle, or MethodType constant"}
 
 def field_rule(op: U32, +tag: U32) -> Rule:
   match op:
@@ -77,7 +84,7 @@ def field(+op: U32, +index: U32, +pool: +List<M.Constant>) -> Result<&2, &2, Str
     Decode.require(U32.is_eq(cp_tag(entry), 9), "VerifyError: field operand is not Fieldref")
     member : CP.Member <- CP.member(pool, index)
     value : M.JvmType <- D.parse_field(CP.member_descriptor(member))
-    slot : U32 <- result_tag(value)
+    slot : U32 <- value_tag(value)
     return field_rule(op, slot)
 
 def call_tag(op: U32, +tag: U32) -> Bool:
@@ -89,6 +96,7 @@ def call_tag(op: U32, +tag: U32) -> Bool:
 def receiver(op: U32, parameters: +List<U32>) -> +List<U32>:
   match op:
     case 184: parameters
+    case 186: parameters
     case _: M.append(U32, parameters, [3])
 
 def returns(tag: U32) -> +List<U32>:
@@ -96,19 +104,65 @@ def returns(tag: U32) -> +List<U32>:
     case 0: Nil{}
     case _: [tag]
 
+def tag_width(tag: U32) -> U32:
+  match tag:
+    case 4: 2
+    case 5: 2
+    case _: 1
+
+def tag_slots(values: +List<U32>) -> U32:
+  match values:
+    case Nil{}: 0
+    case Con{tag, rest}: (tag_width(tag) + tag_slots(rest) : U32)
+
 def interface_count(op: U32, count: U32, parameters: +List<U32>) -> Bool:
   match op:
-    case 185: U32.is_eq(count, (M.length(U32, parameters) + 1 : U32))
+    case 185: U32.is_eq(count, (tag_slots(parameters) + 1 : U32))
     case _: True{}
 
-def call(+op: U32, +index: U32, count: U32, +pool: +List<M.Constant>) -> Result<&2, &2, String, Rule>:
+def dynamic_name_type(entry: M.Constant) -> Result<&2, &2, String, U32>:
+  match entry:
+    case M.PairIndex{18, bootstrap, nameType}: Done{nameType}
+    case _: Fail{"VerifyError: invokedynamic operand is not InvokeDynamic"}
+def dynamic_name(value: CP.NameType) -> String:
+  match value:
+    case CP.NameType{name, descriptor}: name
+
+def dynamic_descriptor(value: CP.NameType) -> String:
+  match value:
+    case CP.NameType{name, descriptor}: descriptor
+
+
+def dynamic_call(+index: U32, +pool: +List<M.Constant>) -> Result<&2, &2, String, Rule>:
   do Result<&2, &2, String, Rule>:
     entry : M.Constant <- cp(pool, index)
+    nameType : U32 <- dynamic_name_type(entry)
+    +pair : CP.NameType <- CP.name_type(pool, nameType)
+    descriptor : String = dynamic_descriptor(pair)
+    +name : String = dynamic_name(pair)
+    Decode.require(Bool.not(String.eq(name, "<init>")) && Bool.not(String.eq(name, "<clinit>")), "VerifyError: invokedynamic has a forbidden special name")
+    +parsed : M.Descriptor <- D.parse_method(descriptor)
+    Decode.require(U32.is_le(D.parameter_slots(D.parameter_types(parsed)), 255), "VerifyError: invokedynamic descriptor exceeds the parameter-slot limit")
+    +args : +List<U32> <- tags(D.parameter_types(parsed))
+    resultTag : U32 = return_tag(D.result_type(parsed))
+    return Rule{0, 0, M.reverse(U32, args), returns(resultTag)}
+def call(+op: U32, +index: U32, count: U32, +pool: +List<M.Constant>) -> Result<&2, &2, String, Rule>:
+  do Result<&2, &2, String, Rule>:
+    +entry : M.Constant <- cp(pool, index)
     Decode.require(call_tag(op, cp_tag(entry)), "VerifyError: invocation constant-pool tag mismatch")
-    member : CP.Member <- CP.member(pool, index)
+    +member : CP.Member <- CP.member(pool, index)
+    +name : String = CP.member_name(member)
+    +isInit : Bool = String.eq(name, "<init>")
+    isClinit : Bool = String.eq(name, "<clinit>")
+    Decode.require(Bool.not(isClinit), "VerifyError: class initializer cannot be invoked")
+    Decode.require(Bool.not(isInit) || U32.is_eq(cp_tag(entry), 10), "VerifyError: constructor reference must be a class Methodref")
+    Decode.require(Bool.not(isInit) || U32.is_eq(op, 183), "VerifyError: constructor must be invoked with invokespecial")
     +parsed : M.Descriptor <- D.parse_method(CP.member_descriptor(member))
     +args : +List<U32> <- tags(D.parameter_types(parsed))
-    resultTag : U32 <- result_tag(D.result_type(parsed))
+    +resultTag : U32 = return_tag(D.result_type(parsed))
+    Decode.require(Bool.not(isInit) || U32.is_eq(resultTag, 0), "VerifyError: constructor descriptor must return void")
+    receiverSlots : U32 = Bool.pick(U32, U32.is_eq(op, 184), 0, 1)
+    Decode.require(U32.is_le((receiverSlots + D.parameter_slots(D.parameter_types(parsed)) : U32), 255), "VerifyError: invocation descriptor exceeds the parameter-slot limit")
     Decode.require(interface_count(op, count, args), "VerifyError: invokeinterface count does not match descriptor")
     return Rule{0, 0, receiver(op, M.reverse(U32, args)), returns(resultTag)}
 
@@ -132,14 +186,36 @@ def class_operand(+op: U32, +index: U32, +pool: +List<M.Constant>) -> Result<&2,
     Decode.require(new_name(op, name), "VerifyError: new cannot allocate an array class")
     return class_rule(op)
 
+def array_dimensions(name: String) -> U32:
+  match name:
+    case SCon{Chr{91}, rest}: U32.add(array_dimensions(rest), 1)
+    case _: 0
+
+def int_inputs(count: Nat) -> +List<U32>:
+  match count:
+    case 0n: Nil{}
+    case 1n+p: Con{1, int_inputs(p)}
+
+# multianewarray: the operand is an array class with at least `dimensions`
+# dimensions; it pops that many int counts and pushes the array.
+def multi_array_operand(+index: U32, +dimensions: U32, +pool: +List<M.Constant>) -> Result<&2, &2, String, Rule>:
+  do Result<&2, &2, String, Rule>:
+    entry : M.Constant <- cp(pool, index)
+    Decode.require(U32.is_eq(cp_tag(entry), 7), "VerifyError: class operand is not Class constant")
+    name : String <- CP.class_name(pool, index)
+    Decode.require(U32.is_ne(dimensions, 0) && U32.is_le(dimensions, array_dimensions(name)), "VerifyError: multianewarray dimensions exceed the array type")
+    return Rule{0, 0, int_inputs(U32.to_nat(dimensions)), [3]}
+
 def primitive_array(atype: U32) -> Bool:
   match atype:
     case 4: True{}
     case 5: True{}
     case 6: True{}
+    case 7: True{}
     case 8: True{}
     case 9: True{}
     case 10: True{}
+    case 11: True{}
     case _: False{}
 
 def returning(+tag: U32, expected: U32) -> Result<&2, &2, String, Rule>:
@@ -158,11 +234,75 @@ def plain(op: U32, expected: U32) -> Result<&2, &2, String, Rule>:
     case 6: Done{Rule{0, 0, Nil{}, [1]}}
     case 7: Done{Rule{0, 0, Nil{}, [1]}}
     case 8: Done{Rule{0, 0, Nil{}, [1]}}
+    case 9: Done{Rule{0, 0, Nil{}, [4]}}
+    case 10: Done{Rule{0, 0, Nil{}, [4]}}
     case 11: Done{Rule{0, 0, Nil{}, [2]}}
     case 12: Done{Rule{0, 0, Nil{}, [2]}}
     case 13: Done{Rule{0, 0, Nil{}, [2]}}
+    case 14: Done{Rule{0, 0, Nil{}, [5]}}
+    case 15: Done{Rule{0, 0, Nil{}, [5]}}
     case 16: Done{Rule{0, 0, Nil{}, [1]}}
     case 17: Done{Rule{0, 0, Nil{}, [1]}}
+    case 20: Done{Rule{0, 0, Nil{}, [4]}}
+    case 22: Done{Rule{1, 4, Nil{}, [4]}}
+    case 24: Done{Rule{1, 5, Nil{}, [5]}}
+    case 30: Done{Rule{1, 4, Nil{}, [4]}}
+    case 31: Done{Rule{1, 4, Nil{}, [4]}}
+    case 32: Done{Rule{1, 4, Nil{}, [4]}}
+    case 33: Done{Rule{1, 4, Nil{}, [4]}}
+    case 38: Done{Rule{1, 5, Nil{}, [5]}}
+    case 39: Done{Rule{1, 5, Nil{}, [5]}}
+    case 40: Done{Rule{1, 5, Nil{}, [5]}}
+    case 41: Done{Rule{1, 5, Nil{}, [5]}}
+    case 47: Done{Rule{0, 0, [1, 3], [4]}}
+    case 49: Done{Rule{0, 0, [1, 3], [5]}}
+    case 55: Done{Rule{2, 4, [4], Nil{}}}
+    case 57: Done{Rule{2, 5, [5], Nil{}}}
+    case 63: Done{Rule{2, 4, [4], Nil{}}}
+    case 64: Done{Rule{2, 4, [4], Nil{}}}
+    case 65: Done{Rule{2, 4, [4], Nil{}}}
+    case 66: Done{Rule{2, 4, [4], Nil{}}}
+    case 71: Done{Rule{2, 5, [5], Nil{}}}
+    case 72: Done{Rule{2, 5, [5], Nil{}}}
+    case 73: Done{Rule{2, 5, [5], Nil{}}}
+    case 74: Done{Rule{2, 5, [5], Nil{}}}
+    case 80: Done{Rule{0, 0, [4, 1, 3], Nil{}}}
+    case 82: Done{Rule{0, 0, [5, 1, 3], Nil{}}}
+    case 97: Done{Rule{0, 0, [4, 4], [4]}}
+    case 99: Done{Rule{0, 0, [5, 5], [5]}}
+    case 101: Done{Rule{0, 0, [4, 4], [4]}}
+    case 103: Done{Rule{0, 0, [5, 5], [5]}}
+    case 105: Done{Rule{0, 0, [4, 4], [4]}}
+    case 107: Done{Rule{0, 0, [5, 5], [5]}}
+    case 109: Done{Rule{0, 0, [4, 4], [4]}}
+    case 111: Done{Rule{0, 0, [5, 5], [5]}}
+    case 113: Done{Rule{0, 0, [4, 4], [4]}}
+    case 115: Done{Rule{0, 0, [5, 5], [5]}}
+    case 117: Done{Rule{0, 0, [4], [4]}}
+    case 119: Done{Rule{0, 0, [5], [5]}}
+    case 121: Done{Rule{0, 0, [1, 4], [4]}}
+    case 123: Done{Rule{0, 0, [1, 4], [4]}}
+    case 125: Done{Rule{0, 0, [1, 4], [4]}}
+    case 127: Done{Rule{0, 0, [4, 4], [4]}}
+    case 129: Done{Rule{0, 0, [4, 4], [4]}}
+    case 131: Done{Rule{0, 0, [4, 4], [4]}}
+    case 133: Done{Rule{0, 0, [1], [4]}}
+    case 135: Done{Rule{0, 0, [1], [5]}}
+    case 136: Done{Rule{0, 0, [4], [1]}}
+    case 137: Done{Rule{0, 0, [4], [2]}}
+    case 138: Done{Rule{0, 0, [4], [5]}}
+    case 140: Done{Rule{0, 0, [2], [4]}}
+    case 141: Done{Rule{0, 0, [2], [5]}}
+    case 142: Done{Rule{0, 0, [5], [1]}}
+    case 143: Done{Rule{0, 0, [5], [4]}}
+    case 144: Done{Rule{0, 0, [5], [2]}}
+    case 148: Done{Rule{0, 0, [4, 4], [1]}}
+    case 151: Done{Rule{0, 0, [5, 5], [1]}}
+    case 152: Done{Rule{0, 0, [5, 5], [1]}}
+    case 170: Done{Rule{0, 0, [1], Nil{}}}
+    case 171: Done{Rule{0, 0, [1], Nil{}}}
+    case 173: returning(4, expected)
+    case 175: returning(5, expected)
     case 21: Done{Rule{1, 1, Nil{}, [1]}}
     case 23: Done{Rule{1, 2, Nil{}, [2]}}
     case 25: Done{Rule{1, 3, Nil{}, [3]}}
@@ -261,12 +401,20 @@ def plain(op: U32, expected: U32) -> Result<&2, &2, String, Rule>:
     case 177: returning(0, expected)
     case 190: Done{Rule{0, 0, [3], [1]}}
     case 191: Done{Rule{0, 0, [3], Nil{}}}
+    case 194: Done{Rule{0, 0, [3], Nil{}}}
+    case 195: Done{Rule{0, 0, [3], Nil{}}}
     case 198: Done{Rule{0, 0, [3], Nil{}}}
     case 199: Done{Rule{0, 0, [3], Nil{}}}
     case 200: Done{Rule{0, 0, Nil{}, Nil{}}}
-    case _: Fail{"VerifyError: unsupported instruction contract"}
+    case _: Fail{"UnsupportedOpcode: verifier transfer function is not implemented for opcode " ++ U32.show(op)}
 
-def select(op: U32, a: U32, b: U32, c: U32, pool: +List<M.Constant>, expected: U32) -> Result<&2, &2, String, Rule>:
+def ldc2(entry: M.Constant) -> Result<&2, &2, String, Rule>:
+  match entry:
+    case M.PairIndex{5, first, second}: Done{Rule{0, 0, Nil{}, [4]}}
+    case M.PairIndex{6, first, second}: Done{Rule{0, 0, Nil{}, [5]}}
+    case _: Fail{"VerifyError: ldc2_w requires Long or Double constant"}
+
+def select(op: U32, a: U32, b: U32, c: U32, +pool: +List<M.Constant>, expected: U32) -> Result<&2, &2, String, Rule>:
   match op:
     case 18:
       do Result<&2, &2, String, Rule>:
@@ -276,6 +424,10 @@ def select(op: U32, a: U32, b: U32, c: U32, pool: +List<M.Constant>, expected: U
       do Result<&2, &2, String, Rule>:
         entry : M.Constant <- cp(pool, a)
         ldc(entry, pool)
+    case 20:
+      do Result<&2, &2, String, Rule>:
+        entry : M.Constant <- cp(pool, a)
+        ldc2(entry)
     case 178: field(178, a, pool)
     case 179: field(179, a, pool)
     case 180: field(180, a, pool)
@@ -284,6 +436,7 @@ def select(op: U32, a: U32, b: U32, c: U32, pool: +List<M.Constant>, expected: U
     case 183: call(183, a, b, pool)
     case 184: call(184, a, b, pool)
     case 185: call(185, a, b, pool)
+    case 186: dynamic_call(a, pool)
     case 187: class_operand(187, a, pool)
     case 188:
       do Result<&2, &2, String, Rule>:
@@ -292,14 +445,22 @@ def select(op: U32, a: U32, b: U32, c: U32, pool: +List<M.Constant>, expected: U
     case 189: class_operand(189, a, pool)
     case 192: class_operand(192, a, pool)
     case 193: class_operand(193, a, pool)
+    case 197: multi_array_operand(a, b, pool)
     case 196: plain(c, expected)
     case _: plain(op, expected)
 
-def local_bounds(rule: Rule, index: U32, maximum: U32) -> Result<&2, &2, String, Rule>:
+def local_width(kind: U32, tag: U32) -> U32:
+  match kind:
+    case 1: tag_width(tag)
+    case 2: tag_width(tag)
+    case _: 1
+
+def local_bounds(rule: Rule, +index: U32, +maximum: U32) -> Result<&2, &2, String, Rule>:
   match rule:
-    case Rule{+kind, tag, inputs, outputs}:
+    case Rule{+kind, +tag, inputs, outputs}:
       do Result<&2, &2, String, Rule>:
-        Decode.require(U32.is_eq(kind, 0) || U32.is_eq(kind, 4) || (index < maximum : U32), "VerifyError: local index exceeds max_locals")
+        width : U32 = local_width(kind, tag)
+        Decode.require(U32.is_eq(kind, 0) || U32.is_eq(kind, 4) || (U32.is_lt(index, maximum) && U32.is_le(width, U32.sub(maximum, index))), "VerifyError: local index exceeds max_locals")
         return Rule{kind, tag, inputs, outputs}
 
 def verify(instruction: M.Instruction, pool: +List<M.Constant>, expected: U32, maximum: U32) -> Result<&2, &2, String, Rule>:

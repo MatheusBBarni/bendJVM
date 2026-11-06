@@ -1,12 +1,10 @@
 # Plan: Reflection and metadata
 
-Status: complete for the documented bounded scope. Current source artifacts
-prepare with isolated Bend 2.0.36; `scripts/test.py --fast --bend scripts/run.py`
-passes 54 tests and `--full` passes 105. The full CLI suite includes the packaged
-component-container fixture. `bend PROOF.bend` reports `ALL PROOFS CHECK`.
-Low-fuel proxy and configuration-only loading probes stop with `OutOfFuel`;
-annotation materialization under a 16-entry heap limit stops with
-`OutOfMemoryError`. OpenJDK parity and the exclusions below remain out of scope.
+Status: complete, with no exclusions of its own left (2026-11-05).
+Bend 2.0.39 artifact preparation succeeds; `scripts/test.py --fast --bend scripts/run.py` passes 89 tests and `--full` passes 141.
+`bend PROOF.bend` reports `ALL PROOFS CHECK`.
+The original bounded slices are below; the former exclusions became completion slices C1-C11 at the end of this plan, each gated by a JDK-oracle fixture.
+Threads and the context class loader moved to plan 05, and Spring Boot nested-JAR layouts to plan 06.
 
 Source: `ROADMAP.md`, milestone 3.
 Dependencies: [JAR and classpath loading](01-jar-and-classpath-loading.md) and [Java runtime expansion](02-java-runtime-expansion.md).
@@ -16,6 +14,7 @@ Dependencies: [JAR and classpath loading](01-jar-and-classpath-loading.md) and [
 Run a small Java 8 application that discovers configured classes, reads runtime annotations, constructs and wires objects reflectively, intercepts interface calls through a dynamic proxy, and reads configuration from dependency archives.
 
 The deliverable is a bounded reflection-capable MiniJRE, not Spring Boot compatibility or full OpenJDK reflection.
+The 2026-11-05 decision in [Completion of the remaining exclusions](#completion-of-the-remaining-exclusions) widened this goal: plan 03 now ends with no exclusions of its own.
 
 | Roadmap requirement | Deliverable |
 | --- | --- |
@@ -25,6 +24,9 @@ The deliverable is a bounded reflection-capable MiniJRE, not Spring Boot compati
 | Resource lookup for framework configuration | Class-relative and class-loader resource lookup, ordered enumeration, local resource URLs, and properties configuration |
 
 ## Current implementation and blockers
+
+This section and the scope below record the original bounded slice.
+Its open items were closed later by plan 04 and by slices C1-C11 at the end of this plan.
 
 Repository evidence:
 
@@ -45,7 +47,7 @@ The current bounded expansion adds:
 - Java 8 method `Signature` attributes for generic return, parameter, and exception types, including `ParameterizedType` argument arrays and `TypeVariable` names. Non-generic throws stay on the `Exceptions` attribute when the signature omits them. `Class.forName(name, initialize, null)` uses the bootstrap loader for bootstrap classes.
 - Field and class `Signature` attributes for `Field.getGenericType`, `Field.getAnnotatedType`, and `Class.getGenericSuperclass`, including type-argument annotations on fields.
 
-The following remain incomplete: true category-two JVM stack/local layout and the remaining long/double opcodes/conversions, loader identity and multiple independent namespaces, special default-method proxy invocation, parameter-name reflection, `AnnotatedType` coverage for local-variable and expression targets, and byte-for-byte OpenJDK formatting/exception-message compatibility.
+The original slice left these incomplete (all done since): true category-two JVM stack/local layout and the remaining long/double opcodes/conversions, loader identity and multiple independent namespaces, special default-method proxy invocation, parameter-name reflection, `AnnotatedType` coverage for local-variable and expression targets, and byte-for-byte OpenJDK formatting/exception-message compatibility.
 
 ## Scope and boundaries
 
@@ -57,7 +59,9 @@ The following remain incomplete: true category-two JVM stack/local layout and th
 - Preserve raw long/double annotation constants and materialize them through boxed `Long`/`Double` reflection values using high/low U32 words. The current runtime additionally supports a single logical VM slot for bounded long arithmetic, `dadd`, wide field/call/return transport, and wrapper accessors; true category-two stack/local semantics and the remaining opcodes remain excluded.
 - Add only the enum support required to compile and consume Java 8 annotation enum values: Enum construction/name/ordinal/identity semantics, constant lookup, and array cloning used by javac-generated `values()`. Enum switch execution remains milestone 4.
 
-### Explicit exclusions
+### Original exclusions (superseded)
+
+These were the original slice's exclusions; slices C1-C11 removed them, and threads and Spring Boot archive layouts moved to plans 05 and 06.
 
 Custom loader instances may resolve names from the existing application catalog, but arbitrary `defineClass`, loader identity, and multiple application-loader namespaces remain unsupported; modules/security managers, MethodHandles, `invokedynamic`, Class type-parameter and generic-interface reflection beyond recorded method/field/superclass signatures, parameter-name reflection, serialization of reflection/proxy objects, Java threading/context-class-loader APIs, subclass-based proxies, default-method special invocation, Spring Boot archive layouts, and general classpath/package scanning are also excluded.
 
@@ -320,8 +324,156 @@ reported `ALL PROOFS CHECK`. Stress probes confirmed `OutOfFuel` in proxy and
 configuration-only loading paths, and `OutOfMemoryError` during annotation
 materialization at a 16-entry heap limit.
 
-Remaining exclusions: general category-two bytecode/field/call execution,
+Exclusions the original slice left (closed since by plan 04 and slices C1-C11): general category-two bytecode/field/call execution,
 complete access-edge compatibility, custom loader subclasses and multiple
 application namespaces, default-method proxy dispatch, parent/complex
 static-initialization semantics, parameter-name reflection, complete URL
 escaping/annotation formatting, and full OpenJDK reflection compatibility.
+
+## Completion of the remaining exclusions
+
+Decision (2026-11-05): plan 03 ends with no exclusions of its own, because the target is an unmodified Spring Boot application.
+Each former exclusion below becomes a slice with a JDK-oracle fixture; a slice is done only when its fixture matches `java -Xverify:all` byte for byte and is part of `scripts/test.py`.
+Three former exclusions belong to other plans and move there rather than being dropped.
+Threads and the context class loader are plan 05.
+Spring Boot nested-JAR layouts are plan 06.
+`MethodHandles` and `invokedynamic` were completed by plan 04.
+
+### C1. Class initialization and field resolution (done)
+
+- Field references resolve per JVMS 5.4.3.2: declared fields, then superinterfaces depth-first, then the superclass chain (`heap.resolve_field`).
+- Every trigger follows JVMS 5.5: `new`, `getstatic`, `putstatic`, `invokestatic`, reflective static access and invocation, `Constructor.newInstance`, and `Class.forName(..., true, ...)`.
+- A class initializes after its superclass and after superinterfaces that declare default methods; an interface initializes alone.
+- Bytecode triggers re-execute after each `<clinit>`; intrinsics re-run through a `NeedIntrinsicRetry` callback, and `Class.forName` through `NeedClassMirror`.
+- A non-`Error` exception leaving `<clinit>` becomes `ExceptionInInitializerError`; later use throws `NoClassDefFoundError: Could not initialize class X`.
+- Fixture: `InitSemantics`.
+
+### C2. Parameter metadata (done)
+
+- `MethodParameters` is parsed into method metadata; `Executable` is the JDK superclass of `Method` and `Constructor` and declares `getParameters`, `getParameterCount` and the shared abstract members.
+- `Parameter` implements `getName` (synthesized `argN` without a recorded name), `isNamePresent`, `getModifiers`, `isImplicit`, `isSynthetic`, `isVarArgs`, `getType`, `getParameterizedType`, `getDeclaringExecutable`, the annotation queries, `equals`, `hashCode` and `toString`.
+- Malformed attributes raise `MalformedParametersException` as the JDK does.
+- Method resolution now continues into maximally specific superinterface methods (JVMS 5.4.3.3), which calls through `Executable` and inherited interface methods need.
+- Generic arrays and wildcards are complete in the generic type engine, and `Class.getTypeName` prints arrays as `T[]`.
+- `java.lang.Comparable` exists; `String` and the eight wrappers implement it with JDK `compareTo` semantics, plus the static `compare` methods.
+- Fixtures: `ParameterReflection` (compiled with and without `-parameters`) and `ComparableValues`.
+
+### C3. Generic declarations and nested classes (done)
+
+- `TypeVariable` records its generic declaration and computes bounds lazily, so recursive bounds such as `T extends Comparable<T>` work; equality follows the declaration and name.
+- Type variables resolve through the JDK scope chain: method or constructor, declaring class, then enclosing method or class.
+- `Class/Method/Constructor.getTypeParameters`, `Class.getGenericInterfaces`, and `toGenericString`.
+- `ParameterizedType`, `TypeVariable`, `WildcardType` and `GenericArrayType` are interfaces implemented by the JDK's `sun.reflect.generics.reflectiveObjects` classes, and `GenericDeclaration` exists.
+- Parse `InnerClasses` and `EnclosingMethod`; implement `Class.getSimpleName`, `getCanonicalName`, `getEnclosingClass`, `getDeclaringClass`, `getEnclosingMethod/Constructor`, `isMemberClass`, `isLocalClass`, `isAnonymousClass`, and `getDeclaredClasses/getClasses`.
+- Fixtures: `GenericDeclarations`, `NestedClasses`, `ReflectionStrings`, and `ArraySemantics`.
+- Also fixed on the way: array classes are created on first use for literals, `anewarray`, type tests and mirrors, and reference arrays record their component class; `multianewarray` is implemented (decoder, verifier and runtime); `Modifier`, `Method/Constructor/Field.toString` and `toGenericString` print in the JDK format; `PrintStream.print` writes without a newline; classes declaring unlinked `native` methods load and throw `UnsatisfiedLinkError` when called.
+- The `AnnotatedType` family is the JDK's: `AnnotatedType`, `AnnotatedParameterizedType`, `AnnotatedArrayType`, `AnnotatedTypeVariable` and `AnnotatedWildcardType` are interfaces implemented by the `sun.reflect.annotation.AnnotatedTypeFactory$*Impl` classes, chosen by the annotated `Type`.
+- Annotated types carry their site, index and full type path, so nested type arguments, array components and wildcard bounds find their type-use annotations; an implicit `Object` upper bound (a wildcard with lower bounds) has none, as in the JDK.
+- `TypeVariable` implements `AnnotatedElement` (its type-parameter annotations) and `getAnnotatedBounds` (bound annotations, skipping the class-bound slot when the first bound is an interface).
+- Fixture: `AnnotatedTypes`.
+
+### Gaps found outside plan 03
+
+- MiniJRE breadth: `String` and `StringBuilder` expose only a few methods (`trim`, `indexOf`, `split`, `replace`, `setLength` and many more are missing); this is runtime-expansion work that Spring needs.
+- `volatile` fields, `synchronized` methods and `monitorenter`/`monitorexit` are rejected at load time; they belong to plan 05, but even a single-threaded Spring application needs them to load.
+
+### C4. Java 8 access rules (done)
+
+- Reflection follows `Reflection.verifyMemberAccess`: the member's class must be public or in the caller's package, privates are reachable only from their own class (Java 8 class files have no nestmates), and a protected instance member or constructor reached from another package needs a target of the caller's class.
+- `IllegalAccessException` messages match the JDK ("class A cannot access a member of class B with modifiers \"protected\"", "with package access"), as do the final-field and wrong-type messages of `Field.set*` ("Can not set final int field ...").
+- `MethodHandles.Lookup` checks run in the JDK's order: the symbolic class, then the lookup class's own resolution ("no such method"), then the lookup modes ("member is private", "expected a static field", "unexpected set of a final field").
+- A protected member found from a subclass in another package narrows the handle's receiver to the lookup class, so other receivers fail with the JDK's `ClassCastException`.
+- `Lookup.in` follows Java 8's mode rules, and handle invocation no longer re-checks access (it was checked at lookup).
+- Bytecode linkage keeps the JVMS 5.4.4 rule, without the reflection-only class check.
+- Also fixed on the way: `Class.toString`, `Class.newInstance`, `MethodType.toString`, and common `String` methods (`indexOf`, `lastIndexOf`, `startsWith`, `endsWith`, `trim`, `replace`, `equalsIgnoreCase`, case mapping, `toCharArray`, `valueOf(char[])`, `new String(...)`).
+- Fixture: `AccessRules` (with `AccessRulesBase` and `AccessRulesSub` in two packages).
+
+### C5. Default-method special invocation (done)
+
+- The private `Lookup(Class, int)` and `Lookup(Class)` constructors exist and work through reflection, as Spring 5 uses them on Java 8.
+- `unreflect`, `unreflectSpecial`, `unreflectConstructor`, `unreflectGetter` and `unreflectSetter` follow Java 8, including the trusted lookup for accessible members.
+- `invokeWithArguments` spreads an array or list into a generic invocation, including varargs collectors.
+- `invokespecial` handles run the selected body even on a proxy receiver, so an `InvocationHandler` can run an interface's default method.
+- Also fixed: virtual handles select default methods; field-handle results and setters return through the `asType` boundary (a generic `invoke` of a setter returned no value before); `MethodType.methodType(Class, Class, Class...)` and `methodType(Class, MethodType)`.
+- Fixture: `DefaultMethodProxy` (it falls back to `privateLookupIn` only where the JDK oracle lacks or closes the Java 8 constructors).
+
+### C6. Class loaders, `defineClass` and namespaces (done)
+
+- `ClassLoader` is subclassable: both constructors, `getParent`, `loadClass(String)` (calling the two-argument form virtually), `loadClass(String, boolean)` with the JDK algorithm (`findLoadedClass`, the parent, then `findClass`), `findClass`, `findLoadedClass`, `resolveClass`, `findSystemClass`, `getClassLoadingLock`, `registerAsParallelCapable`, `getResource`/`getResourceAsStream` delegation and `findResource`.
+- Each loader owns a namespace; a `ClassNotFoundException` from the parent resumes `loadClass` through a catching boundary (`LoaderCatch`).
+- `defineClass` (all three forms) checks the prohibited `java.*` packages, the expected name ("wrong name") and duplicates, resolves supertypes through the defining loader (a missing one is `NoClassDefFoundError`), and resolves every other name it mentions through that loader too.
+- JVMS 5.4 lets a VM load referenced classes eagerly; a name the loader cannot load stays unresolvable and fails only at use, so laziness is not observable except through loader side effects before first use.
+- A binary name defined by a second loader gets a distinct internal name (a U+E000 suffix that no Java source can produce), and its class file is renamed in its namespace; names print without the suffix.
+- Verification of a user-defined class waits for linking (first initialization), where a failure is a `VerifyError` on every attempt.
+- `Class.getClassLoader` reports the defining loader (arrays report their element's), runtime packages compare loaders, the system loader never sees user-defined classes, and `Class.forName` uses the caller's or the given loader.
+- Host failures now reach boundaries at the suspended intrinsic first (a `ClassNotFoundException` from the system loader's class path lookup is catchable by a delegating loader).
+- Also added on the way: array `clone()`, `java.lang.SecurityException`, and the binary name in class path `ClassNotFoundException` messages.
+- A renamed class's `Signature` attributes and annotation type descriptors point at renamed Utf8 entries, and the classes they name resolve through the defining loader like any other name the class mentions, so a second definition's annotations and generic types stay in its namespace.
+- Fixture: the `loaders/user-class-loaders` check runs `ClassLoaders` with `isolated.*` classes visible only as resources, including deserialization inside isolated code and a second definition's annotations and generic types.
+
+### C7. Subclass proxies (done)
+
+- Class bytes written at run time (as ASM writes them) are defined through a user loader and behave as CGLIB/ByteBuddy subclasses: overrides that call `super` (`invokespecial` on the parent), inherited protected fields, implemented interfaces, reflection over the generated members, and calls through the parent's `Method`.
+- A generated class that fails verification is defined, and fails with `VerifyError` at first use.
+- Also added: `ArrayList.toString` (elements through their own `toString`).
+- Fixture: `SubclassProxies` (its class writer is in the fixture).
+
+### C8. Classpath and package scanning (done)
+
+- Class files and directories are resources: `getResource(s)` finds `pkg/` and `pkg` in directories and in jars with directory entries.
+- `URL` keeps its external form; `URL(String)`, `URL(URL, String)` (relative resolution, also inside jars), `openConnection`, `toURI`, `getFile`, `getHost`, `getRef` and `equals`.
+- `java.net.URI` parses and validates RFC 2396 references and decodes escapes as UTF-8.
+- `File` normalizes paths and implements `listFiles`, `list`, `getName`, `getParent(File)`, `getAbsolutePath(File)`, `File(URI)`, `File(parent, child)` and the separator fields.
+- `URLConnection`, `JarURLConnection`, `ZipFile`, `JarFile`, `ZipEntry` and `JarEntry` support the scanning sequence: entries in central-directory order, `getJarEntry`, and entry streams.
+- Fixture: the `resources/package-scanning` check runs `PackageScanning` over a directory and a jar, as Spring 5's `PathMatchingResourcePatternResolver` does.
+
+### C9. Formatting (done)
+
+- Annotation `toString` matches the oracle JDK's `AnnotationInvocationHandler`: canonical names, quoted strings and chars, `L`/`f` suffixes, `(byte)0x..`, `.class` literals, `{...}` arrays, and the lone `value` shorthand.
+- Members follow the JDK order: defaults in `AnnotationType`'s `HashMap` bucket order, then explicit members.
+- Ties within one bucket follow HotSpot's internal method order, which no other VM can reproduce.
+  This is a deliberate difference: declaration order is used, and the fixture avoids ties.
+- The format is the oracle's (modern JDK), consistent with the rest of the suite; Java 8 printed strings unquoted.
+- Resource URLs escape as `ParseUtil.encodePath` does: each UTF-16 unit, lowercase hex, and `;`, `=`, `?`, `#` and brackets among the escaped characters; class path roots are canonical paths as in the JDK.
+- `Enum.toString`, `compareTo` and `getDeclaringClass` exist, and Object methods on proxies and annotations reached from intrinsic callbacks now dispatch like bytecode calls.
+- Fixtures: `AnnotationFormatting` and the `resources/url-escaping` check (`ResourceUrls`).
+
+### C10. Serialization (done)
+
+- `ObjectOutputStream` and `ObjectInputStream` speak the JDK stream protocol, written in Bend (`bendjvm/java/serial.bend`) with Java callbacks resuming a task machine.
+- Streams carry objects, strings, `Class` objects, enums, primitive and reference arrays, proxies (`TC_PROXYCLASSDESC`), null and back references; handles are assigned in the JDK's order, so repeated objects and cycles come back with their identity.
+- Class descriptors list fields as `ObjectStreamField` sorts them (primitives first, then by name) and carry the declared `serialVersionUID`, or the one `computeDefaultSUID` derives with SHA-1 from the class's name, modifiers, interfaces, members and static initializer.
+- MiniJRE classes the JDK serializes (`String`, `Enum`, `Number` and the boxes, `Proxy`, `SerializedLambda`) use the JDK's UIDs and field layouts.
+- Private `writeObject`/`readObject` run in block-data mode with `defaultWriteObject`/`defaultReadObject`, `writeUTF`/`readUTF` and the other `DataOutput`/`DataInput` methods; unread custom data is skipped up to `TC_ENDBLOCKDATA`.
+- `writeReplace` repeats while the replacement's class changes and is remembered for later writes; `readResolve` replaces the object and its handle.
+- Serializable lambdas write a `SerializedLambda` and read back through the capturing class's `$deserializeLambda$`.
+- Reading allocates without constructors except the no-argument constructor of the first non-serializable superclass, which must be accessible (`no valid constructor` otherwise), and rejects a `serialVersionUID` mismatch with the JDK's `InvalidClassException` message.
+- `Externalizable` classes write `SC_EXTERNALIZABLE | SC_BLOCK_DATA` descriptors and their `writeExternal` data in block-data mode; reading runs the public no-argument constructor, then `readExternal`.
+- `writeUnshared` and `readUnshared` keep the object out of the handle table; a back reference to it, or `readUnshared` of a back reference, is the JDK's `InvalidObjectException`.
+- `reset` writes `TC_RESET` and forgets handles and replacements (`IOException: stream active` inside a write); the reader accepts `TC_RESET` between objects and between data blocks, with the JDK's recursion-depth check.
+- Fields are matched by name as `ObjectStreamClass.matchFields` does, and a primitive type change is an `InvalidClassException`.
+- Class data follows `getClassDataLayout`: stream classes the object lacks are read and dropped, and local classes missing from the stream get `readObjectNoData`.
+- `ObjectInputStream` reads any `InputStream`: `ByteArrayInputStream` and resource streams in place, others through their own `read()` and `read(byte[], int, int)`, asking for exactly the bytes it needs.
+- Each reader step is a pure step over the VM state; a step that runs short of bytes, or meets a class its loader has not loaded, fails with a request, and replays once the Java call returns.
+- Stream classes resolve through `latestUserDefinedLoader()`: a class the loader's namespace already knows is used directly, and any other is loaded with `Class.forName(name, false, loader)`.
+- Also added: `writeBytes`, `writeChars`, `read(byte[], int, int)`, `readFully(byte[], int, int)`, `skipBytes`, `available`, and `close` closing the source stream.
+- Also fixed on the way: a serializable lambda's generated `writeReplace` had duplicate symbol ids, so name lookups could not find it; `java.lang.reflect.Proxy` implements `Serializable`; the core `java.util.function` interfaces exist (abstract methods only).
+- Also fixed: `InputStream.read()` returned sign-extended bytes, `read(byte[])` and `read(byte[], int, int)` read one byte without filling the array, `ObjectInputStream` never advanced a `ByteArrayInputStream`'s position, and `Integer.parseInt(String, int)` was missing.
+- Also fixed in the runtime: a native that an intrinsic calls back and that waits on the host (a file read, a class load) now resumes the intrinsic's continuation instead of returning into the frame below, and the host loop applies an effect that a resumed callback chain requests right away.
+- Subclass hooks run as Java callbacks: `writeStreamHeader`/`readStreamHeader`, `writeClassDescriptor`/`readClassDescriptor`, `annotateClass`/`annotateProxyClass` (written in block-data mode, skipped JDK-style when not read), `resolveClass`/`resolveProxyClass`, `replaceObject`/`resolveObject` under `enableReplaceObject`/`enableResolveObject`, and `writeObjectOverride`/`readObjectOverride` through the protected constructors.
+- Descriptor reading and writing are steps of the task machines, so each hook sees the stream exactly where the JDK calls it.
+- `ObjectStreamClass` (`lookup`, `lookupAny`, `getName`, `getSerialVersionUID`, `forClass`, `getFields`, `getField`, `toString`) and `ObjectStreamField` exist; a descriptor read from a stream is an `ObjectStreamClass`, and a class's own is cached on its mirror.
+- `serialPersistentFields` declares the serializable fields (bound to same-named fields of the same type), and `putFields`/`writeFields` and `readFields` (`GetField.get`, `defaulted`, `getObjectStreamClass`) work with the JDK's `IllegalArgumentException` messages.
+- `registerValidation` callbacks run after the top-level `readObject`, highest priority first.
+- A top-level write that meets an `IOException`, whether the serializer's own or one thrown by a `writeObject`/`writeExternal`/hook callback (caught by a `SerialCatch` call boundary), writes `TC_EXCEPTION` and the exception, then rethrows; the reader turns it into `WriteAbortedException`. `Throwable` is `Serializable`, with its message and cause as fields.
+- A reference field whose local type changed rejects a value of another type with the JDK's `ClassCastException` message.
+- `useProtocolVersion(1)` writes `Externalizable` data without block-data mode, and `drain` is available to subclasses.
+- Known differences, all on error paths: a `ClassNotFoundException` from resolving a stream class is thrown at once, where the JDK records it, reads on, and throws it when `readObject` returns; duplicate names in `serialPersistentFields` are not rejected; and the writer reads `serialPersistentFields` without initializing a class it only describes (`writeObject(SomeClass.class)`).
+- Fixtures: `SerializationStreams` (its hex dumps match the JDK's bytes), `SerializationEvolution` and `SerializationHooks`.
+
+### C11. Security and privileged actions (done)
+
+- `System.getSecurityManager()` returns `null`.
+- `AccessController.doPrivileged` runs `PrivilegedAction` and `PrivilegedExceptionAction` (with or without a context) on the caller's stack.
+- A checked exception from a `PrivilegedExceptionAction` becomes a `PrivilegedActionException` cause, with a null message; runtime exceptions and errors pass through.
+- Fixture: `PrivilegedActions`.

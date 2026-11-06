@@ -38,7 +38,7 @@ program output or a VM error
 
 The project is designed around two boundaries:
 
-- **Bend owns JVM semantics and state.** Host C/JavaScript code is limited to launch I/O, file/TCP effects, and the generated-artifact adapter.
+- **Bend owns JVM semantics and state.** Host C/JavaScript code is limited to launch I/O, file/socket/TLS effects, the native-plugin helper, and the generated-artifact adapter. Java threads, monitors and their scheduling are Bend state.
 - **The reference JVM is the oracle.** The differential test harness compiles the same Java fixture with `javac`, runs it with `java`, runs it with BendJVM, and compares observable output.
 
 - Java 8 class files (major version 52)
@@ -55,12 +55,18 @@ The project is designed around two boundaries:
 - string constants, UTF-16 decoding, `String`/`StringBuilder`/`Integer`/`Math` MiniJRE methods
 - `ArrayList`/`HashMap`, `invokeinterface`, in-memory and file streams, and UTF-8 readers
 - blocking TCP client/server sockets, try-with-resources, and typed exception unwinding
+- Java threads on a Bend scheduler: `Thread` lifecycle, interruption, `join`, `sleep`, daemon shutdown and uncaught-exception handlers, with preemption every 1000 instructions by default, weighted by thread priority
+- JDK-style stack traces from `printStackTrace` and for uncaught exceptions, with source files and line numbers
+- monitors: `synchronized` methods and blocks, `monitorenter`/`monitorexit`, `wait`/`notify`/`notifyAll`, and volatile fields under a sequentially consistent memory model
+- scheduler-aware networking: classic sockets, `java.nio` buffers, `SocketChannel`/`ServerSocketChannel` and `Selector`, plus client/server TLS through `javax.net.ssl`
+- a restricted native-plugin bridge (not JNI): `System.load`/`loadLibrary` of launcher-allowed libraries, run in a supervised helper process
 - class initialization, typed Java exceptions, and `System.out.println` for supported primitive types
 - instruction tracing, class dumps, disassembly, fuel limits, heap limits, and `--no-files`/`--no-net`
 - structured annotation attributes parsed and retained through linking, including visible/invisible declaration, parameter, type, default, and `Exceptions` metadata
 - `ldc` Class literals, cached mirrors for loaded classes/arrays, primitive and void mirrors, `Object.getClass`, `Class.forName(String)`, and `ClassLoader.loadClass(String)`
 - bounded `Class` introspection, declared `Field`/`Method`/`Constructor` discovery, annotation materialization/defaults/repeatable queries, field access, reflective invocation, and construction
 - interface dynamic proxies backed by Bend-owned handler callbacks, plus ordered classpath resource streams/URLs and bounded `Properties` parsing
+- `ObjectOutputStream`/`ObjectInputStream` with the JDK stream format: computed or declared `serialVersionUID`s, back references, enums, arrays, proxies, custom `writeObject`/`readObject`, `writeReplace`/`readResolve`, `Externalizable`, unshared objects, `reset`, class evolution by field name, subclass hooks, `PutField`/`GetField`, validation callbacks, recorded write failures, serializable lambdas, any `InputStream` as a source, and stream classes loaded through the caller's class loader
 
 ## Getting started
 
@@ -141,11 +147,19 @@ Useful options:
 | `--fuel N` | Stop after at most `N` interpreter steps. Default: `1000000`. |
 | `--max-heap N` | Limit simulated heap entries. Default: `1024`. |
 | `--no-files` | Deny `FileInputStream`/`FileOutputStream` host effects. |
-| `--no-net` | Deny `Socket`/`ServerSocket` host effects. |
+| `--no-net` | Deny socket, channel and TLS host effects. |
+| `--quantum N` | Instructions a Java thread runs before the scheduler switches threads. Default: `1000`. |
+| `--native-library NAME=PATH` | Allow `System.loadLibrary(NAME)` to load the plugin at absolute `PATH`. Repeatable. |
+| `--native-allow PATH` | Allow `System.load(PATH)` for that absolute path. Repeatable. |
+| `--native-timeout MS` | Deadline for one native call; on expiry the helper is stopped. Default: `30000`. |
+| `--tls-trust PEM` | Trust roots for TLS peers. Without it the provider's system roots apply. |
+| `--tls-key PEM` / `--tls-cert PEM` | The TLS identity: the server certificate, and the client certificate offered to servers that ask for one. Given together. |
 | `--dump-class` | Print loaded class metadata without executing `main`. |
 | `--disassemble` | Print class metadata and decoded instructions. |
 | `--trace` | Print decoded instruction execution diagnostics to stderr. |
 | `--prepare` | Build cached Bend loader/runtime artifacts without running a class. |
+
+`--fuel` is one budget for every Java thread together. Native loading is off unless a `--native-*` option allows a library, and TLS material is checked (readable PEM, key matching certificate) before any Java code runs.
 
 Archive sources accept stored and deflated entries. Reads are bounded at
 64 MiB per entry and 512 MiB decompressed per archive. Unsafe names,
@@ -231,6 +245,21 @@ Bend
 `66` is the first byte of `banner.txt` (`B`). The same classes also run from a
 JAR whose manifest names `example.hello.Main`.
 
+`examples/webserver/` is a small HTTPS/1.1 server: an acceptor thread feeds a
+monitor-protected work queue, three workers answer requests, a volatile flag
+stops it, and `POST /checksum` calls a native plugin. Build and run it with a
+test CA and identity of your own (the test suite generates throwaway ones):
+
+```bash
+mkdir -p /tmp/bendjvm-web
+javac --release 8 -d /tmp/bendjvm-web examples/webserver/example/web/*.java
+cc -shared -fPIC -I bendjvm/native -o /tmp/bendjvm-web/libwebchecksum.so examples/webserver/native/web_checksum.c
+python3 scripts/run.py --fuel 2000000000 --tls-trust ca.pem --tls-key server.key --tls-cert server.pem \
+  --native-library webchecksum=/tmp/bendjvm-web/libwebchecksum.so -cp /tmp/bendjvm-web example.web.HttpsServer 8443
+```
+
+On macOS use `-dynamiclib` and a `.dylib` name for the plugin.
+
 Run every example through the practical runner:
 
 ```bash
@@ -270,7 +299,11 @@ The harness requires Python 3.10+, a JDK, Bend 2, and Bun. It compiles sources a
 | `bendjvm/verifier/` | Stack contracts, local bounds, descriptor checks, and instruction validation. |
 | `bendjvm/loader/` | Symbol interning, class catalog/linking, bootstrap classes, intrinsic registration, metadata retention, and VM construction. |
 | `bendjvm/heap/` | Object, primitive-array, reference-array, string, and resource-stream entries with bounded allocation. |
-| `bendjvm/java/` | MiniJRE intrinsics: objects/strings/collections, bounded class mirrors/member discovery, resources/URL/Properties, streams, files, TCP, throwables, and `println`. |
+| `bendjvm/java/` | MiniJRE intrinsics: objects/strings/collections, bounded class mirrors/member discovery, resources/URL/Properties, streams, files, threads and monitors, the `HostIO` socket gateway, native plugin calls, throwables, and `println`. |
+| `bendjvm/runtime/` | The interpreter, frames, wide arithmetic, the thread/monitor records (`threads.bend`) and the scheduler (`scheduler.bend`). |
+| `bendjvm/jre/` | MiniJRE classes written in Java and compiled during `--prepare`: `Thread`, sockets, `java.nio` buffers/channels/selectors, and `javax.net.ssl`. |
+| `bendjvm/native/` | `bendjvm_plugin.h`, the versioned native-plugin ABI. |
+| `bendjvm/native/helper.c` | The supervised process that loads allowed plugins and runs their calls; compiled on first use (needs `cc`). |
 | `scripts/classpath.py` | Ordered directory/JAR/ZIP sources, manifest expansion, bounded reads, and resource lookup. |
 | `scripts/run.py` | Builds cached Bend JavaScript artifacts and provides the structured practical command-line runner. |
 | `scripts/test.py` | Differential, classpath/JAR, file/TCP, malformed-input, limit, debug-mode, and generated-program tests. |
@@ -291,12 +324,17 @@ interface abstract (`0x0401`).
 | Integers / Math | `Integer.valueOf(I)`, `intValue()`, `parseInt`, `equals`, `hashCode`, `toString`; cached `valueOf` identities for `-128..127`; `Math.abs/min/max` on `I`; `System.arraycopy` |
 | Collections | `ArrayList`/`List`/`Collection`/`Iterable`/`Iterator` and `HashMap`/`Map` as registered in bootstrap, including iterator `hasNext/next/remove` |
 | Streams | `InputStream.read()I`, `read([B)I`, `read([BII)I`, `close`; `OutputStream.write(I\|[B\|[BII)`, `flush`, `close`; `ByteArrayInputStream([B)`, `ByteArrayOutputStream` `toByteArray/size/reset` |
+| Serialization | `ObjectOutputStream(OutputStream)` `writeObject`, `writeUnshared`, `defaultWriteObject`, `reset`, `DataOutput` writes, `flush`, `close`; `ObjectInputStream(InputStream)` `readObject`, `readUnshared`, `defaultReadObject`, `DataInput` reads, `read`, `readFully`, `skipBytes`, `available`, `close`; `Externalizable`; the subclass hooks (`resolveClass`, `annotateClass`, `replaceObject`, `readClassDescriptor`, the override constructors and the rest); `ObjectStreamClass`/`ObjectStreamField`, `serialPersistentFields` with `PutField`/`GetField`, `registerValidation`, and `TC_EXCEPTION` |
 | Files | `File(String)` `exists/isFile/isDirectory/getPath`; `FileInputStream(String)`; `FileOutputStream(String)` and `(String,Z)` |
 | Reflection / metadata | `Object.getClass()`, cached primitive/void/array/class mirrors and wrapper `TYPE` fields, `Class` name/superclass/modifier/array/interface/primitive/assignability/instance checks, annotation queries/materialization/defaults/repeatable expansion, `cast`, `forName(String)` and `forName(String,boolean,ClassLoader)`, `ClassLoader.loadClass(String)`, declared member arrays and exact name/parameter lookup, declaring-class/basic metadata accessors, per-handle `AccessibleObject.setAccessible/isAccessible`, `Field.get/set`, `Method.invoke`, and `Constructor.newInstance`; generic accessors: `Class.getGenericSuperclass`, `Field.getGenericType`, `Method.getGenericReturnType/getGenericParameterTypes/getGenericExceptionTypes`; annotated accessors: `Field.getAnnotatedType`, `Method.getAnnotatedReturnType/getAnnotatedParameterTypes`; `Proxy`/`InvocationHandler` interface proxies, generated-class identity, category-one boxing, and handler lookup |
 | Resources / configuration | `Class`/`ClassLoader` relative/root lookup, ordered `getResources`, origin-bound `URL.openStream`, local URL path/protocol/string accessors, `Properties.load(InputStream)` and bounded UTF-8 `Properties.load(Reader)` for memory-backed `InputStreamReader`, `getProperty`/default getter/`setProperty`; lookup is ordered and first-match |
 | Text | `Reader.read()I`, `read([CII)I`, `close`; `Writer.write(I\|String\|[CII)`, `flush`, `close`; `InputStreamReader`/`OutputStreamWriter` `(stream, UTF-8)`; `BufferedReader.readLine` |
-| TCP | `InetSocketAddress(String,I)`; `Socket()V`, `(String,I)`, `connect(SocketAddress,I)`, `getInputStream`, `getOutputStream`, `setSoTimeout`, `close`; `ServerSocket(I)`, `getLocalPort`, `accept`, `setSoTimeout`, `close` |
-| Throwables | `Throwable` no-arg/message/cause/message+cause `<init>`, `getMessage`, `getCause`, `initCause`, `addSuppressed`, `getSuppressed`, `toString`; `UndeclaredThrowableException` cause access; `IOException` has the four Java 8 constructors |
+| Threads | `Runnable`; `Thread()`, `(Runnable)`, `(String)`, `(Runnable,String)`, `start`, `run`, `currentThread`, `isAlive`, `getState`, `getId`, `get/setName`, `set/isDaemon`, `join()`/`(J)`/`(JI)`, `sleep(J)`/`(JI)`, `yield`, `interrupt`, `isInterrupted`, `interrupted`, `holdsLock`, per-thread and default `UncaughtExceptionHandler`; `Thread.State`; `ThreadGroup` (hierarchy, `activeCount`, `enumerate`, `interrupt`, `setMaxPriority`, `uncaughtException`) and the `Thread(ThreadGroup, ...)` constructors; `Object.wait()`/`(J)`/`(JI)`, `notify`, `notifyAll`; `System.nanoTime`, `currentTimeMillis` |
+| TCP | `InetAddress.getByName`, `getLoopbackAddress`, `getHostAddress`, `getHostName`, `getAddress`; `InetSocketAddress(String,I)`/`(InetAddress,I)`/`(I)`, `createUnresolved`, `isUnresolved`; `Socket()`, `(String,I)`, `connect`, `getInputStream`, `getOutputStream`, `setSoTimeout`, `shutdownInput`, `shutdownOutput`, `isClosed`, `isConnected`, `close`; `ServerSocket(I)`, `bind`, `getLocalPort`, `accept`, `setSoTimeout`, `close` |
+| NIO | `Buffer` position/limit/capacity/`clear`/`flip`/`rewind`/`remaining`; `ByteBuffer.allocate/wrap`, relative, indexed and bulk `get`/`put`, `compact`, `slice`, `duplicate`, `array`; `SocketChannel`, `ServerSocketChannel`, `Selector`, `SelectionKey` with the `keys()`/`selectedKeys()` sets |
+| TLS | `SSLContext.getDefault/getInstance`, `SSLSocketFactory`, `SSLServerSocketFactory`, `SSLSocket` handshake/session/parameters/protocol and suite selection, `SSLServerSocket` with `setNeedClientAuth`, `SSLParameters` endpoint identification, `SSLSession` |
+| Native | `System.load(String)`, `System.loadLibrary(String)`, and `native` methods bound through `bendjvm/native/bendjvm_plugin.h` |
+| Throwables | `Throwable` no-arg/message/cause/message+cause `<init>`, `getMessage`, `getCause`, `initCause`, `addSuppressed`, `getSuppressed`, `toString`, `printStackTrace()`/`(PrintStream)` with source lines; `UndeclaredThrowableException` cause access; `IOException` has the four Java 8 constructors |
 
 The reflection slice is intentionally bounded. Class mirrors are cached for
 loaded class and array identities. Declared members expose basic metadata;
@@ -320,9 +358,9 @@ type arguments and type-variable names.
 paths; class type parameters, generic interfaces, and local-variable/expression
 sites remain metadata-only.
 `Class.forName(name, initialize, null)` resolves bootstrap classes through the
-bootstrap loader. Caller package edges, default-method proxy dispatch,
-category-two bytecode execution, and complete OpenJDK formatting remain
-outside this bounded slice.
+bootstrap loader.
+Plan 03's completion slices go further: Java 8 access rules, default-method special invocation, user class loaders, subclass proxies, package scanning, JDK annotation and URL formatting, serialization, and privileged actions.
+[Plan 03](.plans/03-reflection-and-metadata.md) lists each slice and its remaining limitations.
 
 Resources are root-relative for `ClassLoader` and package-relative for `Class`;
 relative class names normalize `./` and `..`, while single lookups preserve
@@ -341,12 +379,24 @@ The class-file metadata parser validates declaration, parameter, type, and
 nested `Code` type-annotation attributes and links them into method metadata.
 Runtime-visible annotations materialize supported values on demand; CLASS
 retention remains absent from runtime query results. Wide annotation constants
-are represented losslessly as two raw U32 words inside boxed `Long`/`Double`
-reflection results; they do not imply general long/double execution.
+are carried losslessly as two raw U32 words and box to ordinary `Long` and
+`Double` values.
 
+`long` and `double` run as two-word category-two values. Binary64 arithmetic,
+remainder and conversions are computed in Bend, and `Double.toString` matches
+the JDK's shortest-decimal output. `Long` and `Double` provide `valueOf`,
+unboxing, `equals`, `hashCode`, `toString`, `parseLong`, `isNaN`,
+`isInfinite` and the raw-bits conversions.
 
-Host file and TCP effects use opaque handles scoped to one VM run. `--no-files`
-and `--no-net` deny those effects with `IOException`. `--max-heap` counts heap
+`java.lang.invoke` supports `MethodType`, `MethodHandles.lookup()` with the
+`find*` family, `bindTo`, `asType`, `insertArguments`, `constant`,
+`identity`, varargs collectors, `invokeExact`/`invoke`, and constant, mutable
+and volatile call sites. `invokedynamic` runs any bootstrap method built from
+that surface; `LambdaMetafactory.metafactory` and `altMetafactory` (including
+`SerializedLambda`) back Java 8 lambdas and method references.
+
+Host file and socket effects use opaque handles scoped to one VM run and never reused. `--no-files`
+and `--no-net` deny those effects with `IOException` (`SocketException` for sockets). `--max-heap` counts heap
 entries. Relative files resolve against the launch working directory. The host
 closes remaining handles on every process exit, including fuel exhaustion and
 uncaught exceptions. This is a capability control, not a sandbox.
@@ -361,15 +411,17 @@ yet promise:
   annotation formatting
 - modules, JNI, agents, custom class-loader subclasses, arbitrary `defineClass`,
   or multiple independent application-loader namespaces
-- `long` and `double` bytecode execution, category-two field/call conversion,
-  or complete floating-point edge-case compatibility; annotation reflection
-  only exposes boxed raw-word wide values
-- `invokedynamic`, method handles, default-method special proxy invocation, or
-  full verifier compatibility
-- Java threads, monitors, `synchronized`, `volatile`, garbage collection, JIT
-  compilation, or Spring Boot nested-JAR layouts
+- `StringConcatFactory`, constant-dynamic linkage, or MethodHandle combinators
+  beyond `bindTo`, `asType`, `insertArguments` and varargs collection
+- default-method special proxy invocation
+- verification beyond the Java 8 StackMapTable type checker; there is no
+  inference-based fallback for class files without frames
+- JNI (the native bridge is BendJVM's own restricted ABI), `ThreadLocal`, `java.util.concurrent`, `SSLEngine`, TLS over
+  selectable channels, `DatagramChannel` or direct buffers
+- garbage collection, JIT compilation, or Spring Boot nested-JAR layouts
 
 BendJVM is not a sandbox-grade security boundary. Java code only reaches host behavior through registered intrinsics, but untrusted bytecode should still be treated as untrusted input.
+Native plugins run real native code with the helper process's operating-system permissions: the separate process keeps a plugin crash away from the VM, but it does not contain a malicious library.
 
 ## Design direction
 
@@ -381,7 +433,6 @@ The project specification is documented in [`bendjvm-spec.md`](bendjvm-spec.md).
 4. Reject unsupported semantics instead of approximating them.
 5. Prove small interpreter invariants in Bend before optimizing representation or dispatch.
 
-Classpath, JAR/ZIP, manifest, MiniJRE streams, files, blocking TCP, bounded
-reflection, runtime annotation materialization, and interface proxies are in
-place. The next milestones are broader bytecode coverage, stronger edge-case
-compatibility, and concurrency — not Spring Boot until those exist.
+Classpath loading, the MiniJRE, reflection, the Java 8 bytecode set, threads, monitors,
+networking, TLS and the native bridge are in place. The next milestone is the Spring
+Boot launcher layout.

@@ -4,6 +4,7 @@ import ./symbols.bend as S
 import ./bootstrap.bend as B
 import ../classfile/descriptor.bend as D
 import ../classfile/constant_pool.bend as CP
+import ../classfile/bootstrap_methods.bend as BM
 import ../classfile/metadata.bend as MD
 
 type Catalog is Data:
@@ -57,7 +58,7 @@ def member_symbols_fields(fields: +List<M.Field>) -> +List<String>:
 def member_symbols_methods(methods: +List<M.Method>) -> +List<String>:
   match methods:
     case Nil{}: Nil{}
-    case Con{M.Method{flags, name, desc, stack, locals, code, ins, handlers, attrs}, rest}:
+    case Con{M.Method{flags, name, desc, stack, locals, code, ins, handlers, attrs, switches}, rest}:
       Con{name, Con{desc, member_symbols_methods(rest)}}
 
 def symbols(classes: +List<M.ClassFile>, sy: +List<String>) -> +List<String>:
@@ -90,7 +91,6 @@ def field_records(fields: +List<M.Field>, +owner: U32, +sy: +List<String>, id: U
       +descriptor = desc
       do Result<&2, &2, String, +List<M.LoadedField>>:
         typ : M.JvmType <- D.parse_field(descriptor)
-        check(U32.is_eq(U32.and(flags, 64), 0), "UnsupportedFeature: volatile field")
         tail : +List<M.LoadedField> <- field_records(rest, owner, sy, (nextId + 1 : U32))
         field : M.LoadedField <- field_value(D.slot_tag(typ), nextId, owner, sy, name, descriptor, flags)
         return Con{field, tail}
@@ -155,6 +155,10 @@ def class_literal_name(name: String) -> String:
 def link_literal(op: U32, a: U32, b: U32, c: U32, offset: U32, value: M.Constant, +pool: +List<M.Constant>, +sy: +List<String>) -> Result<&2, &2, String, M.Instruction>:
   match value:
     case M.Number{kind, bits}: Done{M.Instruction{op, bits, literal_tag(kind), c, offset}}
+    case M.PairIndex{15, reference_kind, reference}:
+      Done{M.Instruction{op, a, 6, c, offset}}
+    case M.Index{16, descriptor_index}:
+      Done{M.Instruction{op, a, 7, c, offset}}
     case M.PairIndex{kind, first, second}:
       Done{M.Instruction{op, first, second, literal_tag(kind), offset}}
     case M.Index{7, index}:
@@ -196,6 +200,10 @@ def link_one(value: M.Instruction, +pool: +List<M.Constant>, +sy: +List<String>)
           do Result<&2, &2, String, M.Instruction>:
             name : String <- CP.class_name(pool, a)
             return M.Instruction{op, S.find(sy, name), b, c, offset}
+        case 197:
+          do Result<&2, &2, String, M.Instruction>:
+            name : String <- CP.class_name(pool, a)
+            return M.Instruction{op, S.find(sy, name), b, c, offset}
         case 193:
           do Result<&2, &2, String, M.Instruction>:
             name : String <- CP.class_name(pool, a)
@@ -219,14 +227,17 @@ def link_instructions(values: +List<M.Instruction>, +pool: +List<M.Constant>, +s
   link_go(values, pool, sy)
 
 
-def method_value(native: Bool, intrinsic: U32, nextId: U32, owner: U32, +sy: +List<String>, name: String, descriptor: String, +flags: U32, parameters: U32, resultTag: U32, maxStack: U32, maxLocals: U32, instructions: +List<M.Instruction>, handlers: +List<M.Handler>) -> Result<&2, &2, String, M.LoadedMethod>:
+def method_value(native: Bool, intrinsic: U32, +nextId: U32, owner: U32, +sy: +List<String>, name: String, descriptor: String, +flags: U32, parameters: U32, resultTag: U32, maxStack: U32, maxLocals: U32, instructions: +List<M.Instruction>, handlers: +List<M.Handler>, switches: +List<M.SwitchTable>) -> Result<&2, &2, String, M.LoadedMethod>:
   match native intrinsic:
     case False{} 0:
-      Done{M.LoadedMethod{nextId, owner, S.find(sy, name), S.find(sy, descriptor), flags, parameters, resultTag, maxStack, maxLocals, instructions, handlers, 0}}
+      Done{M.LoadedMethod{nextId, owner, S.find(sy, name), S.find(sy, descriptor), flags, parameters, resultTag, maxStack, maxLocals, instructions, handlers, 0, switches}}
+    # A native method with no MiniJRE intrinsic binds lazily to a loaded plugin
+    # library on its first call (java/natives.bend): its intrinsic number is
+    # 0x80000000 | method id. Unbound calls throw UnsatisfiedLinkError.
     case True{} 0:
-      Fail{"UnsupportedFeature: native method owner#" ++ U32.show(owner)}
+      Done{M.LoadedMethod{nextId, owner, S.find(sy, name), S.find(sy, descriptor), flags, parameters, resultTag, maxStack, maxLocals, instructions, handlers, U32.or(2147483648, nextId), switches}}
     case _ other:
-      Done{M.LoadedMethod{nextId, owner, S.find(sy, name), S.find(sy, descriptor), flags, parameters, resultTag, maxStack, maxLocals, instructions, handlers, other}}
+      Done{M.LoadedMethod{nextId, owner, S.find(sy, name), S.find(sy, descriptor), flags, parameters, resultTag, maxStack, maxLocals, instructions, handlers, other, switches}}
 
 def link_catch(+catch: U32, +pool: +List<M.Constant>, +sy: +List<String>) -> Result<&2, &2, String, U32>:
   match catch:
@@ -248,17 +259,16 @@ def link_handlers(handlers: +List<M.Handler>, +pool: +List<M.Constant>, +sy: +Li
 def method_records(methods: +List<M.Method>, +owner: U32, +ownerName: String, +pool: +List<M.Constant>, +sy: +List<String>, id: U32) -> Result<&2, &2, String, +List<M.LoadedMethod>>:
   match methods:
     case Nil{}: Done{Nil{}}
-    case Con{M.Method{+flags, +name, +desc, stack, locals, code, ins, handlers, attrs}, rest}:
+    case Con{M.Method{+flags, +name, +desc, stack, locals, code, ins, handlers, attrs, switches}, rest}:
       +nextId = id
       do Result<&2, &2, String, +List<M.LoadedMethod>>:
         +parsed : M.Descriptor <- D.parse_method(desc)
-        check(U32.is_eq(U32.and(flags, 32), 0), "UnsupportedFeature: synchronized method")
         intrinsic : U32 = Bool.pick(U32, U32.is_ne(U32.and(flags, 256), 0), B.intrinsic_desc(ownerName, name, desc), 0)
         resultTag : U32 = D.slot_tag(D.result_type(parsed))
         tail : +List<M.LoadedMethod> <- method_records(rest, owner, ownerName, pool, sy, (nextId + 1 : U32))
         linked : +List<M.Instruction> <- link_instructions(ins, pool, sy)
         linked_handlers : +List<M.Handler> <- link_handlers(handlers, pool, sy)
-        method : M.LoadedMethod <- method_value(U32.is_ne(U32.and(flags, 256), 0), intrinsic, nextId, owner, sy, name, desc, flags, D.parameter_count(parsed), resultTag, stack, locals, linked, linked_handlers)
+        method : M.LoadedMethod <- method_value(U32.is_ne(U32.and(flags, 256), 0), intrinsic, nextId, owner, sy, name, desc, flags, D.parameter_count(parsed), resultTag, stack, locals, linked, linked_handlers, switches)
         return Con{method, tail}
 
 def signature_word(bytes: +List<U32>) -> U32:
@@ -293,19 +303,129 @@ def field_metadata_records(fields: +List<M.Field>, +owner: U32, +pool: +List<M.C
         tail : +List<M.FieldMetadata> <- field_metadata_records(rest, owner, pool, (id + 1 : U32))
         return Con{M.FieldMetadata{owner, id, metadata, signature}, tail}
 
-def method_metadata_records(methods: +List<M.Method>, +owner: U32, +pool: +List<M.Constant>, +id: U32) -> Result<&2, &2, String, +List<M.MethodMetadata>>:
+def parameter_name(+pool: +List<M.Constant>, index: U32) -> Result<&2, &2, String, String>:
+  match index:
+    case 0: Done{""}
+    case value: CP.utf(pool, value)
+
+# MethodParameters (JVMS 4.7.24): u1 count, then (u2 name_index, u2 access_flags).
+def parameter_entries(bytes: +List<U32>, count: U32, +pool: +List<M.Constant>) -> Result<&2, &2, String, +List<M.MethodParameter>>:
+  match bytes count:
+    case Nil{} 0: Done{Nil{}}
+    case Con{a, Con{b, Con{c, Con{d, rest}}}} n:
+      do Result<&2, &2, String, +List<M.MethodParameter>>:
+        name : String <- parameter_name(pool, (a * 256 + b : U32))
+        tail : +List<M.MethodParameter> <- parameter_entries(rest, U32.sub(n, 1), pool)
+        return Con{M.MethodParameter{name, (c * 256 + d : U32)}, tail}
+    case _ _: Fail{"VmError.InvalidAttribute: MethodParameters length"}
+
+def parameter_attribute(bytes: +List<U32>, +pool: +List<M.Constant>) -> Result<&2, &2, String, +List<M.MethodParameter>>:
+  match bytes:
+    case Con{count, rest}: parameter_entries(rest, count, pool)
+    case Nil{}: Fail{"VmError.InvalidAttribute: MethodParameters length"}
+
+def method_parameters_scan(attributes: +List<M.Attribute>, +pool: +List<M.Constant>) -> Result<&2, &2, String, +List<M.MethodParameter>>:
+  match attributes:
+    case Nil{}: Done{Nil{}}
+    case Con{M.Attribute{name, bytes}, rest}:
+      Bool.pick(Result<&2, &2, String, +List<M.MethodParameter>>, String.eq(name, "MethodParameters"), parameter_attribute(bytes, pool), method_parameters_scan(rest, pool))
+    case Con{other, rest}: method_parameters_scan(rest, pool)
+
+# ---- LineNumberTable and SourceFile (for stack traces) ---------------------
+
+def word2(bytes: +List<U32>) -> U32:
+  match bytes:
+    case Con{a, Con{b, rest}}: (U32.and(a, 255) * 256 + U32.and(b, 255) : U32)
+    case _: 0
+
+def word4(bytes: +List<U32>) -> U32:
+  match bytes:
+    case Con{a, Con{b, Con{c, Con{d, rest}}}}: U32.or(U32.shln(U32.and(a, 255), 24n), U32.or(U32.shln(U32.and(b, 255), 16n), U32.or(U32.shln(U32.and(c, 255), 8n), U32.and(d, 255))))
+    case _: 0
+
+def line_entries(count: Nat, bytes: +List<U32>) -> +List<U32>:
+  match count bytes:
+    case 0n _: Nil{}
+    case 1n+p Con{a, Con{b, Con{c, Con{d, rest}}}}: Con{(U32.and(a, 255) * 256 + U32.and(b, 255) : U32), Con{(U32.and(c, 255) * 256 + U32.and(d, 255) : U32), line_entries(p, rest)}}
+    case 1n+p _: Nil{}
+
+def utf_or_empty(result: Result<&2, &2, String, String>) -> String:
+  match result:
+    case Done{text}: text
+    case Fail{error}: ""
+
+@unsafe def code_sub_found(is_lines: Bool, +bytes: +List<U32>, count: Nat, +pool: +List<M.Constant>) -> +List<U32>:
+  match is_lines:
+    case True{}: line_entries(U32.to_nat(word2(M.drop(U32, bytes, 6n))), M.drop(U32, bytes, 8n))
+    case False{}: code_sub_attributes(count, M.drop(U32, bytes, U32.to_nat(U32.add(6, word4(M.drop(U32, bytes, 2n))))), pool)
+
+# The Code attribute's own attributes: the first LineNumberTable wins.
+@unsafe def code_sub_attributes(count: Nat, +bytes: +List<U32>, +pool: +List<M.Constant>) -> +List<U32>:
+  match count:
+    case 0n: Nil{}
+    case 1n+p: code_sub_found(String.eq(utf_or_empty(CP.utf(pool, word2(bytes))), "LineNumberTable"), bytes, p, pool)
+
+@unsafe def code_line_table(+bytes: +List<U32>, +pool: +List<M.Constant>) -> +List<U32>:
+  +after_code : +List<U32> = M.drop(U32, bytes, U32.to_nat(U32.add(8, word4(M.drop(U32, bytes, 4n)))))
+  +after_handlers : +List<U32> = M.drop(U32, after_code, U32.to_nat(U32.add(2, U32.mul(8, word2(after_code)))))
+  code_sub_attributes(U32.to_nat(word2(after_handlers)), M.drop(U32, after_handlers, 2n), pool)
+
+# (start byte offset, line) pairs of a method's LineNumberTable, or none.
+@unsafe def line_table(attributes: +List<M.Attribute>, +pool: +List<M.Constant>) -> +List<U32>:
+  match attributes:
+    case Nil{}: Nil{}
+    case Con{M.Attribute{+name, +bytes}, rest}: line_table_attribute(String.eq(name, "Code"), bytes, rest, pool)
+    case Con{other, rest}: line_table(rest, pool)
+
+@unsafe def line_table_attribute(is_code: Bool, +bytes: +List<U32>, +rest: +List<M.Attribute>, +pool: +List<M.Constant>) -> +List<U32>:
+  match is_code:
+    case True{}: code_line_table(bytes, pool)
+    case False{}: line_table(rest, pool)
+
+# The class's SourceFile attribute, or "" without one.
+def source_file(attributes: +List<M.Attribute>, +pool: +List<M.Constant>) -> String:
+  match attributes:
+    case Nil{}: ""
+    case Con{M.Attribute{+name, +bytes}, rest}: Bool.pick(String, String.eq(name, "SourceFile"), utf_or_empty(CP.utf(pool, word2(bytes))), source_file(rest, pool))
+    case Con{other, rest}: source_file(rest, pool)
+
+@unsafe def method_metadata_records(methods: +List<M.Method>, +owner: U32, +pool: +List<M.Constant>, +id: U32) -> Result<&2, &2, String, +List<M.MethodMetadata>>:
   match methods:
     case Nil{}: Done{Nil{}}
-    case Con{M.Method{flags, name, desc, stack, locals, code, ins, handlers, +attrs}, rest}:
+    case Con{M.Method{flags, name, desc, stack, locals, code, ins, handlers, +attrs, switches}, rest}:
       do Result<&2, &2, String, +List<M.MethodMetadata>>:
         metadata : M.AnnotationMetadata <- MD.cached_method(attrs, pool, desc)
         signature : String <- signature_text(attrs, pool)
+        parameters : +List<M.MethodParameter> <- method_parameters_scan(attrs, pool)
         tail : +List<M.MethodMetadata> <- method_metadata_records(rest, owner, pool, (id + 1 : U32))
-        return Con{M.MethodMetadata{owner, id, metadata, signature}, tail}
+        lines : +List<U32> = line_table(attrs, pool)
+        return Con{M.MethodMetadata{owner, id, metadata, signature, parameters, lines}, tail}
 def annotation_type_name(value: M.JvmType) -> Result<&2, &2, String, String>:
   match value:
     case M.ObjectType{name}: Done{name}
     case _: Fail{"VmError.InvalidAnnotation: annotation type is not an object"}
+def bootstrap_arguments(arguments: +List<BM.BootstrapArgument>) -> +List<M.BootstrapArgument>:
+  match arguments:
+    case Nil{}: Nil{}
+    case Con{BM.BootstrapArgument{argumentIndex, constantIndex, tag, value}, rest}:
+      Con{M.BootstrapArgument{argumentIndex, constantIndex, tag, value}, bootstrap_arguments(rest)}
+
+def bootstrap_methods(methods: +List<BM.BootstrapMethod>) -> +List<M.BootstrapMethod>:
+  match methods:
+    case Nil{}: Nil{}
+    case Con{BM.BootstrapMethod{index, methodRef, handleKind, handleReference, arguments}, rest}:
+      Con{M.BootstrapMethod{index, methodRef, handleKind, handleReference, bootstrap_arguments(arguments)}, bootstrap_methods(rest)}
+
+def bootstrap_methods_result(parsed: Maybe<&2, BM.BootstrapMethods>) -> Result<&2, &2, String, +List<M.BootstrapMethod>>:
+  match parsed:
+    case None{}: Done{Nil{}}
+    case Some{BM.BootstrapMethods{methods}}: Done{bootstrap_methods(methods)}
+
+def class_bootstrap_methods(attributes: +List<M.Attribute>, +pool: +List<M.Constant>) -> Result<&2, &2, String, +List<M.BootstrapMethod>>:
+  do Result<&2, &2, String, +List<M.BootstrapMethod>>:
+    parsed : Maybe<&2, BM.BootstrapMethods> <- BM.parse_class_attributes(attributes, pool)
+    methods : +List<M.BootstrapMethod> <- bootstrap_methods_result(parsed)
+    return methods
 
 def annotation_name_from_pool(+pool: +List<M.Constant>, index: U32) -> Result<&2, &2, String, String>:
   do Result<&2, &2, String, String>:
@@ -333,6 +453,72 @@ def metadata_add(meta: M.Metadata, class_meta: M.ClassMetadata, field_meta: +Lis
     case M.Metadata{classes, fields, methods}:
       M.Metadata{M.append(M.ClassMetadata, classes, Con{class_meta, Nil{}}), M.append(M.FieldMetadata, fields, field_meta), M.append(M.MethodMetadata, methods, method_meta)}
 
+def pool_class_or_empty(+pool: +List<M.Constant>, index: U32) -> Result<&2, &2, String, String>:
+  match index:
+    case 0: Done{""}
+    case value: CP.class_name(pool, value)
+
+def pool_utf_or_empty(+pool: +List<M.Constant>, index: U32) -> Result<&2, &2, String, String>:
+  match index:
+    case 0: Done{""}
+    case value: CP.utf(pool, value)
+
+def inner_entries(bytes: +List<U32>, count: U32, +pool: +List<M.Constant>) -> Result<&2, &2, String, +List<M.InnerClass>>:
+  match bytes count:
+    case Nil{} 0: Done{Nil{}}
+    case Con{a, Con{b, Con{c, Con{d, Con{e, Con{f, Con{g, Con{h, rest}}}}}}}} n:
+      do Result<&2, &2, String, +List<M.InnerClass>>:
+        inner : String <- pool_class_or_empty(pool, (a * 256 + b : U32))
+        outer : String <- pool_class_or_empty(pool, (c * 256 + d : U32))
+        name : String <- pool_utf_or_empty(pool, (e * 256 + f : U32))
+        tail : +List<M.InnerClass> <- inner_entries(rest, U32.sub(n, 1), pool)
+        return Con{M.InnerClass{inner, outer, name, (g * 256 + h : U32)}, tail}
+    case _ _: Fail{"VmError.InvalidAttribute: InnerClasses length"}
+
+def inner_attribute(bytes: +List<U32>, +pool: +List<M.Constant>) -> Result<&2, &2, String, +List<M.InnerClass>>:
+  match bytes:
+    case Con{high, Con{low, rest}}: inner_entries(rest, (high * 256 + low : U32), pool)
+    case _: Fail{"VmError.InvalidAttribute: InnerClasses length"}
+
+def enclosing_method(+pool: +List<M.Constant>, index: U32) -> Result<&2, &2, String, CP.NameType>:
+  match index:
+    case 0: Done{CP.NameType{"", ""}}
+    case value: CP.name_type(pool, value)
+
+def enclosing_parts(class: String, found: Result<&2, &2, String, CP.NameType>, +inner: +List<M.InnerClass>) -> Result<&2, &2, String, M.Nesting>:
+  match found:
+    case Fail{error}: Fail{error}
+    case Done{CP.NameType{name, descriptor}}: Done{M.Nesting{inner, class, name, descriptor}}
+
+def enclosing_attribute(bytes: +List<U32>, +pool: +List<M.Constant>, +inner: +List<M.InnerClass>) -> Result<&2, &2, String, M.Nesting>:
+  match bytes:
+    case Con{a, Con{b, Con{c, Con{d, Nil{}}}}}:
+      do Result<&2, &2, String, M.Nesting>:
+        class : String <- CP.class_name(pool, (a * 256 + b : U32))
+        result : M.Nesting <- enclosing_parts(class, enclosing_method(pool, (c * 256 + d : U32)), inner)
+        return result
+    case _: Fail{"VmError.InvalidAttribute: EnclosingMethod length"}
+
+def nesting_inner(attributes: +List<M.Attribute>, +pool: +List<M.Constant>) -> Result<&2, &2, String, +List<M.InnerClass>>:
+  match attributes:
+    case Nil{}: Done{Nil{}}
+    case Con{M.Attribute{name, bytes}, rest}:
+      Bool.pick(Result<&2, &2, String, +List<M.InnerClass>>, String.eq(name, "InnerClasses"), inner_attribute(bytes, pool), nesting_inner(rest, pool))
+    case Con{other, rest}: nesting_inner(rest, pool)
+
+def nesting_enclosing(attributes: +List<M.Attribute>, +pool: +List<M.Constant>, +inner: +List<M.InnerClass>) -> Result<&2, &2, String, M.Nesting>:
+  match attributes:
+    case Nil{}: Done{M.Nesting{inner, "", "", ""}}
+    case Con{M.Attribute{name, bytes}, rest}:
+      Bool.pick(Result<&2, &2, String, M.Nesting>, String.eq(name, "EnclosingMethod"), enclosing_attribute(bytes, pool, inner), nesting_enclosing(rest, pool, inner))
+    case Con{other, rest}: nesting_enclosing(rest, pool, inner)
+
+def class_nesting(+attributes: +List<M.Attribute>, +pool: +List<M.Constant>) -> Result<&2, &2, String, M.Nesting>:
+  do Result<&2, &2, String, M.Nesting>:
+    inner : +List<M.InnerClass> <- nesting_inner(attributes, pool)
+    result : M.Nesting <- nesting_enclosing(attributes, pool, inner)
+    return result
+
 def collect(classes: +List<M.ClassFile>, +all: +List<M.ClassFile>, +ns: +List<String>, +sy: +List<String>, fs: +List<M.LoadedField>, ms: +List<M.LoadedMethod>, metadata: M.Metadata, owner: U32) -> Result<&2, &2, String, Catalog>:
   match classes:
     case Nil{}: Done{Catalog{all, ns, sy, fs, ms, metadata}}
@@ -348,12 +534,20 @@ def collect(classes: +List<M.ClassFile>, +all: +List<M.ClassFile>, +ns: +List<St
         method_metadata : +List<M.MethodMetadata> <- method_metadata_records(methods, cid, pool, M.length(M.LoadedMethod, oldMethods))
         visible_names : +List<String> <- annotation_names(annotation_metadata_annotations(class_metadata), pool, Nil{})
         class_signature : String <- signature_text(attrs, pool)
-        next_metadata : M.Metadata = metadata_add(metadata, M.ClassMetadata{cid, fl, class_metadata, visible_names, pool, class_signature}, field_metadata, method_metadata)
+        nesting : M.Nesting <- class_nesting(attrs, pool)
+        next_metadata : M.Metadata = metadata_add(metadata, M.ClassMetadata{cid, fl, class_metadata, visible_names, pool, class_signature, nesting, source_file(attrs, pool)}, field_metadata, method_metadata)
         next : Catalog <- collect(rest, all, ns, sy, M.append(M.LoadedField, oldFields, newFields), M.append(M.LoadedMethod, oldMethods, newMethods), next_metadata, (cid + 1 : U32))
         return next
 
 type AugmentedClasses is Data:
   AugmentedClasses{classes: +List<M.ClassFile>, arrays: +List<M.ClassFile>}
+def augmented_class_files(value: AugmentedClasses) -> +List<M.ClassFile>:
+  match value:
+    case AugmentedClasses{classes, arrays}: classes
+
+def augmented_array_files(value: AugmentedClasses) -> +List<M.ClassFile>:
+  match value:
+    case AugmentedClasses{classes, arrays}: arrays
 
 def reference_array_name(name: String) -> String:
   match name:
@@ -424,7 +618,7 @@ def resolve_method(fuel: Nat, +cat: Catalog, +owner: U32, +name: U32, +desc: U32
       Result.bind(&2, &2, String, U32, M.LoadedMethod, parent(sources, ns, owner), par =>
         resolve_found(own_method(methods, owner, name, desc), par, parentId => resolve_method(p, cat, parentId, name, desc)))
 def field_binding(+field: M.LoadedField) -> M.Binding:
-  M.Binding{M.loaded_field_id(field), M.Slot{M.loaded_field_tag(field), 0}}
+  M.Binding{M.loaded_field_id(field), M.default_slot(M.loaded_field_tag(field))}
 
 @unsafe def class_fields(fields: +List<M.LoadedField>, +owner: U32, +acc: +List<M.Binding>) -> +List<M.Binding>:
   match fields:
@@ -463,7 +657,8 @@ def field_binding(+field: M.LoadedField) -> M.Binding:
     case Con{M.ClassFile{mi, ma, fl, name, parent_name, interfaces, pool, fs, ms, attrs}, rest}:
       do Result<&2, &2, String, +List<M.LoadedClass>>:
         parentId : U32 <- parent_id(ns, parent_name)
-        loaded : M.LoadedClass = M.LoadedClass{owner, S.find(symbols, name), parentId, interface_ids(interfaces, names, Nil{}), class_fields(fields, owner, Nil{}), class_methods(methods, owner, Nil{}), initializer_id(methods, owner, S.find(symbols, "<clinit>"), S.find(symbols, "()V")), 0}
+        parsed_bootstrap_methods : +List<M.BootstrapMethod> <- class_bootstrap_methods(attrs, pool)
+        loaded : M.LoadedClass = M.LoadedClass{owner, S.find(symbols, name), parentId, interface_ids(interfaces, names, Nil{}), class_fields(fields, owner, Nil{}), class_methods(methods, owner, Nil{}), initializer_id(methods, owner, S.find(symbols, "<clinit>"), S.find(symbols, "()V")), 0, parsed_bootstrap_methods}
         tail : +List<M.LoadedClass> <- classes_go(rest, names, ns, symbols, fields, methods, (owner + 1 : U32), Con{loaded, acc})
         return tail
 

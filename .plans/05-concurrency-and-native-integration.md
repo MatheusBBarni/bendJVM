@@ -1,6 +1,9 @@
 # Plan: Concurrency and native integration
 
-Status: planned; no runtime changes implemented.
+Status: implemented for the documented Java 8 scope.
+Every roadmap row has an end-to-end Java-visible demonstration in `scripts/test.py` (see "Implementation notes" at the end).
+`python3 scripts/test.py --fast` passes 105 tests and `--full` passes 162 (Bend 2.0.39, OpenJDK 26 as the oracle).
+`bend PROOF.bend` reports `ALL PROOFS CHECK`.
 Source: `ROADMAP.md`, milestone 5.
 Dependencies: [loading](01-jar-and-classpath-loading.md), [runtime expansion](02-java-runtime-expansion.md), [reflection/metadata](03-reflection-and-metadata.md), and [broader bytecode](04-broader-jvm-bytecode-support.md).
 
@@ -307,4 +310,88 @@ Candidate laws: each thread is in exactly one lifecycle/wait state; monitor owne
 - Each named API and acceptance case is implemented or scope is changed with explicit user approval. No simulated network successes, stub native returns, no-op locks, or fake certificate validation.
 - Documentation and meaningful laws/proofs match exercised behavior. Remove throwaway probes/generated libraries/certificates after verification; retain reproducible fixture sources and harness generation logic.
 
-Planning verification: grounded in the current VM/state/execute/catalog/runner/native-launcher files and preceding milestone plans. This documentation-only change does not claim implemented concurrency, native loading, networking, TLS, or passing runtime tests.
+Planning verification: grounded in the VM/state/execute/catalog/runner/native-launcher files and preceding milestone plans as they stood before implementation.
+
+## Implementation notes
+
+### Where things live
+
+- `bendjvm/runtime/threads.bend` holds the pure thread, monitor, wait-set and clock records.
+- `bendjvm/runtime/scheduler.bend` runs host rounds: a wake pass, round-robin quanta, and settling of each thread that stops.
+- `bendjvm/java/threads.bend` implements the `Thread`, `Object.wait/notify` and `System.nanoTime/currentTimeMillis` intrinsics (800-817).
+- `bendjvm/java/hostio.bend` is the single `sun.nio.ch.HostIO.call` intrinsic (820) that every socket, channel, selector and TLS operation goes through.
+- `bendjvm/java/natives.bend` binds plugin natives lazily (intrinsic `0x80000000 | method id`) and handles `System.load/loadLibrary` (821/822).
+- `bendjvm/java/charsets.bend` adds `String.getBytes` and the `byte[]` String constructors (823-828), which the networking code needed.
+- `bendjvm/jre/` is a new Java-source MiniJRE layer: `Thread`, `ThreadGroup`, `Runnable`, `java.net` sockets, `java.nio` buffers and channels, the selector, and `javax.net.ssl`.
+  `scripts/run.py` compiles it with `javac --release 8` during `--prepare` and resolves its classes ahead of the application class path.
+  `scripts/jre_audit.py` checks that it only references classes the MiniJRE defines.
+- `bendjvm/native/helper.c` is the supervised plugin helper, compiled on demand by `scripts/run.py` when a launch allows a native library; `bendjvm/native/bendjvm_plugin.h` is the plugin ABI (version 1).
+- `bendjvm/runtime/trace.bend` records each throwable's creation stack; `bendjvm/java/stacktrace.bend` renders it, and `sun.misc.BendStackTrace` (always loaded) prints it in the JDK's format.
+- The host side of sockets, selectors and TLS is the `hostIO` function in the generated host of `scripts/run.py`.
+
+### Decisions taken during implementation
+
+- The running thread keeps its frames, status, pending exception, result, host effect and continuations in the VM record; every other thread keeps a saved copy in its `ThreadState`.
+  This kept all existing interpreter code unchanged while giving each thread isolated execution state.
+- Parked threads are never woken by the code that changes their condition.
+  Each round re-evaluates every wait (monitor owner, live join target, class state, deadline, interrupt flag) from shared state, so a wakeup cannot be lost.
+- A synchronized method takes its lock when its frame executes pc 0 and records the object in the frame's new `monitor` field.
+  Return opcodes release it (throwing `IllegalMonitorStateException` if it is no longer held) and every unwound frame releases it once.
+- Class initialization records the initializing thread.
+  Bytecode triggers from other threads block and re-execute; intrinsic triggers park and re-run through the existing `<clinit>` callback continuation.
+  A method-handle initialization chain that meets another thread's initializer parks with its continuation and re-walks once that class settles.
+- `java.net.Socket`, `ServerSocket`, `InetSocketAddress` and the socket streams moved from Bend intrinsics to the Java-source layer, so classic sockets, NIO channels and TLS share one scheduler-aware transport.
+  The old `ConnectTcp`/`BindTcp`/`AcceptTcp` effects are gone.
+- The TLS provider is Bun's maintained `node:tls`, in the same host process as the sockets, rather than the Python `ssl` baseline; the user approved this change.
+  A capability check covered layered client upgrade, server-side upgrade, TLS 1.3, hostname verification and required client certificates.
+  TLS is layered over a stream that replays bytes the plain socket already received, because a ClientHello can arrive before the server thread starts its handshake.
+- The native helper is a compiled C program (`dlopen`, a four-thread worker pool, a line protocol of 32-bit words), as the user decided.
+  Calls into a library that does not declare itself thread-safe are serialized.
+- An exception that ends `main` is offered to the main thread's or the default `UncaughtExceptionHandler` through `Thread.mainUncaught`, or printed as the JDK's `Exception in thread "main"` report with its stack trace; the run exits with status 1.
+- Throwables record their creation stack (as `fillInStackTrace` does); `printStackTrace` prints frames with source files and line numbers from `SourceFile` and `LineNumberTable`, `Caused by:` and `Suppressed:` chains, and `... n more` for shared frames.
+- `InetAddress` and `InetSocketAddress` resolve names when created, through a host DNS lookup that parks only the calling thread.
+- Thread priorities weight the round-robin: a turn lasts `quantum * priority / 5` instructions.
+- `ThreadGroup` implements the JDK 8 API (the user asked for it although the plan excluded groups): a `system`/`main` tree, child groups, `Thread(ThreadGroup, ...)` constructors, maximum priorities that cap thread priorities, membership from `start` until `run` finishes, `activeCount`, `enumerate`, `interrupt`, `destroy`, `list`, and parent-first `uncaughtException`.
+- An exception raised inside a MiniJRE intrinsic (directly, or when the host effect it started fails) gets that method as its innermost frame, printed `(Unknown Source)` for bootstrap classes and `(Native Method)` for `native` methods of the Java-source layer.
+- With `autoClose=false`, closing a layered `SSLSocket` sends `close_notify` and hands the TCP connection back to the plain socket.
+- A closed wait-for cycle ends the run with a `Deadlock:` diagnostic that names each blocked thread, instead of hanging.
+
+### Scope
+
+- Nothing is excluded beyond the plan's own exclusion list. The user's review decisions: Bun `node:tls` replaces the Python `ssl` baseline (approved), the native helper is written in C, and `ThreadGroup`, intrinsic stack frames, stack traces, name resolution and priority scheduling were added although the plan did not require them.
+- Java execution stays serialized on one interpreter, as the plan requires: monitors, waits and deadlines are VM state, and no heap mutation runs in parallel.
+- No single-thread transport or memory-model placeholder is left in active paths: the old `ConnectTcp`/`BindTcp`/`AcceptTcp` effects are removed, and `MutableCallSite.syncAll` is correct as-is under the sequentially consistent model.
+
+### API table coverage
+
+Each row of "Required Java/API compatibility slice" is exercised by a fixture whose output matches OpenJDK:
+
+| Row | Fixtures |
+| --- | --- |
+| Runnable/Thread | `ThreadLifecycle`, `ApiSurface` (`setName`, `getId`, `join(long,int)`, `sleep(long,int)`, `yield`, `State`) |
+| Thread failure reporting | `ThreadLifecycle`, `MainHandled`, `StackTraces`, `ApiSurface` |
+| Monitors | `MonitorSemantics`, `ApiSurface` (`wait(long,int)`, static synchronized) |
+| Time | `MonitorSemantics`, `ApiSurface` |
+| Shared publication | `VolatilePublication` (volatile primitives, `long`/`double`, class initialization, `MutableCallSite.syncAll`, `VolatileCallSite`) |
+| Native loading | `NativeDemo` (`native/plugin-bridge`) |
+| Existing TCP | `TcpEcho`, `TcpAccept`, `TcpRefused`, `TcpTimeout`, `ConcurrentTcp` (`shutdownInput/Output`, `isClosed`) |
+| Buffers | `NioSelectorEcho`, `ApiSurface` (indexed `put`, `arrayOffset`) |
+| Selectable channels | `NioSelectorEcho`, `ApiSurface` (non-blocking `connect`/`finishConnect`) |
+| Selectors | `NioSelectorEcho`, `ApiSurface` (`selectNow`, `keys`, `channel`, `selector`, `readyOps`, writable/connectable queries) |
+| TLS factories | `TlsFixture` (`SSLContext.getDefault`, both factories, layered `createSocket`) |
+| TLS sockets | `TlsFixture` (cipher and protocol selection on client and server sockets) |
+| TLS parameters/session | `TlsFixture` (endpoint identification, `getPeerHost`, `getPeerPort`, `getCipherSuite`) |
+| Exceptions | `ApiSurface` (every class the plan names) plus the fixtures that raise them |
+
+The packaged web example also runs by hand through the CLI (`run.py --tls-* --native-library ... -jar web.jar`) and serves `curl` over HTTPS, including the native checksum route and a clean shutdown with the helper reaped.
+
+### Verification
+
+- Differential fixtures that match OpenJDK output exactly: `ThreadLifecycle`, `MonitorSemantics`, `VolatilePublication` (including cross-thread class initialization and call-site retargeting), `ConcurrentTcp`, `DaemonExit` and `NioSelectorEcho`.
+- `threads/schedule-variation` reruns the synchronization fixtures with quanta 3, 37 and 5000 (`--quantum`) and expects the same output.
+- `threads/main-uncaught-handler`, `threads/deadlock-diagnostic` and `threads/fuel-with-blocked-threads` cover exit policy, deadlock reporting and global fuel.
+- `threads/stack-traces` compiles `StackTraces` with debug information and compares stdout, stderr and exit status with OpenJDK; `NetAddresses` and `ThreadGroups` are differential fixtures; `threads/priorities` checks that a priority-10 thread outruns a priority-1 thread; `threads/native-frames` checks intrinsic frames for `String.charAt`, `FileInputStream` and `Thread.sleep`.
+- `native/plugin-bridge` compiles `bendjvm/tests/fixtures/native/demo_plugin.c`, runs `NativeDemo` (wide values, copied buffers, handles, mapped and unregistered errors, a slow call, a synchronized native, a plugin crash), rejects a wrong ABI version, and checks that the helper is reaped.
+- `tls/client-server-interop` generates an ephemeral CA, identity and bad certificates, runs `TlsFixture` on OpenJDK and BendJVM against independent Python TLS peers and clients, and compares the results.
+- `web/https-example` packages `examples/webserver` as a jar and drives it through the CLI with concurrent HTTPS clients, a stalled client, a native checksum route and a shutdown request.
+- `LAWS.bend` states the monitor release, park, notify-depth, interrupt-clearing and thread-state mapping laws; `PROOF.bend` proves them.

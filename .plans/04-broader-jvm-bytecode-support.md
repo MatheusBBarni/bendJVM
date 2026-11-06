@@ -1,6 +1,11 @@
 # Plan: Broader JVM bytecode support
 
-Status: planned; no runtime changes implemented.
+Status: implemented for the documented Java 8 scope.
+Source artifacts prepare with Bend 2.0.39.
+`scripts/test.py --fast --bend scripts/run.py` passes 69 tests and `--full` passes 121.
+`bend PROOF.bend` reports `ALL PROOFS CHECK`.
+The exclusions listed under "Implementation notes" below remain out of scope.
+
 Source: `ROADMAP.md`, milestone 4.
 Related plans: [loading](01-jar-and-classpath-loading.md), [runtime expansion](02-java-runtime-expansion.md), and [reflection/metadata](03-reflection-and-metadata.md).
 
@@ -295,4 +300,54 @@ Candidate laws: two-word encode/decode preservation, add/sub carry correctness, 
 - Named acceptance cases and API surfaces are implemented or scope is changed with explicit user approval; no hard-coded bootstrap successes, placeholder numeric operations, or skipped malformed-input checks.
 - Documentation and meaningful laws/proofs reflect observed behavior. Remove throwaway probes/generated artifacts after verification; retain reusable fixtures/generators and deterministic regression cases.
 
-Planning verification: grounded in current model/frame/descriptor/constant-pool/decoder/verifier/runner code and preceding plans. This document does not claim implemented bytecode support or passing runtime tests.
+## Implementation notes
+
+The sections above are the original plan.
+This section records what was built and where it differs.
+
+### Values and numerics
+
+- Category-two values are single logical stack entries with two raw U32 words; locals reserve the second slot, and `dup*`/`pop2`/`swap` forms are category-aware.
+- Long arithmetic, shifts and comparisons work on the two words directly (`runtime/wide.bend`); shift distances are popped as `int`.
+- Binary64 arithmetic, remainder, rounding and conversions are implemented in Bend (`runtime/binary64.bend`, `runtime/big_uint.bend`) rather than delegated to host floats.
+- `Double.toString` follows the JDK 19+ shortest-decimal rule (`runtime/double_format.bend`); the `DoubleFormatting` fixture checks hand-picked edge cases and a seeded sweep against the JDK.
+- Generated JavaScript evaluates both branches of `Bool.pick`, `&&` and `||`, so recursive or expensive branches in numeric code use `match` on a Bool helper.
+
+### Switches and decoding
+
+- `tableswitch` and `lookupswitch` are decoded once into instruction-index targets that the verifier and interpreter share.
+- All Java 8 `wide` forms are decoded, including long/double loads and stores.
+
+### Verifier
+
+- `verifier/method.bend` is a JVMS 4.10.1 type checker: one linear pass over the StackMapTable frames, with no type inference or least-upper-bound merging.
+- Every jump target, exception handler and fall-through edge is checked against the recorded frame with JVMS assignability, including the interface rule and `uninitializedThis`.
+- BootstrapMethods entries and their static arguments are validated against the whole constant pool before execution.
+- The Python stack-height checker in `scripts/run.py` has been removed; Bend is the only authority.
+- Runtime class-load failures are reported as `VerifyError`, `ClassFormatError`, `UnsupportedOperationException` or `LinkageError` with a message.
+
+### Dynamic linkage and method handles
+
+- `invokedynamic` runs user bootstrap methods through the same handle machinery as LambdaMetafactory; nothing is special-cased by name.
+- A bootstrap exception is wrapped in `BootstrapMethodError` (message "bootstrap method initialization exception", cause preserved), and a failed site keeps rethrowing the recorded error.
+- Reentrant resolution of a site that is still linking runs the bootstrap again, as the JVM does, and the first result to complete is the one published.
+- Bend applies the Java 8 rule (JVMS 6.5) and wraps static-argument resolution failures in `BootstrapMethodError`; JDK 11+ rethrows the `LinkageError`, so the harness accepts either form from the oracle only.
+
+The heap kinds for `java.lang.invoke` objects are registered in `heap/heap.bend`: 20 MethodType, 21 MethodHandle, 22 CallSite, 23 Lookup, 24 lambda plan.
+MethodHandle bindings are 0 owner, 1 name, 2 descriptor, 3 specialCaller, 4 adapter mode, 5-8 adapter state, 9 onward bound `insertArguments` values, and 0xFFFFFFFF the varargs-collector flag.
+Adapter modes are 0 direct, 1 `asType`, 2 `bindTo`, 5 `dynamicInvoker` (re-reads the CallSite target on every call), 6 `insertArguments`, 7 `constant`, 8 `identity` and 9 lambda factory.
+Binding 6 of a bound handle holds the receiver slot itself.
+Category-one wrapper objects keep their value in binding 0; `Long` and `Double` use their declared `value` field, and `library.reflect_box_value` is the single boxing path.
+Reflective `MethodHandle.invokeExact`/`invoke` through `Method.invoke` throws `UnsupportedOperationException`, as on the JDK.
+
+### Host callbacks
+
+User `toString`, `equals` and `hashCode` reached from intrinsics (`println(Object)`, `String.valueOf`, `StringBuilder.append`, `ArrayList.contains`, `HashMap` lookups) run as real Java calls.
+The pending host continuation sits under a `HostCallback` marker and resumes when that call returns; an exception thrown by the callback discards it.
+
+### Remaining exclusions
+
+- `StringConcatFactory`, constant-dynamic (`CONSTANT_Dynamic`), and class files newer than major version 52.
+- Only the `java.lang.invoke` surface listed in `loader/bootstrap.bend` exists; method-handle combinators beyond `insertArguments`, `bindTo`, `asType` and varargs collection are absent.
+- `Integer.valueOf` caching is not applied on the reflective boxing path, so boxed identity can differ from the JDK for small values reached through reflection or method handles.
+- Threads, monitors and the other milestone-5 facilities remain out of scope, and the verifier is not a sandbox boundary.

@@ -178,7 +178,7 @@ def method_code(attributes: +List<M.Attribute>, +pool: +List<M.Constant>) -> Res
 def method_build(info: CodeInfo, flags: U32, name: String, descriptor: String, attributes: +List<M.Attribute>) -> Result<&2, &2, String, M.Method>:
   match info:
     case CodeInfo{maxStack, maxLocals, code, handlers}:
-      BC.method(M.Method{flags, name, descriptor, maxStack, maxLocals, code, Nil{}, handlers, attributes})
+      BC.method(M.Method{flags, name, descriptor, maxStack, maxLocals, code, Nil{}, handlers, attributes, Nil{}})
 
 @unsafe def methods_go(count: Nat, reader: R.Reader, +pool: +List<M.Constant>, acc: +List<M.Method>) -> Result<&2, &2, String, Methods>:
   match count:

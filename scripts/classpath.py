@@ -9,14 +9,15 @@ must close a classpath (or use it as a context manager) before it is discarded.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import contextlib
 import io
-from pathlib import Path, PurePosixPath, PureWindowsPath
 import stat
 import urllib.parse
 import zipfile
-from typing import Iterable, Iterator
-
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import Self
 
 DEFAULT_MAX_ENTRY_BYTES = 64 * 1024 * 1024
 DEFAULT_MAX_TOTAL_BYTES = 512 * 1024 * 1024
@@ -33,7 +34,7 @@ class SourceMatch:
     name: str
     data: bytes
     origin: str
-    source: "Source"
+    source: Source
 
     @property
     def bytes(self) -> bytes:
@@ -43,7 +44,7 @@ class SourceMatch:
 class EntryStream(io.RawIOBase):
     """A bounded, closeable stream over one archive entry."""
 
-    def __init__(self, owner: "ArchiveSource", info: zipfile.ZipInfo, request: str):
+    def __init__(self, owner: ArchiveSource, info: zipfile.ZipInfo, request: str):
         super().__init__()
         self._owner = owner
         self._info = info
@@ -121,7 +122,7 @@ class EntryStream(io.RawIOBase):
             finally:
                 super().close()
 
-    def __enter__(self) -> "EntryStream":
+    def __enter__(self) -> Self:
         if self._closed:
             raise ValueError("I/O operation on closed archive entry")
         return self
@@ -173,7 +174,7 @@ class Source:
     def close(self) -> None:
         pass
 
-    def __enter__(self) -> "Source":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
@@ -401,10 +402,8 @@ class ArchiveSource(Source):
                 self._zip = None
 
     def __del__(self):  # pragma: no cover - best effort only
-        try:
+        with contextlib.suppress(Exception):
             self.close()
-        except Exception:
-            pass
 
 
 @dataclass(frozen=True)
@@ -528,18 +527,18 @@ class Classpath:
         for source in self.sources:
             source.close()
 
-    def __enter__(self) -> "Classpath":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         self.close()
 
     @classmethod
-    def from_paths(cls, paths: Iterable[str | Path], **kwargs) -> "Classpath":
+    def from_paths(cls, paths: Iterable[str | Path], **kwargs) -> Classpath:
         return cls(paths, **kwargs)
 
     @classmethod
-    def expand(cls, paths: Iterable[str | Path], **kwargs) -> "Classpath":
+    def expand(cls, paths: Iterable[str | Path], **kwargs) -> Classpath:
         return cls.from_paths(paths, **kwargs)
 
 
@@ -649,7 +648,7 @@ def parse_manifest(data: bytes, *, origin: str = "manifest") -> dict[str, str]:
         key = name.casefold()
         if key in attrs:
             raise ClasspathError(f"{origin}: duplicate main attribute {name!r}")
-        attrs[key] = value[1:] if value.startswith(" ") else value
+        attrs[key] = value.removeprefix(" ")
         current = key
     return attrs
 
@@ -702,9 +701,23 @@ def expand_classpath(
 
 
 __all__ = [
-    "ArchiveRoot", "ArchiveSource", "ClassPath", "Classpath", "ClasspathError",
-    "DEFAULT_MAX_ENTRY_BYTES", "DEFAULT_MAX_TOTAL_BYTES", "DirectoryRoot",
-    "DirectorySource", "EntryStream", "JarSource", "MissingSource",
-    "Source", "SourceMatch", "ZipSource", "class_path", "expand_classpath",
-    "parse_manifest", "source_from_path",
+    "DEFAULT_MAX_ENTRY_BYTES",
+    "DEFAULT_MAX_TOTAL_BYTES",
+    "ArchiveRoot",
+    "ArchiveSource",
+    "ClassPath",
+    "Classpath",
+    "ClasspathError",
+    "DirectoryRoot",
+    "DirectorySource",
+    "EntryStream",
+    "JarSource",
+    "MissingSource",
+    "Source",
+    "SourceMatch",
+    "ZipSource",
+    "class_path",
+    "expand_classpath",
+    "parse_manifest",
+    "source_from_path",
 ]

@@ -8,10 +8,15 @@ import ../classfile/constant_pool.bend as CP
 import ./outcome.bend as O
 import ../classfile/descriptor.bend as D
 import ../runtime/wide.bend as W
+import ../runtime/binary64.bend as B64
 import ./generic.bend as G
+import ../classfile/signature.bend as Sig
 import ./annotation_runtime.bend as AR
 import ../loader/class_loader.bend as CL
 import ../loader/bootstrap.bend as B
+import ./loader_state.bend as LS
+import ../runtime/threads.bend as Th
+import ../runtime/trace.bend as Tr
 type ReflectRefs is Data:
   ReflectRefs{vm: M.VM, refs: +List<U32>}
 type AnnotationValueRef is Data:
@@ -59,6 +64,20 @@ type UrlOrigin is Data:
   UrlOrigin{archive: Bool, text: String}
 def class_id(+vm: M.VM, name: String) -> U32:
   H.named_class(S.classes(vm), S.symbols(vm), name)
+def wrapper_value_field_id_scan(fields: +List<M.LoadedField>, +owner: U32, +symbols: +List<String>, +descriptor: String) -> Maybe<&2, U32>:
+  match fields:
+    case Nil{}: None{}
+    case Con{+field, rest}:
+      +match_field = U32.is_eq(M.loaded_field_owner(field), owner) &&
+        String.eq(Sy.text(symbols, M.loaded_field_name(field)), "value") &&
+        String.eq(Sy.text(symbols, M.loaded_field_descriptor(field)), descriptor)
+      Bool.pick(Maybe<&2, U32>, match_field, Some{M.loaded_field_id(field)}, wrapper_value_field_id_scan(rest, owner, symbols, descriptor))
+
+def wrapper_value_field_id(+vm: M.VM, class_name: String, descriptor: String) -> Result<&2, &2, String, U32>:
+  do Result<&2, &2, String, U32>:
+    +owner : U32 = class_id(vm, class_name)
+    field : U32 <- S.require(U32, wrapper_value_field_id_scan(S.fields(vm), owner, S.symbols(vm), descriptor), "java/lang/NoSuchFieldException")
+    return field
 
 
 def entry_fields(entry: M.HeapEntry) -> +List<M.Binding>:
@@ -80,6 +99,28 @@ def entry_element(entry: M.HeapEntry) -> U32:
 def entry_chars(entry: M.HeapEntry) -> +List<U32>:
   M.HeapEntry{class, kind, element, fields, values, chars} = entry
   chars
+
+# Decode Java UTF-16 code units for host output; unpaired surrogates become U+FFFD.
+def high_surrogate(+unit: U32) -> Bool:
+  Bool.and(U32.is_ge(unit, 55296), U32.is_le(unit, 56319))
+
+def low_surrogate(+unit: U32) -> Bool:
+  Bool.and(U32.is_ge(unit, 56320), U32.is_le(unit, 57343))
+
+def utf16_unit(+pending: U32, +unit: U32, paired: Bool) -> String:
+  match paired:
+    case True{}:
+      Char.show(Chr{U32.add(65536, U32.add(U32.shln(U32.sub(pending, 55296), 10n), U32.sub(unit, 56320)))})
+    case False{}:
+      Bool.pick(String, U32.is_eq(pending, 0), "", Char.show(Chr{65533})) ++ Bool.pick(String, high_surrogate(unit), "", Char.show(Chr{Bool.pick(U32, low_surrogate(unit), 65533, unit)}))
+
+def utf16(units: +List<U32>, +pending: U32) -> String:
+  match units:
+    case Nil{}:
+      Bool.pick(String, U32.is_eq(pending, 0), "", Char.show(Chr{65533}))
+    case Con{+unit, tail}:
+      +paired = Bool.and(U32.is_ne(pending, 0), low_surrogate(unit))
+      utf16_unit(pending, unit, paired) ++ utf16(tail, Bool.pick(U32, Bool.and(Bool.not(paired), high_surrogate(unit)), unit, 0))
 
 def name_text(chars: +List<U32>) -> String:
   match chars:
@@ -177,9 +218,7 @@ def slot4(args: +List<M.Slot>) -> Result<&2, &2, String, M.Slot>:
     case _: Fail{"InvalidState: intrinsic argument count"}
 
 def bits_of(slot: M.Slot) -> U32:
-  M.Slot{tag, bits} = slot
-  bits
-
+  M.slot_bits(slot)
 def alloc_ok(allocation: H.Allocation, cont: M.VM -> U32 -> Result<&2, &2, String, O.Outcome>) -> Result<&2, &2, String, O.Outcome>:
   match allocation:
     case H.Allocation{vm, reference}:
@@ -268,6 +307,14 @@ def proxy_box_alloc_result(result: Result<&2, &2, String, H.Allocation>) -> Resu
 
 def proxy_box_alloc(+vm: M.VM, value: M.Slot, name: String) -> Result<&2, &2, String, ProxyBoxedValue>:
   proxy_box_alloc_result(H.allocate(vm, H.object_entry(class_id(vm, name), [M.Binding{0, value}])))
+def proxy_box_wide(+vm: M.VM, +value: M.Slot, +class_name: String, +descriptor: String) -> Result<&2, &2, String, ProxyBoxedValue>:
+  do Result<&2, &2, String, ProxyBoxedValue>:
+    +tag : U32 = Bool.pick(U32, String.eq(descriptor, "J"), 4, 5)
+    checked : Unit <- S.check(U32.is_eq(M.slot_tag(value), tag), "java/lang/IllegalArgumentException")
+    field : U32 <- wrapper_value_field_id(vm, class_name, descriptor)
+    allocation : H.Allocation <- H.allocate(vm, H.object_entry(class_id(vm, class_name), [M.Binding{field, value}]))
+    boxed : ProxyBoxedValue <- proxy_box_alloc_result(Done{allocation})
+    return boxed
 
 def proxy_box_primitive(+vm: M.VM, value: M.Slot, tag: U32) -> Result<&2, &2, String, ProxyBoxedValue>:
   match tag:
@@ -277,8 +324,8 @@ def proxy_box_primitive(+vm: M.VM, value: M.Slot, tag: U32) -> Result<&2, &2, St
     case 67: proxy_box_alloc(vm, value, "java/lang/Character")
     case 73: proxy_box_alloc(vm, value, "java/lang/Integer")
     case 70: proxy_box_alloc(vm, value, "java/lang/Float")
-    case 74: Fail{"UnsupportedFeature: proxy long argument boxing"}
-    case 68: Fail{"UnsupportedFeature: proxy double argument boxing"}
+    case 74: proxy_box_wide(vm, value, "java/lang/Long", "J")
+    case 68: proxy_box_wide(vm, value, "java/lang/Double", "D")
     case _: Fail{"java/lang/IllegalArgumentException"}
 
 def proxy_box_value(+vm: M.VM, value: M.Slot, jvm_type: M.JvmType) -> Result<&2, &2, String, ProxyBoxedValue>:
@@ -303,7 +350,7 @@ def proxy_box_args(+types: +List<M.JvmType>, +values: +List<M.Slot>, +vm: M.VM, 
 def proxy_class_pool_found(found: Maybe<&2, M.ClassMetadata>) -> Result<&2, &2, String, +List<M.Constant>>:
   match found:
     case None{}: Fail{"InvalidState: missing class metadata"}
-    case Some{M.ClassMetadata{owner, flags, metadata, visibleAnnotations, +pool, signature}}: Done{pool}
+    case Some{M.ClassMetadata{owner, flags, metadata, visibleAnnotations, +pool, signature, nesting, source}}: Done{pool}
 
 def proxy_class_pool(metadata: M.Metadata, owner: U32) -> Result<&2, &2, String, +List<M.Constant>>:
   match metadata:
@@ -316,7 +363,7 @@ def proxy_annotation_exceptions(value: M.AnnotationMetadata) -> +List<U32>:
 def proxy_method_exceptions_found(found: Maybe<&2, M.MethodMetadata>) -> Result<&2, &2, String, +List<U32>>:
   match found:
     case None{}: Fail{"InvalidState: missing method metadata"}
-    case Some{M.MethodMetadata{owner, method, metadata, signature}}: Done{proxy_annotation_exceptions(metadata)}
+    case Some{M.MethodMetadata{owner, method, metadata, signature, parameters, lines}}: Done{proxy_annotation_exceptions(metadata)}
 
 def proxy_metadata_exceptions(metadata: M.Metadata, method: U32) -> Result<&2, &2, String, +List<U32>>:
   match metadata:
@@ -365,6 +412,12 @@ def proxy_hash_slots(values: +List<M.Slot>, acc: U32) -> U32:
   match values:
     case Nil{}: acc
     case Con{M.Slot{tag, bits}, rest}: proxy_hash_slots(rest, U32.add(U32.mul(31, acc), U32.add(tag, bits)))
+    case Con{M.Wide{tag, high, low}, rest}:
+      +tag_hash = U32.add(U32.mul(31, acc), tag)
+      +high_hash = U32.add(U32.mul(31, tag_hash), high)
+      +low_hash = U32.add(U32.mul(31, high_hash), low)
+      proxy_hash_slots(rest, low_hash)
+    case Con{M.Unusable{}, rest}: proxy_hash_slots(rest, U32.add(U32.mul(31, acc), 4294967295))
 
 def proxy_cache_key(loader: U32, values: +List<M.Slot>) -> U32:
   U32.add(1073741824, U32.and(U32.add(U32.mul(65537, loader), proxy_hash_slots(values, 0)), 1048575))
@@ -383,7 +436,7 @@ def proxy_interface_ids(fuel: Nat, +vm: M.VM, values: +List<M.Slot>, +acc: +List
 def proxy_class_flags_found(found: Maybe<&2, M.ClassMetadata>) -> U32:
   match found:
     case None{}: 0
-    case Some{M.ClassMetadata{owner, flags, metadata, visibleAnnotations, pool, signature}}: flags
+    case Some{M.ClassMetadata{owner, flags, metadata, visibleAnnotations, pool, signature, nesting, source}}: flags
 
 def proxy_class_flags(metadata: M.Metadata, target: U32) -> U32:
   match metadata:
@@ -394,14 +447,18 @@ def proxy_id_seen(ids: +List<U32>, +target: U32) -> Bool:
     case Nil{}: False{}
     case Con{head, rest}: Bool.or(U32.is_eq(head, target), proxy_id_seen(rest, target))
 
-def proxy_package_scan(chars: +List<Char>, +before: String, +segment: +List<Char>) -> String:
+# Package prefix of a slash-separated name ("a/b/C" -> "a/b/", "C" -> "").
+def name_package_scan(chars: +List<Char>, +before: String, +segment: +List<Char>) -> String:
   match chars:
     case Nil{}: before
-    case Con{Chr{47}, tail}: proxy_package_scan(tail, before ++ String.from_list(M.reverse(Char, segment)) ++ "/", Nil{})
-    case Con{head, tail}: proxy_package_scan(tail, before, Con{head, segment})
+    case Con{Chr{47}, tail}: name_package_scan(tail, before ++ String.from_list(M.reverse(Char, segment)) ++ "/", Nil{})
+    case Con{head, tail}: name_package_scan(tail, before, Con{head, segment})
+
+def binary_package(+name: String) -> String:
+  name_package_scan(String.to_list(name), "", Nil{})
 
 def proxy_class_package(+vm: M.VM, target: U32) -> String:
-  proxy_package_scan(String.to_list(class_name_text(vm, target)), "", Nil{})
+  binary_package(class_name_text(vm, target))
 
 def proxy_validate_ids(ids: +List<U32>, +vm: M.VM, +metadata: M.Metadata, +seen: +List<U32>, +nonpublic: Bool, +package: String) -> Result<&2, &2, String, Unit>:
   match ids:
@@ -462,7 +519,7 @@ def proxy_descriptor_return(+chars: +List<Char>) -> String:
 
 def proxy_method_sig(+vm: M.VM, method: M.LoadedMethod) -> ProxyMethodSig:
   match method:
-    case M.LoadedMethod{id, owner, +name, +descriptor, flags, parameters, resultTag, maxStack, maxLocals, instructions, handlers, intrinsic}:
+    case M.LoadedMethod{id, owner, +name, +descriptor, flags, parameters, resultTag, maxStack, maxLocals, instructions, handlers, intrinsic, switches}:
       +descriptor_text : String = Sy.text(S.symbols(vm), descriptor)
       ProxyMethodSig{Sy.text(S.symbols(vm), name), proxy_descriptor_parameters(String.to_list(descriptor_text), Nil{}), proxy_descriptor_return(String.to_list(descriptor_text))}
 
@@ -493,7 +550,7 @@ def proxy_validate_methods(fuel: Nat, +methods: +List<M.LoadedMethod>, +owners: 
     case 1n+remaining Nil{}: Done{Unit{}}
     case 1n+remaining Con{+method, rest}:
       match method:
-        case M.LoadedMethod{+id, +owner, +name, +descriptor, +flags, parameters, resultTag, maxStack, maxLocals, instructions, handlers, intrinsic}:
+        case M.LoadedMethod{+id, +owner, +name, +descriptor, +flags, parameters, resultTag, maxStack, maxLocals, instructions, handlers, intrinsic, switches}:
           do Result<&2, &2, String, Unit>:
             +method_name : String = Sy.text(S.symbols(vm), name)
             +descriptor_text : String = Sy.text(S.symbols(vm), descriptor)
@@ -662,11 +719,12 @@ def proxy_call_ready(+vm: M.VM, +handler: U32, +proxy: U32, method: M.LoadedMeth
 def proxy_cache_slot_bits(found: Maybe<&2, M.Slot>) -> U32:
   match found:
     case None{}: 0
-    case Some{M.Slot{tag, bits}}: bits
+    case Some{slot}: M.slot_bits(slot)
+
 def proxy_catalog_found(found: Maybe<&2, M.Slot>) -> Maybe<&2, U32>:
   match found:
     case None{}: None{}
-    case Some{M.Slot{tag, bits}}: Some{bits}
+    case Some{slot}: Some{M.slot_bits(slot)}
 
 
 def proxy_slots_equal(left: +List<M.Slot>, right: +List<M.Slot>) -> Bool:
@@ -674,6 +732,9 @@ def proxy_slots_equal(left: +List<M.Slot>, right: +List<M.Slot>) -> Bool:
     case Nil{} Nil{}: True{}
     case Con{M.Slot{left_tag, left_bits}, left_rest} Con{M.Slot{right_tag, right_bits}, right_rest}:
       U32.is_eq(left_tag, right_tag) && U32.is_eq(left_bits, right_bits) && proxy_slots_equal(left_rest, right_rest)
+    case Con{M.Wide{left_tag, left_high, left_low}, left_rest} Con{M.Wide{right_tag, right_high, right_low}, right_rest}:
+      U32.is_eq(left_tag, right_tag) && U32.is_eq(left_high, right_high) && U32.is_eq(left_low, right_low) && proxy_slots_equal(left_rest, right_rest)
+    case Con{M.Unusable{}, left_rest} Con{M.Unusable{}, right_rest}: proxy_slots_equal(left_rest, right_rest)
     case _ _: False{}
 
 def proxy_cache_node_match(+vm: M.VM, reference: U32, loader: U32, +values: +List<M.Slot>) -> Result<&2, &2, String, Bool>:
@@ -717,7 +778,7 @@ def proxy_catalog_append(+vm: M.VM, +ids: +List<U32>, key: U32, loader: U32, int
     +class_id_value : U32 = M.length(M.LoadedClass, S.classes(vm))
     +name : String = "$Proxy" ++ V.int_show(class_id_value)
     +symbol_id : U32 = M.length(String, S.symbols(vm))
-    +proxy_class : M.LoadedClass = M.LoadedClass{class_id_value, symbol_id, class_id(vm, "java/lang/reflect/Proxy"), ids, Nil{}, Nil{}, 4294967295, 0}
+    +proxy_class : M.LoadedClass = M.LoadedClass{class_id_value, symbol_id, class_id(vm, "java/lang/reflect/Proxy"), ids, Nil{}, Nil{}, 4294967295, 0, Nil{}}
     +symbols : +List<String> = M.append(String, S.symbols(vm), [name])
     +with_symbols : M.VM = S.with_symbols(vm, symbols)
     +classes : +List<M.LoadedClass> = M.append(M.LoadedClass, S.classes(with_symbols), [proxy_class])
@@ -779,7 +840,7 @@ def proxy_class_mirror_cached(+vm: M.VM, +class_id_value: U32, +interfaces: U32)
 def proxy_class_id_found(found: Maybe<&2, M.Slot>, fallback: U32) -> U32:
   match found:
     case None{}: fallback
-    case Some{M.Slot{tag, bits}}: bits
+    case Some{slot}: M.slot_bits(slot)
 
 def proxy_class_id(+vm: M.VM, reference: U32) -> Result<&2, &2, String, U32>:
   do Result<&2, &2, String, U32>:
@@ -828,8 +889,8 @@ def proxy_init(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outc
     return result
 def proxy_constructor_clone(method: M.LoadedMethod, owner: U32) -> M.LoadedMethod:
   match method:
-    case M.LoadedMethod{id, old_owner, name, descriptor, flags, parameters, resultTag, maxStack, maxLocals, instructions, handlers, intrinsic}:
-      M.LoadedMethod{id, owner, name, descriptor, flags, parameters, resultTag, maxStack, maxLocals, instructions, handlers, intrinsic}
+    case M.LoadedMethod{id, old_owner, name, descriptor, flags, parameters, resultTag, maxStack, maxLocals, instructions, handlers, intrinsic, switches}:
+      M.LoadedMethod{id, owner, name, descriptor, flags, parameters, resultTag, maxStack, maxLocals, instructions, handlers, intrinsic, switches}
 
 def proxy_constructor_base(+vm: M.VM) -> Result<&2, &2, String, M.LoadedMethod>:
   S.require(M.LoadedMethod, proxy_own_method(S.methods(vm), S.symbols(vm), class_id(vm, "java/lang/reflect/Proxy"), "<init>", "(Ljava/lang/reflect/InvocationHandler;)V"), "java/lang/NoSuchMethodException")
@@ -902,6 +963,8 @@ def class_name_result(+vm: M.VM, +name: String) -> Result<&2, &2, String, O.Outc
 type ClassForNameStart is Data:
   ClassForNameReady{vm: M.VM}
   ClassForNameCall{vm: M.VM, target: U32, method: M.LoadedMethod}
+  # Another thread is running `class`'s initializer: wait for it (JVMS 5.5 step 2).
+  ClassForNameBlocked{vm: M.VM, class: U32}
 
 def system_loader_reference() -> U32:
   14
@@ -932,79 +995,132 @@ def class_for_name_args(+args: +List<M.Slot>) -> Result<&2, &2, String, ClassFor
     case Con{name, Nil{}}: Done{ClassForNameArgs{name, True{}, system_loader_reference()}}
     case _: Fail{"InvalidState: intrinsic argument count"}
 
-def class_for_name_call(+vm: M.VM, +target: U32, method: M.LoadedMethod) -> O.Outcome:
-  O.Call{S.with_effect(S.set_class_state(vm, target, 1), M.ClassForName{target}), method, Nil{}}
+@unsafe def internal_to_binary(name: String) -> String:
+  class_display_name(name)
 
-def class_for_name_start_outcome(start: ClassForNameStart, target: U32) -> Result<&2, &2, String, O.Outcome>:
+def init_failed(+vm: M.VM, id: U32) -> String:
+  "java/lang/NoClassDefFoundError: Could not initialize class " ++ internal_to_binary(class_name_text(vm, id))
+
+# Interface methods that are neither abstract nor static are default methods.
+def default_method(found: Maybe<&2, M.LoadedMethod>) -> Bool:
+  match found:
+    case None{}: False{}
+    case Some{method}: U32.is_eq(U32.and(M.loaded_method_flags(method), 1032), 0)
+
+@unsafe def declares_default_hit(hit: Bool, +methods: +List<M.LoadedMethod>, ids: +List<U32>) -> Bool:
+  match hit:
+    case True{}: True{}
+    case False{}: declares_default(methods, ids)
+
+@unsafe def declares_default(+methods: +List<M.LoadedMethod>, ids: +List<U32>) -> Bool:
+  match ids:
+    case Nil{}: False{}
+    case Con{id, rest}: declares_default_hit(default_method(M.nth(M.LoadedMethod, methods, id)), methods, rest)
+
+def default_self(declares: Bool, id: U32) -> +List<U32>:
+  match declares:
+    case True{}: Con{id, Nil{}}
+    case False{}: Nil{}
+
+@unsafe def default_interface(fuel: Nat, +vm: M.VM, found: Maybe<&2, M.LoadedClass>) -> +List<U32>:
+  match found:
+    case None{}: Nil{}
+    case Some{M.LoadedClass{id, name, parent, interfaces, fields, methods, initializer, state, bootstrapMethods}}:
+      M.append(U32, default_interfaces(fuel, vm, interfaces), default_self(declares_default(S.methods(vm), methods), id))
+
+# For each direct superinterface in declaration order: its own qualifying
+# superinterfaces, then itself when it declares a default method (HotSpot's
+# initialize_super_interfaces, JDK 8u40 and later).
+@unsafe def default_interfaces(fuel: Nat, +vm: M.VM, ids: +List<U32>) -> +List<U32>:
+  match fuel ids:
+    case 0n _: Nil{}
+    case 1n+p Nil{}: Nil{}
+    case 1n+ +p Con{id, rest}: M.append(U32, default_interface(p, vm, M.nth(M.LoadedClass, S.classes(vm), id)), default_interfaces(p, vm, rest))
+
+# Classes initialized before a class: its superclass, then superinterfaces that
+# declare default methods. Interfaces (no superclass here) initialize alone.
+def init_supers(fuel: Nat, +vm: M.VM, parent: U32, interfaces: +List<U32>) -> +List<U32>:
+  match parent:
+    case 4294967295: Nil{}
+    case value: Con{value, default_interfaces(fuel, vm, interfaces)}
+
+def init_walk_self(+vm: M.VM, id: U32, initializer: U32) -> Result<&2, &2, String, ClassForNameStart>:
+  match initializer:
+    case 4294967295: Done{ClassForNameReady{S.set_class_state(vm, id, 2)}}
+    case method_id:
+      do Result<&2, &2, String, ClassForNameStart>:
+        method : M.LoadedMethod <- S.require(M.LoadedMethod, M.nth(M.LoadedMethod, S.methods(vm), method_id), "java/lang/NoSuchMethodError: <clinit>")
+        return ClassForNameCall{vm, id, method}
+
+@unsafe def init_walk_step(result: Result<&2, &2, String, ClassForNameStart>, +fuel: Nat, id: U32, initializer: U32, supers: +List<U32>) -> Result<&2, &2, String, ClassForNameStart>:
+  match result:
+    case Fail{error}: Fail{error}
+    case Done{ClassForNameCall{+vm, target, +method}}: Done{ClassForNameCall{vm, target, method}}
+    case Done{ClassForNameBlocked{+vm, class}}: Done{ClassForNameBlocked{vm, class}}
+    case Done{ClassForNameReady{+vm}}: init_walk_supers(fuel, vm, id, initializer, supers)
+
+@unsafe def init_walk_supers(+fuel: Nat, +vm: M.VM, id: U32, initializer: U32, supers: +List<U32>) -> Result<&2, &2, String, ClassForNameStart>:
+  match supers:
+    case Nil{}: init_walk_self(vm, id, initializer)
+    case Con{super, rest}: init_walk_step(class_for_name_walk(fuel, vm, super), fuel, id, initializer, rest)
+
+# A user-defined class is verified when it is first linked (JVMS 5.4.1).
+@unsafe def init_walk_verified(result: Result<&2, &2, String, M.VM>, +fuel: Nat, id: U32, initializer: U32, parent: U32, interfaces: +List<U32>) -> Result<&2, &2, String, ClassForNameStart>:
+  match result:
+    case Fail{error}: Fail{error}
+    case Done{+vm}: init_walk_supers(fuel, vm, id, initializer, init_supers(fuel, vm, parent, interfaces))
+
+# State 1 (initializing): a recursive request from the initializing thread
+# proceeds and observes default values (JVMS 5.5 step 3); any other thread
+# waits until the initializer finishes or fails (step 2).
+def init_walk_initializing(+vm: M.VM, +id: U32, +owner: U32) -> Result<&2, &2, String, ClassForNameStart>:
+  Bool.pick(Result<&2, &2, String, ClassForNameStart>, U32.is_eq(owner, Th.current(vm)) || U32.is_eq(owner, 0), Done{ClassForNameReady{vm}}, Done{ClassForNameBlocked{vm, id}})
+
+@unsafe def init_walk_class(+fuel: Nat, +vm: M.VM, found: Maybe<&2, M.LoadedClass>) -> Result<&2, &2, String, ClassForNameStart>:
+  match found:
+    case None{}: Fail{"java/lang/ClassNotFoundException"}
+    case Some{M.LoadedClass{+id, name, parent, interfaces, fields, methods, initializer, state, bootstrapMethods}}:
+      match state:
+        case 0: init_walk_verified(LS.verify_pending(vm, id), fuel, id, initializer, parent, interfaces)
+        case 3: Fail{init_failed(vm, id)}
+        case 1: init_walk_initializing(vm, id, S.init_owner(vm, id))
+        case _: Done{ClassForNameReady{vm}}
+
+# JVMS 5.5: the next initializer that must run before `target` is initialized,
+# or Ready once every superclass, qualifying superinterface and the class itself
+# are initialized. Callers run the returned <clinit> and re-execute their trigger.
+@unsafe def class_for_name_walk(fuel: Nat, +vm: M.VM, +target: U32) -> Result<&2, &2, String, ClassForNameStart>:
+  match fuel target:
+    case _ 4294967295: Done{ClassForNameReady{vm}}
+    case 0n _: Fail{"java/lang/NoClassDefFoundError"}
+    case 1n+remaining id: init_walk_class(remaining, vm, M.nth(M.LoadedClass, S.classes(vm), id))
+
+# Starts the next <clinit> as a Java callback; `cont` resumes the requester
+# when that initializer returns.
+@unsafe def init_call(+vm: M.VM, owner: U32, method: M.LoadedMethod, cont: M.Cont) -> O.Outcome:
+  O.Call{push_cont(S.set_class_state(vm, owner, 1), cont), method, Nil{}}
+
+@unsafe def class_for_name_initialized(start: ClassForNameStart, target: U32) -> Result<&2, &2, String, O.Outcome>:
   match start:
     case ClassForNameReady{+vm}: class_mirror_out(vm, target)
-    case ClassForNameCall{+vm, owner, +method}: Done{class_for_name_call(vm, owner, method)}
+    case ClassForNameCall{+vm, owner, +method}: Done{init_call(vm, owner, method, M.NeedClassMirror{target})}
+    case ClassForNameBlocked{+vm, class}: Done{init_park(vm, class, M.NeedClassMirror{target})}
 
-def class_for_name_parent_ready(parent_result: ClassForNameStart, +vm: M.VM, id: U32, initializer: U32) -> Result<&2, &2, String, ClassForNameStart>:
-  match parent_result:
-    case ClassForNameCall{+vm, target, +method}: Done{ClassForNameCall{vm, target, method}}
-    case ClassForNameReady{+vm}:
-      match initializer:
-        case 4294967295: Done{ClassForNameReady{S.set_class_state(vm, id, 2)}}
-        case method_id:
-          do Result<&2, &2, String, ClassForNameStart>:
-            method : M.LoadedMethod <- S.require(M.LoadedMethod, M.nth(M.LoadedMethod, S.methods(vm), method_id), "java/lang/NoSuchMethodError")
-            return ClassForNameCall{vm, id, method}
-
-def class_for_name_walk(fuel: Nat, +vm: M.VM, +target: U32) -> Result<&2, &2, String, ClassForNameStart>:
-  match fuel:
-    case 0n: Fail{"java/lang/NoClassDefFoundError"}
-    case 1n+remaining:
-      +root : Bool = U32.is_eq(target, 4294967295)
-      Bool.pick(Result<&2, &2, String, ClassForNameStart>,
-        root,
-        Done{ClassForNameReady{vm}},
-        Result.bind(&2, &2, String, M.LoadedClass, ClassForNameStart,
-          S.require(M.LoadedClass, M.nth(M.LoadedClass, S.classes(vm), target), "java/lang/ClassNotFoundException"),
-          +class => do Result<&2, &2, String, ClassForNameStart>:
-            +id : U32 = M.loaded_class_id(class)
-            +parent : U32 = M.loaded_class_parent(class)
-            initializer : U32 = M.loaded_class_initializer(class)
-            +state : U32 = M.loaded_class_state(class)
-            +failed : Bool = U32.is_eq(state, 3)
-            +ready : Bool = U32.is_eq(state, 1) || U32.is_eq(state, 2)
-            +fresh : Bool = U32.is_eq(state, 0)
-            Bool.pick(Result<&2, &2, String, ClassForNameStart>,
-              failed,
-              Fail{"java/lang/NoClassDefFoundError"},
-              Bool.pick(Result<&2, &2, String, ClassForNameStart>,
-                ready,
-                Done{ClassForNameReady{vm}},
-                Bool.pick(Result<&2, &2, String, ClassForNameStart>,
-                  fresh,
-                  do Result<&2, &2, String, ClassForNameStart>:
-                    parent_result : ClassForNameStart <- class_for_name_walk(remaining, vm, parent)
-                    next : ClassForNameStart <- class_for_name_parent_ready(parent_result, vm, id, initializer)
-                    return next,
-                  Fail{"java/lang/NoClassDefFoundError"})))))
-def class_for_name_initial(+vm: M.VM, +target: U32, initializer: U32) -> Result<&2, &2, String, O.Outcome>:
+# Class.forName with initialize=true runs every pending initializer in JVMS 5.5
+# order (one callback each) before returning the mirror.
+@unsafe def class_for_name_init(+vm: M.VM, +target: U32) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
     start : ClassForNameStart <- class_for_name_walk(256n, vm, target)
-    result : O.Outcome <- class_for_name_start_outcome(start, target)
+    result : O.Outcome <- class_for_name_initialized(start, target)
     return result
 
-def class_for_name_continue(+vm: M.VM, +target: U32) -> Result<&2, &2, String, O.Outcome>:
-  do Result<&2, &2, String, O.Outcome>:
-    start : ClassForNameStart <- class_for_name_walk(256n, vm, target)
-    result : O.Outcome <- class_for_name_start_outcome(start, target)
-    return result
-
-def class_for_name_loaded_state(+vm: M.VM, +shouldInit: Bool, +id: U32, initializer: U32, state: U32) -> Result<&2, &2, String, O.Outcome>:
-  match state:
-    case 3: Bool.pick(Result<&2, &2, String, O.Outcome>, shouldInit, throw_name(vm, "java/lang/NoClassDefFoundError"), class_mirror_out(vm, id))
-    case 0: Bool.pick(Result<&2, &2, String, O.Outcome>, shouldInit, class_for_name_initial(vm, id, initializer), class_mirror_out(vm, id))
-    case _: class_mirror_out(vm, id)
+def class_for_name_loaded_state(+vm: M.VM, shouldInit: Bool, +id: U32) -> Result<&2, &2, String, O.Outcome>:
+  match shouldInit:
+    case True{}: class_for_name_init(vm, id)
+    case False{}: class_mirror_out(vm, id)
 
 def class_for_name_loaded(+vm: M.VM, +shouldInit: Bool, +class: M.LoadedClass) -> Result<&2, &2, String, O.Outcome>:
-  +id : U32 = M.loaded_class_id(class)
-  initializer : U32 = M.loaded_class_initializer(class)
-  state : U32 = M.loaded_class_state(class)
-  class_for_name_loaded_state(vm, shouldInit, id, initializer, state)
+  class_for_name_loaded_state(vm, shouldInit, M.loaded_class_id(class))
 
 def class_for_name_target(+vm: M.VM, target: U32, shouldInit: Bool) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
@@ -1056,17 +1172,20 @@ def valid_for_name(+text: String) -> Bool:
     case _: binary_segments(text, False{})
 
 def ensure_array_class(+vm: M.VM, +name: String) -> Result<&2, &2, String, M.VM>:
-  match name:
-    case SCon{Chr{91}, +rest}:
-      do Result<&2, &2, String, M.VM>:
-        +inner : M.VM <- ensure_array_class(vm, rest)
-        result : M.VM <- Bool.pick(Result<&2, &2, String, M.VM>, U32.is_eq(class_id(inner, name), 4294967295), CL.append_parsed(inner, [B.array_class(name)]), Done{inner})
-        return result
-    case _: Done{vm}
+  CL.ensure_array_class(vm, name)
 
-def class_resolve_runtime(+vm: M.VM, +name: String, +shouldInit: Bool, +loader: U32) -> Result<&2, &2, String, O.Outcome>:
+# The bootstrap and system loaders never see classes user loaders defined.
+@unsafe def system_visible(+vm: M.VM, +id: U32) -> Bool:
+  U32.is_ne(id, 4294967295) && system_defined(LS.defining_loader_of(vm, id))
+
+@unsafe def system_defined(found: Maybe<&2, U32>) -> Bool:
+  match found:
+    case None{}: True{}
+    case Some{loader}: U32.is_eq(loader, system_loader_reference())
+
+@unsafe def class_resolve_runtime(+vm: M.VM, +name: String, +shouldInit: Bool, +loader: U32) -> Result<&2, &2, String, O.Outcome>:
   +component : String = CL.loadable_name(name)
-  +missing : Bool = Bool.not(String.is_empty(component)) && U32.is_eq(class_id(vm, component), 4294967295)
+  +missing : Bool = Bool.not(String.is_empty(component)) && Bool.not(system_visible(vm, class_id(vm, component)))
   do Result<&2, &2, String, O.Outcome>:
     allowed : Unit <- S.check(U32.is_eq(loader, system_loader_reference()) || (U32.is_eq(loader, 0) && class_bootstrap_name(name)), "java/lang/ClassNotFoundException")
     result : O.Outcome <- Bool.pick(Result<&2, &2, String, O.Outcome>, missing,
@@ -1103,13 +1222,20 @@ def class_loader_load(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String,
     result : O.Outcome <- class_resolve_runtime(vm, class_binary_name(name), False{}, bits_of(receiver))
     return result
 
-def class_get_loader(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+# A user-defined class reports its defining loader; otherwise bootstrap
+# classes report null and application classes the system loader.
+@unsafe def class_loader_of_target(found: Maybe<&2, U32>, +vm: M.VM, +target: U32) -> Result<&2, &2, String, O.Outcome>:
+  match found:
+    case Some{loader}: ref_out(vm, loader)
+    case None{}: Bool.pick(Result<&2, &2, String, O.Outcome>, class_bootstrap_target(vm, target), ref_out(vm, 0), ref_out(vm, system_loader_reference()))
+
+@unsafe def class_get_loader(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
     mirror : M.Slot <- slot0(args)
     +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(mirror))
     checked : Unit <- S.check(U32.is_eq(entry_kind(entry), 8), "java/lang/IllegalArgumentException")
-    target : U32 = entry_element(entry)
-    result : O.Outcome <- Bool.pick(Result<&2, &2, String, O.Outcome>, class_bootstrap_target(vm, target), ref_out(vm, 0), ref_out(vm, system_loader_reference()))
+    +target : U32 = entry_element(entry)
+    result : O.Outcome <- class_loader_of_target(LS.defining_loader_of(vm, target), vm, target)
     return result
 def resource_match_name(+resource: M.Resource, +name: String) -> Bool:
   M.Resource{+resource_name, +origin} = resource
@@ -1242,14 +1368,8 @@ def resource_join_segments(+segments: +List<String>) -> String:
 def resource_normalize_path(+name: String) -> String:
   resource_join_segments(M.reverse(String, resource_segments(String.to_list(name), Nil{}, Nil{})))
 
-def resource_package_scan(chars: +List<Char>, +before: String, +segment: +List<Char>) -> String:
-  match chars:
-    case Nil{}: before
-    case Con{Chr{47}, tail}: resource_package_scan(tail, before ++ String.from_list(M.reverse(Char, segment)) ++ "/", Nil{})
-    case Con{head, tail}: resource_package_scan(tail, before, Con{head, segment})
-
 def resource_package(+name: String) -> String:
-  resource_package_scan(String.to_list(name), "", Nil{})
+  binary_package(name)
 
 def class_resource_path(+vm: M.VM, target: U32, +name: String) -> String:
   match name:
@@ -1324,13 +1444,20 @@ def url_open_stream(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O
     result : O.Outcome <- resource_stream_found(vm, resource_find_exact(S.resources(vm), name, origin))
     return result
 
-def url_get_path(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+# URL.getPath: the escaped part after the protocol ("/dir/name", or
+# "file:/archive.jar!/name" for a jar URL).
+@unsafe def url_path_info(info: UrlOrigin) -> String:
+  match info:
+    case UrlOrigin{True{}, +text}: "file:" ++ url_escape_text(String.to_list(text))
+    case UrlOrigin{False{}, +text}: url_escape_text(String.to_list(text))
+
+@unsafe def url_get_path(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
     receiver : M.Slot <- slot0(args)
     entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
-    name_ref : U32 <- url_field(entry, 0)
-    name : String <- string_text(vm, name_ref)
-    result : O.Outcome <- intern_or_alloc(vm, units_from_string(name))
+    origin_ref : U32 <- url_field(entry, 1)
+    origin : String <- string_text(vm, origin_ref)
+    result : O.Outcome <- intern_or_alloc(vm, units_from_string(url_path_info(url_origin_info(origin))))
     return result
 def url_origin_scan(chars: +List<Char>, +acc: +List<Char>, archive: Bool) -> UrlOrigin:
   match chars:
@@ -1342,33 +1469,36 @@ def url_origin_info(+origin: String) -> UrlOrigin:
   url_origin_scan(String.to_list(origin), Nil{}, False{})
 
 def url_hex_digit(+value: U32) -> Char:
-  Bool.pick(Char, U32.is_lt(value, 10), Chr{U32.add(48, value)}, Chr{U32.add(55, value)})
+  Bool.pick(Char, U32.is_lt(value, 10), Chr{U32.add(48, value)}, Chr{U32.add(87, value)})
 
 def url_percent_byte(+value: U32) -> String:
   "%" ++ String.from_list([url_hex_digit(U32.shrn(value, 4n)), url_hex_digit(U32.and(value, 15))])
 
-def url_ascii_safe(+value: U32) -> Bool:
-  (U32.is_ge(value, 65) && U32.is_le(value, 90)) ||
-  (U32.is_ge(value, 97) && U32.is_le(value, 122)) ||
-  (U32.is_ge(value, 48) && U32.is_le(value, 57)) ||
-  U32.is_eq(value, 45) || U32.is_eq(value, 46) || U32.is_eq(value, 95) || U32.is_eq(value, 126) ||
-  U32.is_eq(value, 33) || U32.is_eq(value, 36) || U32.is_eq(value, 38) || U32.is_eq(value, 39) || U32.is_eq(value, 40) ||
-  U32.is_eq(value, 41) || U32.is_eq(value, 42) || U32.is_eq(value, 43) || U32.is_eq(value, 44) || U32.is_eq(value, 47) ||
-  U32.is_eq(value, 58) || U32.is_eq(value, 59) || U32.is_eq(value, 61) || U32.is_eq(value, 64)
+# sun.net.www.ParseUtil.encodePath: these ASCII characters are escaped; letters,
+# digits and !$&'()*+,-./:@_~ are kept.
+def url_ascii_encoded(+value: U32) -> Bool:
+  U32.is_le(value, 32) || U32.is_eq(value, 127) ||
+  U32.is_eq(value, 34) || U32.is_eq(value, 35) || U32.is_eq(value, 37) || U32.is_eq(value, 59) ||
+  U32.is_eq(value, 60) || U32.is_eq(value, 61) || U32.is_eq(value, 62) || U32.is_eq(value, 63) ||
+  U32.is_eq(value, 91) || U32.is_eq(value, 92) || U32.is_eq(value, 93) || U32.is_eq(value, 94) ||
+  U32.is_eq(value, 96) || U32.is_eq(value, 123) || U32.is_eq(value, 124) || U32.is_eq(value, 125)
 
-def url_escape_codepoint(+value: U32) -> String:
-  Bool.pick(String, U32.is_le(value, 127) && url_ascii_safe(value), String.from_list([Chr{value}]),
+# Each UTF-16 unit is escaped on its own (surrogates become three bytes each),
+# with lowercase hex digits, as ParseUtil.escape does.
+def url_escape_unit(+value: U32) -> String:
+  Bool.pick(String, U32.is_le(value, 127) && Bool.not(url_ascii_encoded(value)), String.from_list([Chr{value}]),
     Bool.pick(String, U32.is_le(value, 127), url_percent_byte(value),
       Bool.pick(String, U32.is_le(value, 2047),
         url_percent_byte(U32.or(192, U32.shrn(value, 6n))) ++ url_percent_byte(U32.or(128, U32.and(value, 63))),
-        Bool.pick(String, U32.is_le(value, 65535),
-          url_percent_byte(U32.or(224, U32.shrn(value, 12n))) ++ url_percent_byte(U32.or(128, U32.and(U32.shrn(value, 6n), 63))) ++ url_percent_byte(U32.or(128, U32.and(value, 63))),
-          url_percent_byte(U32.or(240, U32.shrn(value, 18n))) ++ url_percent_byte(U32.or(128, U32.and(U32.shrn(value, 12n), 63))) ++ url_percent_byte(U32.or(128, U32.and(U32.shrn(value, 6n), 63))) ++ url_percent_byte(U32.or(128, U32.and(value, 63)))))))
+        url_percent_byte(U32.or(224, U32.shrn(value, 12n))) ++ url_percent_byte(U32.or(128, U32.and(U32.shrn(value, 6n), 63))) ++ url_percent_byte(U32.or(128, U32.and(value, 63))))))
+
+def url_escape_units(units: +List<U32>) -> String:
+  match units:
+    case Nil{}: ""
+    case Con{head, tail}: url_escape_unit(head) ++ url_escape_units(tail)
 
 def url_escape_text(chars: +List<Char>) -> String:
-  match chars:
-    case Nil{}: ""
-    case Con{head, tail}: url_escape_codepoint(Char.to_u32(head)) ++ url_escape_text(tail)
+  url_escape_units(units_from_list(chars))
 
 def url_external_info(info: UrlOrigin) -> String:
   match info:
@@ -1467,14 +1597,18 @@ def return_descriptor_chars(chars: +List<Char>) -> String:
 def method_return_name(+descriptor: String) -> String:
   descriptor_class_name(return_descriptor_chars(String.to_list(descriptor)))
 
-def class_name_mirror(+vm: M.VM, +name: String) -> Result<&2, &2, String, O.Outcome>:
-  +target : U32 = class_id(vm, name)
+def loaded_mirror(+vm: M.VM, +target: U32) -> Result<&2, &2, String, O.Outcome>:
   Bool.pick(Result<&2, &2, String, O.Outcome>, U32.is_eq(target, 4294967295), throw_name(vm, "java/lang/NoClassDefFoundError"), class_mirror_out(vm, target))
 
+# Mirrors by name create array classes on first use, as the JVM does.
+def class_name_mirror(+vm: M.VM, +name: String) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +ready : M.VM <- ensure_array_class(vm, name)
+    result : O.Outcome <- loaded_mirror(ready, class_id(ready, name))
+    return result
+
 def descriptor_mirror(+vm: M.VM, +descriptor: String) -> Result<&2, &2, String, O.Outcome>:
-  +name : String = descriptor_class_name(descriptor)
-  +target : U32 = class_id(vm, name)
-  Bool.pick(Result<&2, &2, String, O.Outcome>, U32.is_eq(target, 4294967295), throw_name(vm, "java/lang/NoClassDefFoundError"), class_mirror_out(vm, target))
+  class_name_mirror(vm, descriptor_class_name(descriptor))
 
 def class_component_result(+vm: M.VM, +name: String) -> Result<&2, &2, String, O.Outcome>:
   +component : String = array_component_name(name)
@@ -1485,7 +1619,7 @@ def class_component_result(+vm: M.VM, +name: String) -> Result<&2, &2, String, O
 def class_metadata_found(found: Maybe<&2, M.ClassMetadata>) -> U32:
   match found:
     case None{}: 0
-    case Some{M.ClassMetadata{owner, flags, metadata, visibleAnnotations, pool, signature}}: flags
+    case Some{M.ClassMetadata{owner, flags, metadata, visibleAnnotations, pool, signature, nesting, source}}: flags
 
 def class_flags_from_metadata(metadata: M.Metadata, +target: U32) -> U32:
   match metadata:
@@ -1499,7 +1633,7 @@ def annotation_name_present(+names: +List<String>, +target: String) -> Bool:
 def class_annotation_names_found(found: Maybe<&2, M.ClassMetadata>) -> +List<String>:
   match found:
     case None{}: Nil{}
-    case Some{M.ClassMetadata{owner, flags, metadata, visibleAnnotations, pool, signature}}: visibleAnnotations
+    case Some{M.ClassMetadata{owner, flags, metadata, visibleAnnotations, pool, signature, nesting, source}}: visibleAnnotations
 
 def class_annotation_names_from_metadata(metadata: M.Metadata, +target: U32) -> +List<String>:
   match metadata:
@@ -1664,7 +1798,7 @@ def annotation_array_result_type(+vm: M.VM, component: U32, +slots: +List<M.Slot
 
 def class_annotation_values_from(+vm: M.VM, metadata: M.ClassMetadata) -> AnnotationMetadataRef:
   match metadata:
-    case M.ClassMetadata{owner, flags, metadata, visibleAnnotations, +pool, signature}: AnnotationMetadataRef{vm, pool, metadata}
+    case M.ClassMetadata{owner, flags, metadata, visibleAnnotations, +pool, signature, nesting, source}: AnnotationMetadataRef{vm, pool, metadata}
 
 def class_annotation_values_after(+vm: M.VM, result: Result<&2, &2, String, M.ClassMetadata>) -> Result<&2, &2, String, AnnotationMetadataRef>:
   match result:
@@ -2102,7 +2236,7 @@ def field_metadata_value(+vm: M.VM, +id: U32) -> Result<&2, &2, String, M.FieldM
 
 def class_metadata_pool(value: M.ClassMetadata) -> +List<M.Constant>:
   match value:
-    case M.ClassMetadata{owner, flags, metadata, visibleAnnotations, +pool, signature}: pool
+    case M.ClassMetadata{owner, flags, metadata, visibleAnnotations, +pool, signature, nesting, source}: pool
 
 def field_metadata_annotations(value: M.FieldMetadata) -> M.AnnotationMetadata:
   match value:
@@ -2118,15 +2252,107 @@ def method_metadata_value(+vm: M.VM, +id: U32) -> Result<&2, &2, String, M.Metho
   method_metadata_from_metadata(S.metadata(vm), id)
 def method_metadata_annotations(value: M.MethodMetadata) -> M.AnnotationMetadata:
   match value:
-    case M.MethodMetadata{owner, method, metadata, signature}: metadata
+    case M.MethodMetadata{owner, method, metadata, signature, parameters, lines}: metadata
 
 def method_signature_found(found: Result<&2, &2, String, M.MethodMetadata>) -> String:
   match found:
     case Fail{error}: ""
-    case Done{M.MethodMetadata{owner, method, metadata, signature}}: signature
+    case Done{M.MethodMetadata{owner, method, metadata, signature, parameters, lines}}: signature
 
 def method_signature(+vm: M.VM, method: M.LoadedMethod) -> String:
   method_signature_found(method_metadata_value(vm, M.loaded_method_id(method)))
+
+# ---- Generic declaration scopes (the JDK's CoreReflectionFactory chain) ----
+# A method's own type parameters come first, then its class's, then the class's
+# enclosing method (EnclosingMethod) or enclosing class.
+
+def method_scope_kind(+vm: M.VM, method: M.LoadedMethod) -> U32:
+  Bool.pick(U32, String.eq(Sy.text(S.symbols(vm), M.loaded_method_name(method)), "<init>"), 3, 2)
+
+@unsafe def method_scopes(fuel: Nat, +vm: M.VM, +method: M.LoadedMethod) -> +List<G.Scope>:
+  Con{G.Scope{method_scope_kind(vm, method), M.loaded_method_id(method), G.method_variables(method_signature(vm, method))}, class_scopes(fuel, vm, M.loaded_method_owner(method))}
+
+@unsafe def scope_enclosing_class(empty: Bool, fuel: Nat, +vm: M.VM, +name: String) -> +List<G.Scope>:
+  match empty:
+    case True{}: Nil{}
+    case False{}: class_scopes(fuel, vm, class_id(vm, name))
+
+@unsafe def scope_from_method(found: Maybe<&2, M.LoadedMethod>, fuel: Nat, +vm: M.VM, +id: U32) -> +List<G.Scope>:
+  match found:
+    case Some{method}: method_scopes(fuel, vm, method)
+    case None{}:
+      +enclosing : String = enclosing_name(vm, id)
+      scope_enclosing_class(String.is_empty(enclosing), fuel, vm, enclosing)
+
+@unsafe def scope_enclosing_method(named: Bool, fuel: Nat, +vm: M.VM, +id: U32, +nesting: M.Nesting) -> +List<G.Scope>:
+  match named:
+    case True{}: scope_from_method(method_named(vm, S.methods(vm), class_id(vm, nesting_enclosing_class(nesting)), nesting_method(nesting), nesting_descriptor(nesting)), fuel, vm, id)
+    case False{}: scope_from_method(None{}, fuel, vm, id)
+
+@unsafe def class_scopes(fuel: Nat, +vm: M.VM, +id: U32) -> +List<G.Scope>:
+  match fuel id:
+    case 0n _: Nil{}
+    case _ 4294967295: Nil{}
+    case 1n+p _:
+      +nesting : M.Nesting = class_nesting_of(vm, id)
+      Con{G.Scope{1, id, G.class_variables(class_signature(vm, id))}, scope_enclosing_method(Bool.not(String.is_empty(nesting_method(nesting))), p, vm, id, nesting)}
+
+@unsafe def ensure_arrays(+vm: M.VM, names: +List<String>) -> Result<&2, &2, String, M.VM>:
+  match names:
+    case Nil{}: Done{vm}
+    case Con{name, rest}:
+      do Result<&2, &2, String, M.VM>:
+        +next : M.VM <- ensure_array_class(vm, name)
+        result : M.VM <- ensure_arrays(next, rest)
+        return result
+
+@unsafe def method_generic_return(+vm: M.VM, +method: M.LoadedMethod, +text: String) -> Result<&2, &2, String, G.TypeRef>:
+  do Result<&2, &2, String, G.TypeRef>:
+    +ready : M.VM <- ensure_arrays(vm, G.method_arrays(text))
+    result : G.TypeRef <- G.return_ref(ready, text, method_scope_kind(ready, method), M.loaded_method_id(method), class_scopes(64n, ready, M.loaded_method_owner(method)))
+    return result
+
+@unsafe def method_generic_parameters(+vm: M.VM, +method: M.LoadedMethod, +text: String) -> Result<&2, &2, String, G.TypeRefs>:
+  do Result<&2, &2, String, G.TypeRefs>:
+    +ready : M.VM <- ensure_arrays(vm, G.method_arrays(text))
+    result : G.TypeRefs <- G.parameter_refs(ready, text, method_scope_kind(ready, method), M.loaded_method_id(method), class_scopes(64n, ready, M.loaded_method_owner(method)))
+    return result
+
+@unsafe def method_generic_thrown(+vm: M.VM, +method: M.LoadedMethod, +text: String) -> Result<&2, &2, String, G.TypeRefs>:
+  do Result<&2, &2, String, G.TypeRefs>:
+    +ready : M.VM <- ensure_arrays(vm, G.method_arrays(text))
+    result : G.TypeRefs <- G.thrown_refs(ready, text, method_scope_kind(ready, method), M.loaded_method_id(method), class_scopes(64n, ready, M.loaded_method_owner(method)))
+    return result
+
+@unsafe def method_generic_return_id(+vm: M.VM, +method_id: U32, +text: String) -> Result<&2, &2, String, G.TypeRef>:
+  do Result<&2, &2, String, G.TypeRef>:
+    +method : M.LoadedMethod <- S.require(M.LoadedMethod, M.nth(M.LoadedMethod, S.methods(vm), method_id), "InvalidState: method id")
+    result : G.TypeRef <- method_generic_return(vm, method, text)
+    return result
+
+@unsafe def field_generic(+vm: M.VM, +owner: U32, +text: String) -> Result<&2, &2, String, G.TypeRef>:
+  do Result<&2, &2, String, G.TypeRef>:
+    +ready : M.VM <- ensure_arrays(vm, G.method_arrays("()" ++ text))
+    result : G.TypeRef <- G.field_ref(ready, text, class_scopes(64n, ready, owner))
+    return result
+
+@unsafe def field_generic_id(+vm: M.VM, +field_id: U32, +text: String) -> Result<&2, &2, String, G.TypeRef>:
+  do Result<&2, &2, String, G.TypeRef>:
+    +field : M.LoadedField <- S.require(M.LoadedField, M.nth(M.LoadedField, S.fields(vm), field_id), "InvalidState: field id")
+    result : G.TypeRef <- field_generic(vm, M.loaded_field_owner(field), text)
+    return result
+
+@unsafe def class_generic_super(+vm: M.VM, +target: U32, +text: String) -> Result<&2, &2, String, G.TypeRef>:
+  do Result<&2, &2, String, G.TypeRef>:
+    +ready : M.VM <- ensure_arrays(vm, G.class_arrays(text))
+    result : G.TypeRef <- G.superclass_ref(ready, text, class_scopes(64n, ready, target))
+    return result
+
+@unsafe def class_generic_interfaces(+vm: M.VM, +target: U32, +text: String) -> Result<&2, &2, String, G.TypeRefs>:
+  do Result<&2, &2, String, G.TypeRefs>:
+    +ready : M.VM <- ensure_arrays(vm, G.class_arrays(text))
+    result : G.TypeRefs <- G.interface_refs(ready, text, class_scopes(64n, ready, target))
+    return result
 def field_signature_found(found: Result<&2, &2, String, M.FieldMetadata>) -> String:
   match found:
     case Fail{error}: ""
@@ -2143,7 +2369,7 @@ def forget_pool(pool: +List<M.Constant>, signature: String) -> String:
 def class_signature_found(found: Result<&2, &2, String, M.ClassMetadata>) -> String:
   match found:
     case Fail{error}: ""
-    case Done{M.ClassMetadata{owner, flags, metadata, visibleAnnotations, pool, signature}}: forget_pool(pool, signature)
+    case Done{M.ClassMetadata{owner, flags, metadata, visibleAnnotations, pool, signature, nesting, source}}: forget_pool(pool, signature)
 
 def class_signature(+vm: M.VM, +target: U32) -> String:
   class_signature_found(class_metadata_value(vm, target))
@@ -2210,13 +2436,18 @@ def annotation_element_invoke(+vm: M.VM, +args: +List<M.Slot>, +owner: U32, +nam
     result : O.Outcome <- AR.outcome(value)
     return result
 
-def annotation_invoke_name(+vm: M.VM, +args: +List<M.Slot>, +name: String, +descriptor: String, +element: U32, +fields: +List<M.Binding>) -> Result<&2, &2, String, O.Outcome>:
+def annotation_receiver(args: +List<M.Slot>) -> M.Slot:
+  match args:
+    case Con{slot, rest}: slot
+    case Nil{}: M.Slot{3, 0}
+
+@unsafe def annotation_invoke_name(+vm: M.VM, +args: +List<M.Slot>, +name: String, +descriptor: String, +element: U32, +fields: +List<M.Binding>) -> Result<&2, &2, String, O.Outcome>:
   match name:
     case "annotationType": class_mirror_out(vm, element)
     case "equals": annotation_equals(vm, args)
     case "hashCode": annotation_hash(vm, args)
 
-    case "toString": intern_or_alloc(vm, units_from_string("@" ++ class_name_text(vm, element)))
+    case "toString": annotation_to_string(vm, bits_of(annotation_receiver(args)))
     case _: annotation_element_invoke(vm, args, element, name, descriptor, fields)
 
 def annotation_invoke_entry(+vm: M.VM, +args: +List<M.Slot>, +name: String, +descriptor: String, entry: M.HeapEntry) -> Result<&2, &2, String, O.Outcome>:
@@ -2398,7 +2629,7 @@ def annotation_default_optional_from_maybe(+vm: M.VM, +pool: +List<M.Constant>, 
 
 def annotation_default_optional_method(+vm: M.VM, +pool: +List<M.Constant>, method_metadata: M.MethodMetadata, +descriptor: String) -> Result<&2, &2, String, Maybe<&2, AnnotationValueRef>>:
   match method_metadata:
-    case M.MethodMetadata{owner, method, metadata, signature}: annotation_default_optional_from_maybe(vm, pool, metadata_default(metadata), descriptor)
+    case M.MethodMetadata{owner, method, metadata, signature, parameters, lines}: annotation_default_optional_from_maybe(vm, pool, metadata_default(metadata), descriptor)
 
 def annotation_default_optional_source(source: AnnotationMetadataRef, +method_id: U32, +descriptor: String) -> Result<&2, &2, String, Maybe<&2, AnnotationValueRef>>:
   match source:
@@ -2418,8 +2649,16 @@ def boolean_singleton_out(+vm: M.VM, value: M.Slot) -> Result<&2, &2, String, O.
 def annotation_default_box_alloc(+vm: M.VM, +name: String, value: M.Slot) -> Result<&2, &2, String, O.Outcome>:
   alloc_result(H.allocate(vm, H.object_entry(class_id(vm, name), [M.Binding{0, value}])), vm2 => reference => ref_out(vm2, reference))
 
+def annotation_default_wide_box(+vm: M.VM, +name: String, +descriptor: String, value: M.Slot) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    field : U32 <- wrapper_value_field_id(vm, name, descriptor)
+    result : O.Outcome <- alloc_result(H.allocate(vm, H.object_entry(class_id(vm, name), [M.Binding{field, value}])), vm2 => reference => ref_out(vm2, reference))
+    return result
+
 def annotation_default_reflect_slot(+vm: M.VM, name: String, +value: M.Slot) -> Result<&2, &2, String, O.Outcome>:
   match name:
+    case "long": annotation_default_wide_box(vm, "java/lang/Long", "J", value)
+    case "double": annotation_default_wide_box(vm, "java/lang/Double", "D", value)
     case "int": annotation_default_box_alloc(vm, "java/lang/Integer", value)
     case "boolean": boolean_singleton_out(vm, value)
     case "byte": annotation_default_box_alloc(vm, "java/lang/Byte", value)
@@ -2516,10 +2755,18 @@ def type_annotation_info_index(info: +List<U32>) -> U32:
     case Nil{}: 4294967295
     case Con{value, rest}: value
 
+# The index a target names: none for fields and returns, parameter and bound
+# index together (parameter * 256 + bound) for type parameter bounds, else the
+# first target_info value (parameter, type parameter or supertype index).
+def type_annotation_site_index(+target: U32, +info: +List<U32>) -> U32:
+  match info:
+    case Con{+first, Con{+second, rest}}: Bool.pick(U32, U32.is_eq(target, 17) || U32.is_eq(target, 18), U32.add(U32.mul(first, 256), second), first)
+    case _: type_annotation_info_index(info)
+
 def type_annotation_matches(value: M.TypeAnnotation, +target: U32, +index: U32, +expected: +List<U32>) -> Bool:
   match value:
     case M.TypeAnnotation{targetType, +targetInfo, +path, annotation}:
-      U32.is_eq(targetType, target) && Bool.or(U32.is_eq(target, 20), Bool.or(U32.is_eq(target, 19), U32.is_eq(type_annotation_info_index(targetInfo), index))) && path_equal(pack_path(path), expected)
+      U32.is_eq(targetType, target) && Bool.or(U32.is_eq(target, 20), Bool.or(U32.is_eq(target, 19), U32.is_eq(type_annotation_site_index(target, targetInfo), index))) && path_equal(pack_path(path), expected)
 
 def type_annotation_values(+values: +List<M.TypeAnnotation>, +target: U32, +index: U32, +expected: +List<U32>, +acc: +List<M.Annotation>) -> +List<M.Annotation>:
   match values:
@@ -2587,7 +2834,7 @@ def annotated_type_stored(+vm: M.VM, method_id: U32, target: U32, type_ref: U32,
 def annotated_type_from_ref(+vm: M.VM, method_id: U32, target: U32, +reference: U32) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
     +entry : M.HeapEntry <- H.get(S.heap(vm), reference)
-    result : O.Outcome <- annotated_type_stored(vm, method_id, target, reference, String.eq(class_name_text(vm, H.entry_class(entry)), "java/lang/reflect/ParameterizedType"))
+    result : O.Outcome <- annotated_type_stored(vm, method_id, target, reference, String.eq(class_name_text(vm, H.entry_class(entry)), "sun/reflect/generics/reflectiveObjects/ParameterizedTypeImpl"))
     return result
 
 def annotated_return_parsed(parsed: Result<&2, &2, String, G.TypeRef>, +vm: M.VM, method_id: U32) -> Result<&2, &2, String, O.Outcome>:
@@ -2595,10 +2842,10 @@ def annotated_return_parsed(parsed: Result<&2, &2, String, G.TypeRef>, +vm: M.VM
     case Fail{error}: reflect_annotated_type_one(vm, method_id, 20)
     case Done{G.TypeRef{next, reference}}: annotated_type_from_ref(next, method_id, 20, reference)
 
-def annotated_return_text(+vm: M.VM, method_id: U32, text: String, empty: Bool) -> Result<&2, &2, String, O.Outcome>:
+def annotated_return_text(+vm: M.VM, +method_id: U32, +text: String, empty: Bool) -> Result<&2, &2, String, O.Outcome>:
   match empty:
     case True{}: reflect_annotated_type_one(vm, method_id, 20)
-    case False{}: annotated_return_parsed(G.return_ref(vm, text), vm, method_id)
+    case False{}: annotated_return_parsed(method_generic_return_id(vm, method_id, text), vm, method_id)
 
 def reflect_method_get_annotated_return_type(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
@@ -2614,7 +2861,8 @@ def path_bits_slot(+vm: M.VM, slot: M.Slot) -> Result<&2, &2, String, +List<U32>
       do Result<&2, &2, String, +List<U32>>:
         +entry : M.HeapEntry <- H.get(S.heap(vm), reference)
         return slot_bits(entry_values(entry))
-
+    case M.Wide{tag, high, low}: Fail{"java/lang/IllegalArgumentException"}
+    case M.Unusable{}: Fail{"java/lang/IllegalArgumentException"}
 def path_bits_found(+vm: M.VM, found: Maybe<&2, M.Slot>) -> Result<&2, &2, String, +List<U32>>:
   match found:
     case None{}: Done{Nil{}}
@@ -2629,7 +2877,7 @@ def reflect_annotated_type_source_kind(+vm: M.VM, entry: M.HeapEntry, member: M.
         result : AnnotationMetadataRef <- method_type_annotation_source(vm, method, target, index, expected)
         return result
 
-def reflect_annotated_type_source(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, AnnotationMetadataRef>:
+@unsafe def reflect_annotated_type_source(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, AnnotationMetadataRef>:
   do Result<&2, &2, String, AnnotationMetadataRef>:
     receiver : M.Slot <- slot0(args)
     +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
@@ -2638,7 +2886,7 @@ def reflect_annotated_type_source(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2,
     index_slot : M.Slot <- reflect_annotation_binding(entry, 2)
     +expected : +List<U32> <- path_bits_found(vm, H.binding_find(entry_fields(entry), 3))
     +target : U32 = bits_of(target_slot)
-    result : AnnotationMetadataRef <- reflect_annotated_type_source_kind(vm, entry, member, target, bits_of(index_slot), expected, U32.is_eq(target, 19))
+    result : AnnotationMetadataRef <- annotated_source(vm, bits_of(member), target, bits_of(index_slot), expected)
     return result
 
 def reflect_annotated_type_is_annotation_present(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
@@ -2694,7 +2942,7 @@ def annotated_type_value(parsed: M.Descriptor, target: U32, index: U32) -> Resul
 def binding_bits(found: Maybe<&2, M.Slot>) -> U32:
   match found:
     case None{}: 0
-    case Some{M.Slot{tag, bits}}: bits
+    case Some{slot}: M.slot_bits(slot)
 
 def reflect_annotated_field_erased(+vm: M.VM, +field_id: U32) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
@@ -2755,7 +3003,7 @@ def child_annotated(+vm: M.VM, method_id: U32, target: U32, index: U32, type_ref
 def child_from_type(+vm: M.VM, method_id: U32, target: U32, index: U32, +type_ref: U32, path_ref: U32) -> Result<&2, &2, String, G.TypeRef>:
   do Result<&2, &2, String, G.TypeRef>:
     +entry : M.HeapEntry <- H.get(S.heap(vm), type_ref)
-    result : G.TypeRef <- child_annotated(vm, method_id, target, index, type_ref, path_ref, String.eq(class_name_text(vm, H.entry_class(entry)), "java/lang/reflect/ParameterizedType"))
+    result : G.TypeRef <- child_annotated(vm, method_id, target, index, type_ref, path_ref, String.eq(class_name_text(vm, H.entry_class(entry)), "sun/reflect/generics/reflectiveObjects/ParameterizedTypeImpl"))
     return result
 
 def child_from_path(parsed: Result<&2, &2, String, G.TypeRef>, +vm: M.VM, method_id: U32, target: U32, index: U32, type_ref: U32) -> Result<&2, &2, String, G.TypeRef>:
@@ -2803,7 +3051,7 @@ def actuals_of_stored(+vm: M.VM, method_id: U32, target: U32, +type_ref: U32, mi
     case False{}:
       do Result<&2, &2, String, O.Outcome>:
         +entry : M.HeapEntry <- H.get(S.heap(vm), type_ref)
-        result : O.Outcome <- actuals_if_parameterized(vm, method_id, target, type_ref, String.eq(class_name_text(vm, H.entry_class(entry)), "java/lang/reflect/ParameterizedType"))
+        result : O.Outcome <- actuals_if_parameterized(vm, method_id, target, type_ref, String.eq(class_name_text(vm, H.entry_class(entry)), "sun/reflect/generics/reflectiveObjects/ParameterizedTypeImpl"))
         return result
 
 def reflect_annotated_type_get_actuals(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
@@ -2896,7 +3144,7 @@ def generic_exceptions_parsed(parsed: Result<&2, &2, String, G.TypeRefs>, +vm: M
 
 def generic_exceptions_text(+vm: M.VM, +method: M.LoadedMethod, text: String, empty: Bool) -> Result<&2, &2, String, O.Outcome>:
   match empty:
-    case False{}: generic_exceptions_parsed(G.thrown_refs(vm, text), vm, method)
+    case False{}: generic_exceptions_parsed(method_generic_thrown(vm, method, text), vm, method)
     case True{}:
       do Result<&2, &2, String, O.Outcome>:
         source : AnnotationMetadataRef <- method_annotation_source(vm, method)
@@ -3120,8 +3368,7 @@ def reflect_parameter_name_checked(+vm: M.VM, tag: U32, reference: U32) -> Resul
     return class_name_text(vm, entry_element(entry))
 
 def reflect_parameter_name(+vm: M.VM, +value: M.Slot) -> Result<&2, &2, String, String>:
-  M.Slot{+tag, +reference} = value
-  reflect_parameter_name_checked(vm, tag, reference)
+  reflect_parameter_name_checked(vm, M.slot_tag(value), M.slot_bits(value))
 
 def reflect_parameter_names(+vm: M.VM, +values: +List<M.Slot>, +acc: +List<String>) -> Result<&2, &2, String, +List<String>>:
   match values:
@@ -3315,24 +3562,59 @@ def class_public_constructor(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, 
     result : O.Outcome <- reflect_constructor_one(vm, target, method)
     return result
 
-def class_display_name(name: String) -> String:
+# U+E000 k (or U+E000 -k) marks a class defined (or unresolvable) in loader
+# namespace k (see java/loaders.bend) and is not part of its name.
+@unsafe def class_display_name(name: String) -> String:
   match name:
     case SNil{}: ""
     case SCon{Chr{47}, rest}: SCon{Chr{46}, class_display_name(rest)}
+    case SCon{Chr{57344}, rest}: class_display_name(skip_namespace(rest))
     case SCon{head, rest}: SCon{head, class_display_name(rest)}
+
+def skip_namespace(text: String) -> String:
+  match text:
+    case SNil{}: ""
+    case SCon{Chr{59}, rest}: text
+    case SCon{head, rest}: skip_namespace(rest)
 
 def class_name(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
     target : U32 <- class_target(vm, args)
     result : O.Outcome <- intern_or_alloc(vm, units_from_string(class_display_name(class_name_text(vm, target))))
     return result
+def array_element_type_name(descriptor: String) -> String:
+  match descriptor:
+    case SCon{Chr{91}, rest}: array_element_type_name(rest) ++ "[]"
+    case SCon{Chr{76}, rest}: internal_to_binary(CL.take_until_semicolon(rest, ""))
+    case "Z": "boolean"
+    case "B": "byte"
+    case "C": "char"
+    case "S": "short"
+    case "I": "int"
+    case "J": "long"
+    case "F": "float"
+    case "D": "double"
+    case other: other
+
+# Class.getTypeName: arrays print as the element name followed by [] per dimension.
+def class_type_name(+name: String) -> String:
+  match name:
+    case SCon{Chr{91}, rest}: array_element_type_name(rest) ++ "[]"
+    case _: class_display_name(name)
+
+def class_type_name_out(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    target : U32 <- class_target(vm, args)
+    result : O.Outcome <- intern_or_alloc(vm, units_from_string(class_type_name(class_name_text(vm, target))))
+    return result
+
 def type_name_named(+vm: M.VM, entry: M.HeapEntry, +name: String, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   match name:
-    case "java/lang/reflect/ParameterizedType": ref_out(vm, binding_bits(H.binding_find(entry_fields(entry), 3)))
-    case "java/lang/reflect/TypeVariable": ref_out(vm, binding_bits(H.binding_find(entry_fields(entry), 0)))
-    case "java/lang/reflect/WildcardType": ref_out(vm, binding_bits(H.binding_find(entry_fields(entry), 2)))
-    case "java/lang/reflect/GenericArrayType": ref_out(vm, binding_bits(H.binding_find(entry_fields(entry), 1)))
-    case _: class_name(vm, args)
+    case "sun/reflect/generics/reflectiveObjects/ParameterizedTypeImpl": ref_out(vm, binding_bits(H.binding_find(entry_fields(entry), 3)))
+    case "sun/reflect/generics/reflectiveObjects/TypeVariableImpl": ref_out(vm, binding_bits(H.binding_find(entry_fields(entry), 0)))
+    case "sun/reflect/generics/reflectiveObjects/WildcardTypeImpl": ref_out(vm, binding_bits(H.binding_find(entry_fields(entry), 2)))
+    case "sun/reflect/generics/reflectiveObjects/GenericArrayTypeImpl": ref_out(vm, binding_bits(H.binding_find(entry_fields(entry), 1)))
+    case _: class_type_name_out(vm, args)
 
 def type_get_type_name(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
@@ -3500,7 +3782,7 @@ def reflect_method_member(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, Str
 def accessible_override_found(found: Maybe<&2, M.Slot>) -> Bool:
   match found:
     case None{}: False{}
-    case Some{M.Slot{tag, bits}}: U32.is_ne(bits, 0)
+    case Some{slot}: U32.is_ne(M.slot_bits(slot), 0)
 
 def accessible_override(entry: M.HeapEntry) -> Bool:
   accessible_override_found(H.binding_find(entry_fields(entry), 2))
@@ -3522,49 +3804,105 @@ def caller_owner(+vm: M.VM) -> U32:
   +found : Maybe<&2, M.Frame> = M.nth(M.Frame, S.frames(vm), 0)
   caller_owner_found_frame(vm, found)
 
-def same_package(+vm: M.VM, left: U32, right: U32) -> Bool:
-  String.eq(resource_package(class_name_text(vm, left)), resource_package(class_name_text(vm, right)))
+# A runtime package is a package name together with a defining loader (JVMS 5.3).
+@unsafe def same_package(+vm: M.VM, +left: U32, +right: U32) -> Bool:
+  String.eq(resource_package(class_name_text(vm, left)), resource_package(class_name_text(vm, right))) &&
+    U32.is_eq(defining_loader_id(LS.defining_loader_of(vm, left)), defining_loader_id(LS.defining_loader_of(vm, right)))
+
+@unsafe def defining_loader_id(found: Maybe<&2, U32>) -> U32:
+  match found:
+    case None{}: 0
+    case Some{loader}: loader
 
 def class_public(+vm: M.VM, target: U32) -> Bool:
   U32.is_ne(U32.and(class_flags(vm, target), 1), 0)
+
+# JVMS 5.4.4 member access for linkage. Class accessibility is checked when the
+# symbolic class reference resolves, so an inherited public member is reachable
+# through an accessible subclass even when its declaring class is not.
 def member_accessible(+vm: M.VM, +caller: U32, +owner: U32, +flags: U32) -> Bool:
   +public : Bool = U32.is_ne(U32.and(flags, 1), 0)
   +private : Bool = U32.is_ne(U32.and(flags, 2), 0)
   +protected : Bool = U32.is_ne(U32.and(flags, 4), 0)
   +package : Bool = same_package(vm, caller, owner)
-  +class_ok : Bool = class_public(vm, owner) || package
-  Bool.and(class_ok,
+  U32.is_eq(caller, owner) ||
     Bool.pick(Bool, public, True{},
-      Bool.pick(Bool, private, U32.is_eq(caller, owner),
-        Bool.pick(Bool, protected, package || H.hierarchy(S.classes(vm), caller, owner), package))))
-def protected_receiver_entry(+vm: M.VM, +target: U32, +caller: U32, result: Result<&2, &2, String, M.HeapEntry>) -> Bool:
-  match result:
-    case Fail{error}: False{}
-    case Done{entry}: H.assignable(S.classes(vm), S.symbols(vm), H.entry_class(entry), caller)
+      Bool.pick(Bool, private, False{},
+        Bool.pick(Bool, protected, package || H.hierarchy(S.classes(vm), caller, owner), package)))
 
-def protected_receiver_target(+vm: M.VM, +target: U32, +caller: U32) -> Bool:
-  match target:
-    case 0: False{}
-    case reference: protected_receiver_entry(vm, target, caller, H.get(S.heap(vm), reference))
+# jdk.internal.reflect.Reflection.verifyMemberAccess: the member's class must be
+# public or in the caller's package; private members are reachable only from
+# their own class (Java 8 class files have no nestmates); a protected instance
+# member or constructor reached from a subclass in another package also needs a
+# target that is the caller's class or a subclass of it. `target` 0 means none.
+def protected_target_ok(+vm: M.VM, +current: U32, +target: U32, +package: Bool) -> Bool:
+  U32.is_eq(target, 0) || U32.is_eq(target, current) || package || H.hierarchy(S.classes(vm), target, current)
 
-def protected_receiver_required(+vm: M.VM, +owner: U32, +flags: U32, +caller: U32) -> Bool:
-  U32.is_ne(U32.and(flags, 4), 0) && U32.is_eq(U32.and(flags, 8), 0) &&
-  Bool.not(same_package(vm, caller, owner)) &&
-  H.hierarchy(S.classes(vm), caller, owner)
+def verify_member_access(+vm: M.VM, +current: U32, +member: U32, +target: U32, +flags: U32) -> Bool:
+  +public : Bool = U32.is_ne(U32.and(flags, 1), 0)
+  +private : Bool = U32.is_ne(U32.and(flags, 2), 0)
+  +protected : Bool = U32.is_ne(U32.and(flags, 4), 0)
+  +package : Bool = same_package(vm, current, member)
+  +class_ok : Bool = class_public(vm, member) || package
+  +granted : Bool = Bool.pick(Bool, private, False{},
+    Bool.pick(Bool, protected, (package || H.hierarchy(S.classes(vm), current, member)) && protected_target_ok(vm, current, target, package), package))
+  U32.is_eq(current, member) || U32.is_eq(current, 4294967295) || (class_ok && (public || granted))
 
-def protected_receiver_accessible(+vm: M.VM, +owner: U32, +flags: U32, +target: U32) -> Bool:
-  +caller : U32 = caller_owner(vm)
-  Bool.pick(Bool, protected_receiver_required(vm, owner, flags, caller), protected_receiver_target(vm, target, caller), True{})
+# Class.toString: "class X", "interface X", or the bare name of a primitive.
+@unsafe def class_to_string_text(+vm: M.VM, +target: U32) -> String:
+  +name : String = class_name_text(vm, target)
+  +display : String = class_display_name(name)
+  Bool.pick(String, primitive_name(name), display,
+    Bool.pick(String, U32.is_ne(U32.and(class_flags(vm, target), 512), 0), "interface " ++ display, "class " ++ display))
 
-def access_with_receiver(override: Bool, +vm: M.VM, +owner: U32, +flags: U32, target: U32) -> Bool:
+@unsafe def class_to_string(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    target : U32 <- class_target(vm, args)
+    result : O.Outcome <- intern_or_alloc(vm, units_from_string(class_to_string_text(vm, target)))
+    return result
+
+@unsafe def access_denied_message(+vm: M.VM, +current: U32, +member: U32, +flags: U32) -> String:
+  +package_access : Bool = U32.is_eq(U32.and(flags, 7), 0)
+  "java/lang/IllegalAccessException: " ++ class_to_string_text(vm, current) ++ " cannot access a member of " ++ class_to_string_text(vm, member) ++
+    Bool.pick(String, package_access, " with package access", " with modifiers \"" ++ modifier_text(flags) ++ "\"")
+
+@unsafe def access_verdict(allowed: Bool, +vm: M.VM, +current: U32, +member: U32, +flags: U32) -> Result<&2, &2, String, Unit>:
+  match allowed:
+    case True{}: Done{Unit{}}
+    case False{}: Fail{access_denied_message(vm, current, member, flags)}
+
+def access_target_class(+vm: M.VM, +static: Bool, +target: U32) -> Result<&2, &2, String, U32>:
+  match static:
+    case True{}: Done{0}
+    case False{}:
+      do Result<&2, &2, String, U32>:
+        checked : Unit <- S.check(U32.is_ne(target, 0), npe())
+        +entry : M.HeapEntry <- H.get(S.heap(vm), target)
+        return H.entry_class(entry)
+
+@unsafe def access_check_target(+vm: M.VM, +owner: U32, +flags: U32, +target_class: U32) -> Result<&2, &2, String, Unit>:
+  +current : U32 = caller_owner(vm)
+  access_verdict(verify_member_access(vm, current, owner, target_class, flags), vm, current, owner, flags)
+
+@unsafe def access_check_member(override: Bool, +vm: M.VM, +owner: U32, +flags: U32, +target: U32) -> Result<&2, &2, String, Unit>:
   match override:
-    case True{}: True{}
-    case False{}: Bool.and(member_accessible(vm, caller_owner(vm), owner, flags), protected_receiver_accessible(vm, owner, flags, target))
+    case True{}: Done{Unit{}}
+    case False{}:
+      do Result<&2, &2, String, Unit>:
+        target_class : U32 <- access_target_class(vm, U32.is_ne(U32.and(flags, 8), 0), target)
+        checked : Unit <- access_check_target(vm, owner, flags, target_class)
+        return Unit{}
 
-def reflective_access(+vm: M.VM, +entry: M.HeapEntry, owner: U32, flags: U32) -> Bool:
-  Bool.or(accessible_override(entry), member_accessible(vm, caller_owner(vm), owner, flags))
-def reflective_method_access(+vm: M.VM, +entry: M.HeapEntry, +owner: U32, +flags: U32, target: U32) -> Bool:
-  access_with_receiver(accessible_override(entry), vm, owner, flags, target)
+# Field.get/set and Method.invoke: the target class is the receiver's class for
+# instance members and none for static ones (JDK AccessibleObject.checkAccess).
+@unsafe def reflect_access_check(+vm: M.VM, +entry: M.HeapEntry, +owner: U32, +flags: U32, +target: U32) -> Result<&2, &2, String, Unit>:
+  access_check_member(accessible_override(entry), vm, owner, flags, target)
+
+# Constructor.newInstance and Class.newInstance check with the declaring class as target.
+@unsafe def reflect_constructor_access(+vm: M.VM, override: Bool, +owner: U32, +flags: U32) -> Result<&2, &2, String, Unit>:
+  match override:
+    case True{}: Done{Unit{}}
+    case False{}: access_check_target(vm, owner, flags, owner)
 
 
 
@@ -3636,17 +3974,17 @@ def field_generic_parsed(parsed: Result<&2, &2, String, G.TypeRef>, +vm: M.VM, +
     case Fail{error}: descriptor_mirror(vm, descriptor)
     case Done{G.TypeRef{next, reference}}: ref_out(next, reference)
 
-def field_generic_text(+vm: M.VM, +descriptor: String, text: String, empty: Bool) -> Result<&2, &2, String, O.Outcome>:
+def field_generic_text(+vm: M.VM, +owner: U32, +descriptor: String, +text: String, empty: Bool) -> Result<&2, &2, String, O.Outcome>:
   match empty:
     case True{}: descriptor_mirror(vm, descriptor)
-    case False{}: field_generic_parsed(G.field_ref(vm, text), vm, descriptor)
+    case False{}: field_generic_parsed(field_generic(vm, owner, text), vm, descriptor)
 
 def reflect_field_generic_type(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
     +field : M.LoadedField <- reflect_field_member(vm, args)
     +descriptor : String = Sy.text(S.symbols(vm), M.loaded_field_descriptor(field))
     +text : String = field_signature(vm, field)
-    result : O.Outcome <- field_generic_text(vm, descriptor, text, String.is_empty(text))
+    result : O.Outcome <- field_generic_text(vm, M.loaded_field_owner(field), descriptor, text, String.is_empty(text))
     return result
 
 def field_annotated_plain(+vm: M.VM, field_id: U32) -> Result<&2, &2, String, O.Outcome>:
@@ -3657,10 +3995,10 @@ def field_annotated_parsed(parsed: Result<&2, &2, String, G.TypeRef>, +vm: M.VM,
     case Fail{error}: field_annotated_plain(vm, field_id)
     case Done{G.TypeRef{next, reference}}: annotated_type_from_ref(next, field_id, 19, reference)
 
-def field_annotated_text(+vm: M.VM, field_id: U32, text: String, empty: Bool) -> Result<&2, &2, String, O.Outcome>:
+def field_annotated_text(+vm: M.VM, +field_id: U32, +text: String, empty: Bool) -> Result<&2, &2, String, O.Outcome>:
   match empty:
     case True{}: field_annotated_plain(vm, field_id)
-    case False{}: field_annotated_parsed(G.field_ref(vm, text), vm, field_id)
+    case False{}: field_annotated_parsed(field_generic_id(vm, field_id, text), vm, field_id)
 
 def reflect_field_annotated_type(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
@@ -3674,17 +4012,17 @@ def class_generic_parsed(parsed: Result<&2, &2, String, G.TypeRef>, +vm: M.VM, +
     case Fail{error}: class_superclass_parent(vm, parent)
     case Done{G.TypeRef{next, reference}}: ref_out(next, reference)
 
-def class_generic_text(+vm: M.VM, +parent: U32, text: String, empty: Bool) -> Result<&2, &2, String, O.Outcome>:
+def class_generic_text(+vm: M.VM, +target: U32, +parent: U32, +text: String, empty: Bool) -> Result<&2, &2, String, O.Outcome>:
   match empty:
     case True{}: class_superclass_parent(vm, parent)
-    case False{}: class_generic_parsed(G.superclass_ref(vm, text), vm, parent)
+    case False{}: class_generic_parsed(class_generic_super(vm, target, text), vm, parent)
 
 def class_generic_superclass_parent(+vm: M.VM, +target: U32, +parent: U32, missing: Bool) -> Result<&2, &2, String, O.Outcome>:
   match missing:
     case True{}: ref_out(vm, 0)
     case False{}:
       +text : String = class_signature(vm, target)
-      class_generic_text(vm, parent, text, String.is_empty(text))
+      class_generic_text(vm, target, parent, text, String.is_empty(text))
 
 def class_generic_superclass(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
@@ -3699,13 +4037,12 @@ def reflect_static_field_value(+vm: M.VM, field: M.LoadedField) -> Result<&2, &2
     result : O.Outcome <- returned(vm, Some{value})
     return result
 
-def reflect_instance_field_value(+vm: M.VM, field: M.LoadedField, target: U32) -> Result<&2, &2, String, O.Outcome>:
+@unsafe def reflect_instance_field_value(+vm: M.VM, field: M.LoadedField, target: U32) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
     +field_ref : M.LoadedField = field
     +target_ref : U32 = target
-    checked : Unit <- S.check(U32.is_ne(target_ref, 0), npe())
+    belongs : Unit <- field_receiver_check(vm, field_ref, target_ref)
     +entry : M.HeapEntry <- H.get(S.heap(vm), target_ref)
-    belongs : Unit <- S.check(H.assignable(S.classes(vm), S.symbols(vm), H.entry_class(entry), M.loaded_field_owner(field_ref)), "java/lang/IllegalArgumentException")
     value : M.Slot <- S.require(M.Slot, H.binding_find(entry_fields(entry), M.loaded_field_id(field_ref)), "java/lang/NoSuchFieldException")
     result : O.Outcome <- returned(vm, Some{value})
     return result
@@ -3720,22 +4057,33 @@ def reflect_field_get_raw(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, Str
     +handle : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
     +field : M.LoadedField <- reflect_field_member(vm, args)
     +target : M.Slot <- slot1(args)
-    checked : Unit <- S.check(reflective_method_access(vm, handle, M.loaded_field_owner(field), M.loaded_field_flags(field), bits_of(target)), "java/lang/IllegalAccessException")
+    checked : Unit <- reflect_access_check(vm, handle, M.loaded_field_owner(field), M.loaded_field_flags(field), bits_of(target))
     result : O.Outcome <- reflect_field_value(vm, field, bits_of(target))
     return result
 
 def reflect_box_alloc(+vm: M.VM, +name: String, value: M.Slot) -> Result<&2, &2, String, O.Outcome>:
   alloc_result(H.allocate(vm, H.object_entry(class_id(vm, name), [M.Binding{0, value}])), vm2 => reference => ref_out(vm2, reference))
 
+def reflect_box_wide(+vm: M.VM, +name: String, +descriptor: String, +value: M.Slot) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +tag : U32 = Bool.pick(U32, String.eq(descriptor, "J"), 4, 5)
+    checked : Unit <- S.check(U32.is_eq(M.slot_tag(value), tag), "java/lang/IllegalArgumentException")
+    field : U32 <- wrapper_value_field_id(vm, name, descriptor)
+    result : O.Outcome <- alloc_result(H.allocate(vm, H.object_entry(class_id(vm, name), [M.Binding{field, value}])), vm2 => reference => ref_out(vm2, reference))
+    return result
+
+# The single primitive boxer (reflection, method handles, lambdas); non-primitive names pass through.
 def reflect_box_value(+vm: M.VM, name: String, +value: M.Slot) -> Result<&2, &2, String, O.Outcome>:
-  +name_ref : String = name
-  +value_ref : M.Slot = value
-  Bool.pick(Result<&2, &2, String, O.Outcome>, String.eq(name_ref, "boolean"), reflect_box_alloc(vm, "java/lang/Boolean", value_ref),
-    Bool.pick(Result<&2, &2, String, O.Outcome>, String.eq(name_ref, "float"), reflect_box_alloc(vm, "java/lang/Float", value_ref),
-      Bool.pick(Result<&2, &2, String, O.Outcome>, String.eq(name_ref, "char"), reflect_box_alloc(vm, "java/lang/Character", value_ref),
-        Bool.pick(Result<&2, &2, String, O.Outcome>, String.eq(name_ref, "byte"), reflect_box_alloc(vm, "java/lang/Byte", value_ref),
-          Bool.pick(Result<&2, &2, String, O.Outcome>, String.eq(name_ref, "short"), reflect_box_alloc(vm, "java/lang/Short", value_ref),
-            Bool.pick(Result<&2, &2, String, O.Outcome>, String.eq(name_ref, "int") || String.eq(name_ref, "long"), reflect_box_alloc(vm, "java/lang/Integer", value_ref), returned(vm, Some{value_ref})))))))
+  match name:
+    case "boolean": reflect_box_alloc(vm, "java/lang/Boolean", value)
+    case "float": reflect_box_alloc(vm, "java/lang/Float", value)
+    case "char": reflect_box_alloc(vm, "java/lang/Character", value)
+    case "byte": reflect_box_alloc(vm, "java/lang/Byte", value)
+    case "short": reflect_box_alloc(vm, "java/lang/Short", value)
+    case "int": reflect_box_alloc(vm, "java/lang/Integer", value)
+    case "long": reflect_box_wide(vm, "java/lang/Long", "J", value)
+    case "double": reflect_box_wide(vm, "java/lang/Double", "D", value)
+    case _: returned(vm, Some{value})
 def reflect_field_get_boxed(result: Result<&2, &2, String, O.Outcome>, name: String) -> Result<&2, &2, String, O.Outcome>:
   match result:
     case Done{O.Returned{vm, Some{value}}}: reflect_box_value(vm, name, value)
@@ -3747,12 +4095,12 @@ def reflect_field_get(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String,
     result : O.Outcome <- reflect_field_get_boxed(reflect_field_get_raw(vm, args), descriptor_class_name(Sy.text(S.symbols(vm), M.loaded_field_descriptor(field))))
     return result
 
-def reflect_field_get_int(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+@unsafe def reflect_field_get_int(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
-    field : M.LoadedField <- reflect_field_member(vm, args)
+    +field : M.LoadedField <- reflect_field_member(vm, args)
     +descriptor : String = Sy.text(S.symbols(vm), M.loaded_field_descriptor(field))
-    checked : Unit <- S.check(String.eq(descriptor, "B") || String.eq(descriptor, "S") || String.eq(descriptor, "C") || String.eq(descriptor, "I"), "java/lang/IllegalArgumentException")
-    result : O.Outcome <- reflect_field_get_raw(vm, args)
+    raw : O.Outcome <- reflect_field_get_raw(vm, args)
+    result : O.Outcome <- field_get_conversion(field_type_gate(String.eq(descriptor, "B") || String.eq(descriptor, "S") || String.eq(descriptor, "C") || String.eq(descriptor, "I"), raw), vm, field, 73)
     return result
 
 def reflect_static_field_set(+vm: M.VM, field: M.LoadedField, value: M.Slot) -> Result<&2, &2, String, O.Outcome>:
@@ -3782,15 +4130,55 @@ def reflect_field_set_allowed(entry: M.HeapEntry, field: M.LoadedField) -> Bool:
 
 def reflect_widen_allowed(+source: U32, +target: U32) -> Bool:
   U32.is_eq(source, target) ||
-    (U32.is_eq(source, 66) && (U32.is_eq(target, 83) || U32.is_eq(target, 73) || U32.is_eq(target, 70))) ||
-    ((U32.is_eq(source, 83) || U32.is_eq(source, 67)) && (U32.is_eq(target, 73) || U32.is_eq(target, 70))) ||
-    (U32.is_eq(source, 73) && U32.is_eq(target, 70))
+    (U32.is_eq(source, 66) && (U32.is_eq(target, 83) || U32.is_eq(target, 73) || U32.is_eq(target, 70) || U32.is_eq(target, 74) || U32.is_eq(target, 68))) ||
+    ((U32.is_eq(source, 83) || U32.is_eq(source, 67)) && (U32.is_eq(target, 73) || U32.is_eq(target, 70) || U32.is_eq(target, 74) || U32.is_eq(target, 68))) ||
+    (U32.is_eq(source, 73) && (U32.is_eq(target, 70) || U32.is_eq(target, 74) || U32.is_eq(target, 68))) ||
+    (U32.is_eq(source, 74) && (U32.is_eq(target, 70) || U32.is_eq(target, 68))) ||
+    (U32.is_eq(source, 70) && U32.is_eq(target, 68))
+
+def reflect_int_to_long_value(value: W.Words) -> Result<&2, &2, String, M.Slot>:
+  match value:
+    case W.Words{high, low}: Done{M.Wide{4, high, low}}
+
+
+def reflect_wide_slot(tag: U32, +words: W.Words) -> M.Slot:
+  match words:
+    case W.Words{high, low}: M.Wide{tag, high, low}
+
+def reflect_widen_value(target: U32, +value: M.Slot) -> Result<&2, &2, String, M.Slot>:
+  match target:
+    case 74:
+      match value:
+        case M.Wide{4, high, low}: Done{value}
+        case M.Slot{tag, bits}: reflect_int_to_long_value(W.int_to_long(bits))
+        case _: Fail{"java/lang/IllegalArgumentException"}
+    case 68:
+      match value:
+        case M.Wide{4, high, low}:
+          +converted : W.Words = B64.long_to_double(W.Words{high, low})
+          Done{reflect_wide_slot(5, converted)}
+        case M.Wide{5, high, low}: Done{value}
+        case M.Slot{2, bits}:
+          +converted : W.Words = B64.f32_bits_to_double(bits)
+          Done{reflect_wide_slot(5, converted)}
+        case M.Slot{tag, bits}:
+          +converted : W.Words = B64.int_to_double(bits)
+          Done{reflect_wide_slot(5, converted)}
+        case _: Fail{"java/lang/IllegalArgumentException"}
+    case 70:
+      match value:
+        case M.Wide{4, high, low}: Done{M.Slot{2, B64.long_to_float(W.Words{high, low})}}
+        case M.Wide{5, high, low}: Done{M.Slot{2, B64.double_to_f32(W.Words{high, low})}}
+        case M.Slot{2, bits}: Done{value}
+        case M.Slot{tag, bits}: Done{M.Slot{2, V.int_float(bits)}}
+        case _: Fail{"java/lang/IllegalArgumentException"}
+    case _: Done{value}
 
 def reflect_widen(+source: U32, +target: U32, +value: M.Slot) -> Result<&2, &2, String, M.Slot>:
   do Result<&2, &2, String, M.Slot>:
     checked : Unit <- S.check(reflect_widen_allowed(source, target), "java/lang/IllegalArgumentException")
-    supported : Unit <- S.check(U32.is_ne(target, 74) && U32.is_ne(target, 68), "UnsupportedFeature: category-two reflective conversion")
-    return Bool.pick(M.Slot, U32.is_eq(target, 70) && U32.is_ne(source, 70), M.Slot{2, V.int_float(bits_of(value))}, value)
+    result : M.Slot <- reflect_widen_value(target, value)
+    return result
 def reflect_set_int_value(jvm_type: M.JvmType, value: M.Slot) -> Result<&2, &2, String, M.Slot>:
   match jvm_type:
     case M.Primitive{tag}: reflect_widen(73, tag, value)
@@ -3818,7 +4206,23 @@ def reflect_wrapper_tag(name: String) -> U32:
     case "java/lang/Long": 74
     case "java/lang/Double": 68
     case _: 0
+def wide_wrapper_field(+vm: M.VM, tag: U32) -> Result<&2, &2, String, U32>:
+  match tag:
+    case 74: wrapper_value_field_id(vm, "java/lang/Long", "J")
+    case 68: wrapper_value_field_id(vm, "java/lang/Double", "D")
+    case _: Done{0}
 
+
+def wrapper_value_slot(+vm: M.VM, entry: M.HeapEntry, tag: U32) -> Result<&2, &2, String, M.Slot>:
+  do Result<&2, &2, String, M.Slot>:
+    field : U32 <- wide_wrapper_field(vm, tag)
+    slot : M.Slot <- S.require(M.Slot, H.binding_find(entry_fields(entry), field), "java/lang/IllegalArgumentException")
+    return slot
+
+def wrapper_value_slot_tag(+tag: U32) -> U32:
+  Bool.pick(U32, U32.is_eq(tag, 70), 2,
+    Bool.pick(U32, U32.is_eq(tag, 74), 4,
+      Bool.pick(U32, U32.is_eq(tag, 68), 5, 1)))
 
 def reflect_convert_primitive(+vm: M.VM, +target: U32, +value: M.Slot) -> Result<&2, &2, String, M.Slot>:
   do Result<&2, &2, String, M.Slot>:
@@ -3826,7 +4230,7 @@ def reflect_convert_primitive(+vm: M.VM, +target: U32, +value: M.Slot) -> Result
     +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(value))
     +source : U32 = reflect_wrapper_tag(class_name_text(vm, H.entry_class(entry)))
     primitive : Unit <- S.check(U32.is_ne(source, 0), "java/lang/IllegalArgumentException")
-    +unboxed : M.Slot <- S.require(M.Slot, H.binding_find(entry_fields(entry), 0), "java/lang/IllegalArgumentException")
+    +unboxed : M.Slot <- wrapper_value_slot(vm, entry, source)
     result : M.Slot <- reflect_widen(source, target, unboxed)
     return result
 
@@ -3850,18 +4254,21 @@ def reflect_convert(+vm: M.VM, +jvm_type: M.JvmType, +value: M.Slot) -> Result<&
   match jvm_type:
     case M.Primitive{tag}: reflect_convert_primitive(vm, tag, value)
     case _: reflect_convert_reference(vm, type_descriptor_from_class_name(jvm_type_class_name(jvm_type)), value)
-def reflect_field_set_mode(+vm: M.VM, +args: +List<M.Slot>, boxed: Bool) -> Result<&2, &2, String, O.Outcome>:
+@unsafe def reflect_field_set_mode(+vm: M.VM, +args: +List<M.Slot>, +boxed: Bool) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
     receiver : M.Slot <- slot0(args)
     +handle : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
     +field : M.LoadedField <- reflect_field_member(vm, args)
     +target : M.Slot <- slot1(args)
-    checked : Unit <- S.check(reflective_method_access(vm, handle, M.loaded_field_owner(field), M.loaded_field_flags(field), bits_of(target)), "java/lang/IllegalAccessException")
-    final_checked : Unit <- S.check(reflect_field_set_allowed(handle, field), "java/lang/IllegalAccessException")
+    checked : Unit <- reflect_access_check(vm, handle, M.loaded_field_owner(field), M.loaded_field_flags(field), bits_of(target))
+    belongs : Unit <- field_receiver_check(vm, field, bits_of(target))
     +value : M.Slot <- slot2(args)
+    +attempted_type : String = Bool.pick(String, boxed, object_type_name(vm, bits_of(value)), "int")
+    +attempted_value : String = Bool.pick(String, boxed, "", V.int_show(bits_of(value)))
+    final_checked : Unit <- field_final_verdict(reflect_field_set_allowed(handle, field), vm, field, attempted_type, attempted_value)
     +descriptor : String = Sy.text(S.symbols(vm), M.loaded_field_descriptor(field))
     +parsed : M.JvmType <- D.parse_field(descriptor)
-    converted : M.Slot <- Bool.pick(Result<&2, &2, String, M.Slot>, boxed, reflect_convert(vm, parsed, value), reflect_set_int_value(parsed, value))
+    converted : M.Slot <- field_convert_message(Bool.pick(Result<&2, &2, String, M.Slot>, boxed, reflect_convert(vm, parsed, value), reflect_set_int_value(parsed, value)), vm, field, attempted_type, attempted_value)
     result : O.Outcome <- reflect_field_set_value(vm, field, bits_of(target), converted)
     return result
 def reflect_field_set(+vm: M.VM, args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
@@ -3869,6 +4276,68 @@ def reflect_field_set(+vm: M.VM, args: +List<M.Slot>) -> Result<&2, &2, String, 
 
 def reflect_field_set_int(+vm: M.VM, args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   reflect_field_set_mode(vm, args, False{})
+def reflect_field_get_typed_value(result: Result<&2, &2, String, O.Outcome>, source: U32, target: U32) -> Result<&2, &2, String, O.Outcome>:
+  match result:
+    case Fail{error}: Fail{error}
+    case Done{O.Returned{vm, Some{value}}}:
+      do Result<&2, &2, String, O.Outcome>:
+        +converted : M.Slot <- reflect_widen(source, target, value)
+        result : O.Outcome <- returned(vm, Some{converted})
+        return result
+    case _: Fail{"java/lang/IllegalArgumentException"}
+
+def reflect_primitive_tag(parsed: M.JvmType) -> Result<&2, &2, String, U32>:
+  match parsed:
+    case M.Primitive{tag}: Done{tag}
+    case _: Fail{"java/lang/IllegalArgumentException"}
+
+
+def reflect_field_get_typed_primitive(source: Result<&2, &2, String, U32>, raw: O.Outcome, target: U32) -> Result<&2, &2, String, O.Outcome>:
+  match source:
+    case Fail{error}: Fail{error}
+    case Done{tag}: reflect_field_get_typed_value(Done{raw}, tag, target)
+
+@unsafe def reflect_field_get_typed(+vm: M.VM, +args: +List<M.Slot>, +target: U32) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +field : M.LoadedField <- reflect_field_member(vm, args)
+    +descriptor : String = Sy.text(S.symbols(vm), M.loaded_field_descriptor(field))
+    +parsed : M.JvmType <- D.parse_field(descriptor)
+    raw : O.Outcome <- reflect_field_get_raw(vm, args)
+    result : O.Outcome <- field_get_conversion(reflect_field_get_typed_primitive(reflect_primitive_tag(parsed), raw, target), vm, field, target)
+    return result
+
+def reflect_widen_primitive(source: U32, parsed: M.JvmType, +value: M.Slot) -> Result<&2, &2, String, M.Slot>:
+  match parsed:
+    case M.Primitive{tag}: reflect_widen(source, tag, value)
+    case _: Fail{"java/lang/IllegalArgumentException"}
+
+
+
+@unsafe def reflect_field_set_typed(+vm: M.VM, +args: +List<M.Slot>, +source: U32) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    receiver : M.Slot <- slot0(args)
+    +handle : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
+    +field : M.LoadedField <- reflect_field_member(vm, args)
+    +target : M.Slot <- slot1(args)
+    checked : Unit <- reflect_access_check(vm, handle, M.loaded_field_owner(field), M.loaded_field_flags(field), bits_of(target))
+    belongs : Unit <- field_receiver_check(vm, field, bits_of(target))
+    +value : M.Slot <- slot2(args)
+    +attempted_value : String = wide_attempt_value(value, source)
+    final_checked : Unit <- field_final_verdict(reflect_field_set_allowed(handle, field), vm, field, source_type_name(source), attempted_value)
+    +descriptor : String = Sy.text(S.symbols(vm), M.loaded_field_descriptor(field))
+    +parsed : M.JvmType <- D.parse_field(descriptor)
+    +converted : M.Slot <- field_convert_message(reflect_widen_primitive(source, parsed, value), vm, field, source_type_name(source), attempted_value)
+    result : O.Outcome <- reflect_field_set_value(vm, field, bits_of(target), converted)
+    return result
+
+def reflect_field_get_long(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  reflect_field_get_typed(vm, args, 74)
+def reflect_field_get_double(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  reflect_field_get_typed(vm, args, 68)
+def reflect_field_set_long(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  reflect_field_set_typed(vm, args, 74)
+def reflect_field_set_double(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  reflect_field_set_typed(vm, args, 68)
 
 
 
@@ -3957,7 +4426,7 @@ def reflect_method_invoke(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, Str
     +handle : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
     +method : M.LoadedMethod <- reflect_method_member(vm, args)
     +target : M.Slot <- slot1(args)
-    checked : Unit <- S.check(reflective_method_access(vm, handle, M.loaded_method_owner(method), M.loaded_method_flags(method), bits_of(target)), "java/lang/IllegalAccessException")
+    checked : Unit <- reflect_access_check(vm, handle, M.loaded_method_owner(method), M.loaded_method_flags(method), bits_of(target))
     argument_array : M.Slot <- slot2(args)
     +values : +List<M.Slot> <- reflect_argument_values(vm, bits_of(argument_array))
     result : O.Outcome <- reflect_method_call(vm, method, target, values)
@@ -4005,17 +4474,17 @@ def generic_return_parsed(parsed: Result<&2, &2, String, G.TypeRef>, +vm: M.VM, 
     case Fail{error}: class_name_mirror(vm, method_return_name(descriptor))
     case Done{G.TypeRef{next, reference}}: ref_out(next, reference)
 
-def generic_return_text(+vm: M.VM, +descriptor: String, text: String, empty: Bool) -> Result<&2, &2, String, O.Outcome>:
+def generic_return_text(+vm: M.VM, +method: M.LoadedMethod, +descriptor: String, +text: String, empty: Bool) -> Result<&2, &2, String, O.Outcome>:
   match empty:
     case True{}: class_name_mirror(vm, method_return_name(descriptor))
-    case False{}: generic_return_parsed(G.return_ref(vm, text), vm, descriptor)
+    case False{}: generic_return_parsed(method_generic_return(vm, method, text), vm, descriptor)
 
 def reflect_method_generic_return(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
     +method : M.LoadedMethod <- reflect_method_member(vm, args)
     +descriptor : String = Sy.text(S.symbols(vm), M.loaded_method_descriptor(method))
     +text : String = method_signature(vm, method)
-    result : O.Outcome <- generic_return_text(vm, descriptor, text, String.is_empty(text))
+    result : O.Outcome <- generic_return_text(vm, method, descriptor, text, String.is_empty(text))
     return result
 
 def reflect_method_return_type(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
@@ -4038,7 +4507,7 @@ def reflect_member_parameter_types(+vm: M.VM, +method: M.LoadedMethod) -> Result
     return result
 def generic_parameters_text(+vm: M.VM, +method: M.LoadedMethod, text: String, empty: Bool) -> Result<&2, &2, String, O.Outcome>:
   match empty:
-    case False{}: generic_type_array(G.parameter_refs(vm, text))
+    case False{}: generic_type_array(method_generic_parameters(vm, method, text))
     case True{}:
       do Result<&2, &2, String, O.Outcome>:
         +descriptor : String = Sy.text(S.symbols(vm), M.loaded_method_descriptor(method))
@@ -4135,7 +4604,7 @@ def reflect_constructor_new_instance(+vm: M.VM, +args: +List<M.Slot>) -> Result<
     +handle : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
     +args_ref : +List<M.Slot> = args
     +method : M.LoadedMethod <- reflect_constructor_member(vm, args_ref)
-    checked : Unit <- S.check(reflective_access(vm, handle, M.loaded_method_owner(method), M.loaded_method_flags(method)), "java/lang/IllegalAccessException")
+    checked : Unit <- reflect_constructor_access(vm, accessible_override(handle), M.loaded_method_owner(method), M.loaded_method_flags(method))
     instantiable : Unit <- S.check(constructor_instantiable(vm, M.loaded_method_owner(method)), "java/lang/InstantiationException")
     argument_array : M.Slot <- slot1(args_ref)
     +values : +List<M.Slot> <- reflect_argument_values(vm, bits_of(argument_array))
@@ -4417,10 +4886,17 @@ def object_equals(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.O
     result : O.Outcome <- bool_out(vm, U32.is_eq(bits_of(left), bits_of(right)))
     return result
 
+def identity_hash_entry(found: Result<&2, &2, String, M.HeapEntry>, +reference: U32) -> U32:
+  match found:
+    case Done{+entry}: Bool.pick(U32, U32.is_eq(entry_kind(entry), 8), entry_element(entry), reference)
+    case Fail{error}: reference
+
+# Object.hashCode identity: the reference, except that a Class mirror hashes as
+# the class it mirrors so generic Type hashes need no mirror allocation.
 def object_hash(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
     +receiver : M.Slot <- slot0(args)
-    result : O.Outcome <- int_out(vm, bits_of(receiver))
+    result : O.Outcome <- int_out(vm, identity_hash_entry(H.get(S.heap(vm), bits_of(receiver)), bits_of(receiver)))
     return result
 
 def slash_to_dot(text: String) -> String:
@@ -4467,21 +4943,26 @@ def objects_equals(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.
 
 
 
-def execute_known(id: U32, vm: M.VM, args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
-  match id:
-    case 12: object_equals(vm, args)
-    case 13: object_hash(vm, args)
-    case 14: object_to_string(vm, args)
-    case _: Fail{"MissingMethod: unknown intrinsic"}
-
 def call_virtual(+vm: M.VM, method: Maybe<&2, M.LoadedMethod>, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   match method:
     case None{}: Fail{"java/lang/NoSuchMethodError"}
     case Some{+value}:
-      Bool.pick(Result<&2, &2, String, O.Outcome>, U32.is_ne(M.loaded_method_intrinsic(value), 0), execute_known(M.loaded_method_intrinsic(value), vm, args), Done{O.Call{vm, value, args}})
+      # The interpreter dispatches intrinsic and bytecode targets alike, so every
+      # MiniJRE override (for example StringBuilder.toString) is reachable here.
+      Done{O.Call{vm, value, args}}
 
+# Host continuations resume when the callback started at the current frame
+# depth returns; the depth marker keeps nested returns from consuming them.
 def push_cont(+vm: M.VM, item: M.Cont) -> M.VM:
-  S.with_cont(vm, Con{item, S.host_cont_of(S.host(vm))})
+  S.with_cont(vm, Con{M.HostCallback{M.length(M.Frame, S.frames(vm))}, Con{item, S.host_cont_of(S.host(vm))}})
+
+# An intrinsic that needs a class another thread is initializing parks; when
+# the initializer finishes, `cont` resumes like a returned <clinit> callback.
+def monitor_park(+vm: M.VM, +object: U32, cont: M.Cont) -> O.Outcome:
+  O.Suspend{S.with_status(S.with_effect(Th.park(push_cont(vm, cont), M.MonitorPark{object}, False{}, M.Clock{0, 0}), M.Park{}), 5), M.Park{}}
+
+def init_park(+vm: M.VM, +class: U32, cont: M.Cont) -> O.Outcome:
+  O.Suspend{S.with_status(S.with_effect(Th.park(push_cont(vm, cont), M.InitPark{class}, False{}, M.Clock{0, 0}), M.Park{}), 5), M.Park{}}
 
 def objects_equals_dispatch(+vm: M.VM, +a: U32, +b: U32) -> Result<&2, &2, String, O.Outcome>:
   call_virtual(push_cont(vm, M.NeedEquals{0, a, b}), virtual_on(vm, a, "equals", "(Ljava/lang/Object;)Z"), [M.Slot{3, a}, M.Slot{3, b}])
@@ -4576,6 +5057,47 @@ def string_concat(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.O
     a : +List<U32> <- string_chars(vm, bits_of(left))
     b : +List<U32> <- string_chars(vm, bits_of(right))
     result : O.Outcome <- intern_or_alloc(vm, concat_chars(a, b))
+    return result
+
+def chars_nonempty(values: +List<U32>) -> Bool:
+  match values:
+    case Nil{}: False{}
+    case _: True{}
+
+def starts_with_units(text: +List<U32>, prefix: +List<U32>) -> Bool:
+  match text prefix:
+    case _ Nil{}: True{}
+    case Con{+unit, rest} Con{+expected, more}: U32.is_eq(unit, expected) && starts_with_units(rest, more)
+    case Nil{} _: False{}
+
+def contains_units(text: +List<U32>, +needle: +List<U32>) -> Bool:
+  match text:
+    case Nil{}: Bool.not(chars_nonempty(needle))
+    case Con{+unit, +rest}: starts_with_units(Con{unit, rest}, needle) || contains_units(rest, needle)
+
+# CharSequence contents for the MiniJRE implementations (String and StringBuilder);
+# user-defined CharSequence classes would need a Java callback and are rejected.
+def char_sequence_entry(entry: M.HeapEntry) -> Result<&2, &2, String, +List<U32>>:
+  match entry:
+    case M.HeapEntry{class, +kind, element, fields, values, chars}:
+      do Result<&2, &2, String, +List<U32>>:
+        checked : Unit <- S.check(U32.is_eq(kind, 3) || U32.is_eq(kind, 7), "UnsupportedFeature: user-defined CharSequence")
+        return chars
+
+def char_sequence_chars(+vm: M.VM, +reference: U32) -> Result<&2, &2, String, +List<U32>>:
+  do Result<&2, &2, String, +List<U32>>:
+    checked : Unit <- S.check(U32.is_ne(reference, 0), npe())
+    +entry : M.HeapEntry <- H.get(S.heap(vm), reference)
+    chars : +List<U32> <- char_sequence_entry(entry)
+    return chars
+
+def string_contains(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +receiver : M.Slot <- slot0(args)
+    +needle : M.Slot <- slot1(args)
+    text : +List<U32> <- string_chars(vm, bits_of(receiver))
+    target : +List<U32> <- char_sequence_chars(vm, bits_of(needle))
+    result : O.Outcome <- bool_out(vm, contains_units(text, target))
     return result
 
 def string_to_string(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
@@ -4737,91 +5259,188 @@ def integer_int_value(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String,
     +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
     result : O.Outcome <- int_out(vm, H.integer_value(entry_fields(entry)))
     return result
-def wide_entry_valid(+entry: M.HeapEntry) -> Bool:
-  match entry:
-    case M.HeapEntry{class, kind, element, fields, values, chars}: U32.is_eq(kind, 9)
+def wide_value_from_binding(+vm: M.VM, +receiver: M.Slot, +tag: U32) -> Result<&2, &2, String, M.Slot>:
+  do Result<&2, &2, String, M.Slot>:
+    checked : Unit <- S.check(U32.is_ne(bits_of(receiver), 0), npe())
+    +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
+    +class_name : String = Bool.pick(String, U32.is_eq(tag, 4), "java/lang/Long", "java/lang/Double")
+    +descriptor : String = Bool.pick(String, U32.is_eq(tag, 4), "J", "D")
+    +field : U32 <- wrapper_value_field_id(vm, class_name, descriptor)
+    +value : M.Slot <- S.require(M.Slot, H.binding_find(entry_fields(entry), field), "java/lang/IllegalArgumentException")
+    checked_tag : Unit <- S.check(U32.is_eq(M.slot_tag(value), tag), "java/lang/IllegalArgumentException")
+    return value
 
-def wide_box(+vm: M.VM, +args: +List<M.Slot>, +class_name: String, tag: U32) -> Result<&2, &2, String, O.Outcome>:
+
+def long_cache_range(+value: W.Words) -> Bool:
+  Bool.not(W.signed_less(value, W.Words{4294967295, 4294967168})) &&
+    Bool.not(W.signed_less(W.Words{0, 127}, value))
+
+def wide_binding_matches(found: Maybe<&2, M.Slot>, high: U32, low: U32) -> Bool:
+  match found:
+    case Some{M.Wide{4, actual_high, actual_low}}:
+      U32.is_eq(actual_high, high) && U32.is_eq(actual_low, low)
+    case _: False{}
+
+@unsafe def long_intern_scan(entries: +List<M.HeapEntry>, +class: U32, +field: U32, +high: U32, +low: U32, +reference: U32) -> Maybe<&2, U32>:
+  match entries:
+    case Nil{}: None{}
+    case Con{entry, rest}:
+      match entry:
+        case M.HeapEntry{object_class, kind, element, fields, values, chars}:
+          selected : Bool = U32.is_eq(object_class, class) && U32.is_eq(kind, 0) &&
+            wide_binding_matches(H.binding_find(fields, field), high, low)
+          Bool.pick(Maybe<&2, U32>, selected, Some{reference}, long_intern_scan(rest, class, field, high, low, (reference + 1 : U32)))
+
+def long_intern(heap: +List<M.HeapEntry>, class: U32, field: U32, high: U32, low: U32) -> Maybe<&2, U32>:
+  long_intern_scan(heap, class, field, high, low, 1)
+
+def wide_box_allocate(+vm: M.VM, +class_name: String, +field: U32, +value: M.Slot) -> Result<&2, &2, String, O.Outcome>:
+  alloc_result(H.allocate(vm, H.object_entry(class_id(vm, class_name), [M.Binding{field, value}])), vm2 => reference => ref_out(vm2, reference))
+
+def wide_box_cached(vm: M.VM, class_name: String, field: U32, value: M.Slot, found: Maybe<&2, U32>) -> Result<&2, &2, String, O.Outcome>:
+  match found:
+    case Some{reference}: ref_out(vm, reference)
+    case None{}: wide_box_allocate(vm, class_name, field, value)
+def wide_box_long_range(+vm: M.VM, +class_name: String, +field: U32, +value: M.Slot, +high: U32, +low: U32, cached: Bool) -> Result<&2, &2, String, O.Outcome>:
+  match cached:
+    case True{}:
+      wide_box_cached(vm, class_name, field, value,
+        long_intern(S.heap(vm), class_id(vm, class_name), field, high, low))
+    case False{}:
+      wide_box_allocate(vm, class_name, field, value)
+def wide_box_with_field(+vm: M.VM, +class_name: String, field: U32, +value: M.Slot) -> Result<&2, &2, String, O.Outcome>:
+  match value:
+    case M.Wide{4, high, low}:
+      wide_box_long_range(vm, class_name, field, value, high, low, long_cache_range(W.Words{high, low}))
+    case _:
+      wide_box_allocate(vm, class_name, field, value)
+def wide_box(+vm: M.VM, +args: +List<M.Slot>, +class_name: String, +tag: U32) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
     +value : M.Slot <- slot0(args)
-    +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(value))
-    checked : Unit <- S.check(wide_entry_valid(entry), "java/lang/IllegalArgumentException")
-    result : O.Outcome <- alloc_result(H.allocate(vm, H.wide_object_entry(class_id(vm, class_name), tag, H.wide_high(entry), H.wide_low(entry))), vm2 => reference => ref_out(vm2, reference))
+    checked : Unit <- S.check(U32.is_eq(M.slot_tag(value), tag), "java/lang/IllegalArgumentException")
+    +descriptor : String = Bool.pick(String, U32.is_eq(tag, 4), "J", "D")
+    +field : U32 <- wrapper_value_field_id(vm, class_name, descriptor)
+    result : O.Outcome <- wide_box_with_field(vm, class_name, field, value)
     return result
-
-def wide_value_alloc(tag: U32, allocation: Result<&2, &2, String, H.Allocation>) -> Result<&2, &2, String, O.Outcome>:
-  match allocation:
-    case Fail{error}: Fail{error}
-    case Done{H.Allocation{updated, reference}}:
-      Done{O.Returned{updated, Some{M.Slot{tag, reference}}}}
 
 def wide_value(+vm: M.VM, +args: +List<M.Slot>, +tag: U32) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
     +receiver : M.Slot <- slot0(args)
-    +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
-    checked : Unit <- S.check(wide_entry_valid(entry), "java/lang/IllegalArgumentException")
-    result : O.Outcome <- wide_value_alloc(tag, H.allocate(vm, H.wide_entry(tag, H.wide_high(entry), H.wide_low(entry))))
+    value : M.Slot <- wide_value_from_binding(vm, receiver, tag)
+    result : O.Outcome <- returned(vm, Some{value})
     return result
 
+def wide_words(value: M.Slot, expected: U32) -> Result<&2, &2, String, W.Words>:
+  match value:
+    case M.Wide{tag, high, low}:
+      do Result<&2, &2, String, W.Words>:
+        checked : Unit <- S.check(U32.is_eq(tag, expected), "java/lang/IllegalArgumentException")
+        return W.Words{high, low}
+    case _: Fail{"java/lang/IllegalArgumentException"}
+
+
+def wide_text(tag: U32, words: W.Words) -> Result<&2, &2, String, String>:
+  match tag:
+    case 4: Done{W.long_show(words)}
+    case 5: B64.double_to_string(words)
+    case _: Fail{"java/lang/IllegalArgumentException"}
 def long_to_string(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
     +receiver : M.Slot <- slot0(args)
-    +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
-    text : String = W.long_show(W.Words{H.wide_high(entry), H.wide_low(entry)})
+    value : M.Slot <- wide_value_from_binding(vm, receiver, 4)
+    +words : W.Words <- wide_words(value, 4)
+    text : String = W.long_show(words)
     result : O.Outcome <- intern_or_alloc(vm, units_from_string(text))
     return result
 def double_to_string(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
     +receiver : M.Slot <- slot0(args)
-    +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
-    text : String = W.double_show(W.Words{H.wide_high(entry), H.wide_low(entry)})
+    value : M.Slot <- wide_value_from_binding(vm, receiver, 5)
+    +words : W.Words <- wide_words(value, 5)
+    text : String <- B64.double_to_string(words)
     result : O.Outcome <- intern_or_alloc(vm, units_from_string(text))
+    return result
+def string_value_of_wide(+vm: M.VM, +args: +List<M.Slot>, +tag: U32) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    value : M.Slot <- slot0(args)
+    +words : W.Words <- wide_words(value, tag)
+    text : String <- wide_text(tag, words)
+    result : O.Outcome <- intern_or_alloc(vm, units_from_string(text))
+    return result
+
+def builder_append_wide(+vm: M.VM, +args: +List<M.Slot>, +tag: U32) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +receiver : M.Slot <- slot0(args)
+    value : M.Slot <- slot1(args)
+    +words : W.Words <- wide_words(value, tag)
+    text : String <- wide_text(tag, words)
+    result : O.Outcome <- builder_append_chars(vm, bits_of(receiver), units_from_string(text))
     return result
 
 
 
-def parse_digit(+c: U32) -> Maybe<&2, U32>:
-  Bool.pick(Maybe<&2, U32>, U32.is_ge(c, 48) && U32.is_le(c, 57), Some{U32.sub(c, 48)}, None{})
+# Character.digit for ASCII digits and letters in the given radix.
+def parse_digit(+c: U32, +radix: U32) -> Maybe<&2, U32>:
+  +value : U32 = Bool.pick(U32, U32.is_ge(c, 48) && U32.is_le(c, 57), U32.sub(c, 48),
+    Bool.pick(U32, U32.is_ge(c, 97) && U32.is_le(c, 122), U32.sub(c, 87),
+      Bool.pick(U32, U32.is_ge(c, 65) && U32.is_le(c, 90), U32.sub(c, 55), 99)))
+  Bool.pick(Maybe<&2, U32>, U32.is_lt(value, radix), Some{value}, None{})
 
-def parse_acc(+acc: U32, +d: U32, +neg: Bool) -> Maybe<&2, U32>:
+# acc * radix + d, unless it passes Integer.MAX_VALUE (or -MIN_VALUE).
+def parse_acc(+acc: U32, +d: U32, +neg: Bool, +radix: U32) -> Maybe<&2, U32>:
   +limit = Bool.pick(U32, neg, 2147483648, 2147483647)
-  Bool.pick(Maybe<&2, U32>, U32.is_gt(acc, U32.div(limit, 10)), None{},
-    Bool.pick(Maybe<&2, U32>, U32.is_gt(U32.mul(acc, 10), U32.sub(limit, d)), None{}, Some{U32.add(U32.mul(acc, 10), d)}))
+  Bool.pick(Maybe<&2, U32>, U32.is_gt(acc, U32.div(U32.sub(limit, d), radix)), None{}, Some{U32.add(U32.mul(acc, radix), d)})
 
 def require_digit(found: Maybe<&2, U32>) -> Result<&2, &2, String, U32>:
   match found:
     case None{}: Fail{nfe()}
     case Some{d}: Done{d}
 
+def parse_digit_result(c: U32) -> Result<&2, &2, String, U32>:
+  require_digit(parse_digit(c, 10))
+
 def require_acc(found: Maybe<&2, U32>) -> Result<&2, &2, String, U32>:
   match found:
     case None{}: Fail{nfe()}
     case Some{d}: Done{d}
 
-@unsafe def parse_go(chars: +List<U32>, +acc: U32, seen: Bool, +neg: Bool) -> Result<&2, &2, String, U32>:
+@unsafe def parse_go(chars: +List<U32>, +acc: U32, seen: Bool, +neg: Bool, +radix: U32) -> Result<&2, &2, String, U32>:
   match chars:
     case Nil{}:
       Bool.pick(Result<&2, &2, String, U32>, seen, Done{Bool.pick(U32, neg, V.negate(acc), acc)}, Fail{nfe()})
     case Con{c, rest}:
       do Result<&2, &2, String, U32>:
-        d : U32 <- require_digit(parse_digit(c))
-        next : U32 <- require_acc(parse_acc(acc, d, neg))
-        result : U32 <- parse_go(rest, next, True{}, neg)
+        d : U32 <- require_digit(parse_digit(c, radix))
+        next : U32 <- require_acc(parse_acc(acc, d, neg, radix))
+        result : U32 <- parse_go(rest, next, True{}, neg, radix)
         return result
 
-def parse_sign(chars: +List<U32>) -> Result<&2, &2, String, U32>:
+def parse_sign(chars: +List<U32>, +radix: U32) -> Result<&2, &2, String, U32>:
   match chars:
     case Nil{}: Fail{nfe()}
-    case Con{43, rest}: parse_go(rest, 0, False{}, False{})
-    case Con{45, rest}: parse_go(rest, 0, False{}, True{})
-    case _: parse_go(chars, 0, False{}, False{})
+    case Con{43, rest}: parse_go(rest, 0, False{}, False{}, radix)
+    case Con{45, rest}: parse_go(rest, 0, False{}, True{}, radix)
+    case _: parse_go(chars, 0, False{}, False{}, radix)
 
-def integer_parse(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+@unsafe def integer_parse(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  integer_parse_in(vm, args, 10)
+
+# Integer.parseInt(String, int): Character.MIN_RADIX to MAX_RADIX.
+@unsafe def integer_parse_radix(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +radix : M.Slot <- slot1(args)
+    +value : U32 = bits_of(radix)
+    low : Unit <- S.check(Bool.not(V.negative(value)) && U32.is_ge(value, 2), "java/lang/NumberFormatException: radix " ++ V.int_show(value) ++ " less than Character.MIN_RADIX")
+    high : Unit <- S.check(U32.is_le(value, 36), "java/lang/NumberFormatException: radix " ++ V.int_show(value) ++ " greater than Character.MAX_RADIX")
+    result : O.Outcome <- integer_parse_in(vm, args, value)
+    return result
+
+def integer_parse_in(+vm: M.VM, +args: +List<M.Slot>, +radix: U32) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
     +value : M.Slot <- slot0(args)
     checked : Unit <- S.check(U32.is_ne(bits_of(value), 0), npe())
     chars : +List<U32> <- string_chars(vm, bits_of(value))
-    bits : U32 <- parse_sign(chars)
+    bits : U32 <- parse_sign(chars, radix)
     result : O.Outcome <- int_out(vm, bits)
     return result
 
@@ -4846,6 +5465,164 @@ def integer_equals(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.
     +left : M.Slot <- slot0(args)
     +right : M.Slot <- slot1(args)
     result : O.Outcome <- integer_equals_ref(vm, bits_of(left), bits_of(right))
+    return result
+def wide_words_equal(a: W.Words, b: W.Words) -> Bool:
+  match a b:
+    case W.Words{ah, al} W.Words{bh, bl}: U32.is_eq(ah, bh) && U32.is_eq(al, bl)
+
+@unsafe def long_parse_digit(+chars: +List<U32>, +acc: W.Words, seen: Bool, neg: Bool, +limit_q: W.Words, +limit_r: W.Words) -> Result<&2, &2, String, W.Words>:
+  match chars:
+    case Nil{}: Bool.pick(Result<&2, &2, String, W.Words>, seen, Done{Bool.pick(W.Words, neg, W.neg(acc), acc)}, Fail{nfe()})
+    case Con{c, rest}:
+      do Result<&2, &2, String, W.Words>:
+        +digit : U32 <- parse_digit_result(c)
+        +at_limit : Bool = wide_words_equal(acc, limit_q)
+        within : Unit <- S.check(Bool.not(W.unsigned_less(limit_q, acc)) && (Bool.not(at_limit) || U32.is_le(digit, W.long_to_int(limit_r))), nfe())
+        next : W.Words = W.add(W.mul(acc, W.Words{0, 10}), W.Words{0, digit})
+        result : W.Words <- long_parse_digit(rest, next, True{}, neg, limit_q, limit_r)
+        return result
+
+def long_parse_division(chars: +List<U32>, neg: Bool, division: W.Division) -> Result<&2, &2, String, W.Words>:
+  match division:
+    case W.Division{quotient, remainder}: long_parse_digit(chars, W.Words{0, 0}, False{}, neg, quotient, remainder)
+def long_parse_go(chars: +List<U32>, +neg: Bool) -> Result<&2, &2, String, W.Words>:
+  +limit : W.Words = Bool.pick(W.Words, neg, W.Words{2147483648, 0}, W.Words{2147483647, 4294967295})
+  long_parse_division(chars, neg, W.unsigned_divide(limit, W.Words{0, 10}))
+
+def long_parse_sign(chars: +List<U32>) -> Result<&2, &2, String, W.Words>:
+  match chars:
+    case Nil{}: Fail{nfe()}
+    case Con{43, rest}: long_parse_go(rest, False{})
+    case Con{45, rest}: long_parse_go(rest, True{})
+    case _: long_parse_go(chars, False{})
+
+def long_parse(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +value : M.Slot <- slot0(args)
+    checked : Unit <- S.check(U32.is_ne(bits_of(value), 0), npe())
+    chars : +List<U32> <- string_chars(vm, bits_of(value))
+    +words : W.Words <- long_parse_sign(chars)
+    result : O.Outcome <- returned(vm, Some{reflect_wide_slot(4, words)})
+    return result
+
+def wide_values_equal(+vm: M.VM, left: U32, right: U32, +tag: U32) -> Result<&2, &2, String, Bool>:
+  do Result<&2, &2, String, Bool>:
+    +left_entry : M.HeapEntry <- H.get(S.heap(vm), left)
+    +right_entry : M.HeapEntry <- H.get(S.heap(vm), right)
+    +class : U32 = class_id(vm, Bool.pick(String, U32.is_eq(tag, 4), "java/lang/Long", "java/lang/Double"))
+    same_class : Bool = U32.is_eq(H.entry_class(right_entry), class)
+    result : Bool <- Bool.pick(Result<&2, &2, String, Bool>, same_class,
+      do Result<&2, &2, String, Bool>:
+        +source : U32 = Bool.pick(U32, U32.is_eq(tag, 4), 74, 68)
+        +left_value : M.Slot <- wrapper_value_slot(vm, left_entry, source)
+        +right_value : M.Slot <- wrapper_value_slot(vm, right_entry, source)
+        +left_words : W.Words <- wide_words(left_value, tag)
+        +right_words : W.Words <- wide_words(right_value, tag)
+        +same_words : Bool = wide_words_equal(left_words, right_words)
+        return Bool.pick(Bool, U32.is_eq(tag, 5) && B64.double_is_nan(left_words) && B64.double_is_nan(right_words), True{}, same_words),
+      Done{False{}})
+    return result
+
+def long_equals(+vm: M.VM, +args: +List<M.Slot>, +tag: U32) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +left : M.Slot <- slot0(args)
+    +right : M.Slot <- slot1(args)
+    equal : Bool <- Bool.pick(Result<&2, &2, String, Bool>, U32.is_eq(bits_of(right), 0),
+      Done{False{}}, wide_values_equal(vm, bits_of(left), bits_of(right), tag))
+    result : O.Outcome <- bool_out(vm, equal)
+    return result
+def wide_low_word(words: W.Words) -> U32:
+  match words:
+    case W.Words{high, low}: low
+
+def wide_word_xor(words: W.Words) -> U32:
+  match words:
+    case W.Words{high, low}: U32.xor(high, low)
+
+def wide_low_value(+vm: M.VM, +args: +List<M.Slot>, +tag: U32) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +receiver : M.Slot <- slot0(args)
+    value : M.Slot <- wide_value_from_binding(vm, receiver, tag)
+    +words : W.Words <- wide_words(value, tag)
+    result : O.Outcome <- int_out(vm, wide_low_word(words))
+    return result
+
+def long_bits_to_double(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    value : M.Slot <- slot0(args)
+    +words : W.Words <- wide_words(value, 4)
+    result : O.Outcome <- returned(vm, Some{reflect_wide_slot(5, words)})
+    return result
+
+def double_raw_bits(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    value : M.Slot <- slot0(args)
+    +words : W.Words <- wide_words(value, 5)
+    result : O.Outcome <- returned(vm, Some{reflect_wide_slot(4, words)})
+    return result
+def double_canonical_bits(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    value : M.Slot <- slot0(args)
+    +words : W.Words <- wide_words(value, 5)
+    +canonical : W.Words = Bool.pick(W.Words, B64.double_is_nan(words), W.Words{2146959360, 0}, words)
+    result : O.Outcome <- returned(vm, Some{reflect_wide_slot(4, canonical)})
+    return result
+
+def double_classify(+vm: M.VM, +args: +List<M.Slot>, infinite: Bool) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    value : M.Slot <- slot0(args)
+    +words : W.Words <- wide_words(value, 5)
+    result : O.Outcome <- bool_out(vm, Bool.pick(Bool, infinite, B64.double_is_infinite(words), B64.double_is_nan(words)))
+    return result
+def long_double_value(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +receiver : M.Slot <- slot0(args)
+    value : M.Slot <- wide_value_from_binding(vm, receiver, 4)
+    +words : W.Words <- wide_words(value, 4)
+    +converted : W.Words = B64.long_to_double(words)
+    result : O.Outcome <- returned(vm, Some{reflect_wide_slot(5, converted)})
+    return result
+
+def long_float_value(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +receiver : M.Slot <- slot0(args)
+    value : M.Slot <- wide_value_from_binding(vm, receiver, 4)
+    +words : W.Words <- wide_words(value, 4)
+    result : O.Outcome <- returned(vm, Some{M.Slot{2, B64.long_to_float(words)}})
+    return result
+
+def double_int_value(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +receiver : M.Slot <- slot0(args)
+    value : M.Slot <- wide_value_from_binding(vm, receiver, 5)
+    +words : W.Words <- wide_words(value, 5)
+    result : O.Outcome <- int_out(vm, B64.double_to_int(words))
+    return result
+
+def double_long_value(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +receiver : M.Slot <- slot0(args)
+    value : M.Slot <- wide_value_from_binding(vm, receiver, 5)
+    +words : W.Words <- wide_words(value, 5)
+    +converted : W.Words = B64.double_to_long(words)
+    result : O.Outcome <- returned(vm, Some{reflect_wide_slot(4, converted)})
+    return result
+
+def double_float_value(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +receiver : M.Slot <- slot0(args)
+    value : M.Slot <- wide_value_from_binding(vm, receiver, 5)
+    +words : W.Words <- wide_words(value, 5)
+    result : O.Outcome <- returned(vm, Some{M.Slot{2, B64.double_to_f32(words)}})
+    return result
+
+def wide_hash_code(+vm: M.VM, +args: +List<M.Slot>, +tag: U32) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +receiver : M.Slot <- slot0(args)
+    value : M.Slot <- wide_value_from_binding(vm, receiver, tag)
+    +words : W.Words <- wide_words(value, tag)
+    +hash_words : W.Words = Bool.pick(W.Words, U32.is_eq(tag, 5) && B64.double_is_nan(words), W.Words{2146959360, 0}, words)
+    result : O.Outcome <- int_out(vm, wide_word_xor(hash_words))
     return result
 
 def integer_hashcode(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
@@ -5281,12 +6058,26 @@ def map_remove_at(+vm: M.VM, +map: U32, +index: U32, value: M.Slot) -> Result<&2
     result : O.Outcome <- returned(updated, Some{value})
     return result
 
+# put on an equal existing key keeps the original key, replaces the value, and
+# returns the previous value (modCount is unchanged).
+def map_put_existing(+vm: M.VM, +map: U32, +index: U32, value: M.Slot) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +entry : M.HeapEntry <- list_entry_of(vm, map)
+    +pairs : +List<M.Slot> = map_pairs(entry)
+    existing : M.Slot <- S.require(M.Slot, M.nth(M.Slot, pairs, U32.mul(index, 2)), "InvalidState: map index")
+    old : M.Slot <- S.require(M.Slot, M.nth(M.Slot, pairs, U32.add(U32.mul(index, 2), 1)), "InvalidState: map index")
+    updated : M.VM = put_map(vm, map, replace_pair(pairs, U32.to_nat(index), existing, value), list_size_of(entry), list_mod(entry_fields(entry)))
+    result : O.Outcome <- returned(updated, Some{old})
+    return result
+
+# op: 0 get, 2 containsKey, 3 remove, 4 put (1 is unused and behaves like get).
 def map_hit(+vm: M.VM, +map: U32, +key: U32, +index: U32, +op: U32, value: M.Slot) -> Result<&2, &2, String, O.Outcome>:
   match op:
     case 0: returned(vm, Some{value})
     case 1: returned(vm, Some{value})
     case 2: bool_out(vm, True{})
     case 3: map_remove_at(vm, map, index, value)
+    case 4: map_put_existing(vm, map, index, value)
     case _: returned(vm, Some{value})
 
 @unsafe def map_lookup_dropped(dropped: +List<M.Slot>, +vm: M.VM, +map: U32, +key: U32, +index: U32, +op: U32) -> Result<&2, &2, String, O.Outcome>:
@@ -5371,7 +6162,8 @@ def throwable_init(+vm: M.VM, +args: +List<M.Slot>, message: U32, cause: U32, fl
   do Result<&2, &2, String, O.Outcome>:
     +receiver : M.Slot <- slot0(args)
     +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
-    updated : M.HeapEntry = M.HeapEntry{H.entry_class(entry), 0, 0, [M.Binding{0, M.Slot{3, message}}, M.Binding{1, M.Slot{3, cause}}, M.Binding{2, M.Slot{3, 0}}, M.Binding{3, M.Slot{1, flags}}], Nil{}, Nil{}}
+    # Like fillInStackTrace in the Throwable constructor: the creating call stack.
+    updated : M.HeapEntry = M.HeapEntry{H.entry_class(entry), 0, 0, [M.Binding{0, M.Slot{3, message}}, M.Binding{1, M.Slot{3, cause}}, M.Binding{2, M.Slot{3, 0}}, M.Binding{3, M.Slot{1, flags}}], Tr.capture(vm), Nil{}}
     result : O.Outcome <- void_out(H.put(vm, bits_of(receiver), updated))
     return result
 
@@ -5394,6 +6186,42 @@ def throwable_init_t(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, 
     +receiver : M.Slot <- slot0(args)
     +cause : M.Slot <- slot1(args)
     result : O.Outcome <- throwable_init_t_dispatch(vm, bits_of(receiver), bits_of(cause))
+    return result
+
+def assertion_null_alloc(+receiver: U32, allocation: Result<&2, &2, String, H.Allocation>) -> Result<&2, &2, String, O.Outcome>:
+  match allocation:
+    case Fail{error}: Fail{error}
+    case Done{H.Allocation{updated, message}}: throwable_init(updated, [M.Slot{3, receiver}], message, 0, 0)
+
+@unsafe def assertion_detail_ref(+vm: M.VM, +receiver: U32, +detail: U32) -> Result<&2, &2, String, O.Outcome>:
+  match detail:
+    case 0: assertion_null_alloc(receiver, H.allocate(vm, H.string_entry(class_id(vm, "java/lang/String"), units_from_string("null"))))
+    case _:
+      do Result<&2, &2, String, O.Outcome>:
+        +entry : M.HeapEntry <- H.get(S.heap(vm), detail)
+        result : O.Outcome <- assertion_detail(vm, receiver, detail, entry)
+        return result
+
+def assertion_object(throwable: Bool, +vm: M.VM, +receiver: U32, +detail: U32) -> Result<&2, &2, String, O.Outcome>:
+  match throwable:
+    case True{}: throwable_init_t_dispatch(vm, receiver, detail)
+    case False{}: call_virtual(push_cont(vm, M.NeedThrowableMessage{receiver, 0}), virtual_on(vm, detail, "toString", "()Ljava/lang/String;"), [M.Slot{3, detail}])
+
+def assertion_detail_kind(string: Bool, +vm: M.VM, +receiver: U32, +detail: U32, class: U32) -> Result<&2, &2, String, O.Outcome>:
+  match string:
+    case True{}: throwable_init(vm, [M.Slot{3, receiver}], detail, 0, 0)
+    case False{}: assertion_object(H.hierarchy(S.classes(vm), class, class_id(vm, "java/lang/Throwable")), vm, receiver, detail)
+
+def assertion_detail(+vm: M.VM, +receiver: U32, +detail: U32, +entry: M.HeapEntry) -> Result<&2, &2, String, O.Outcome>:
+  assertion_detail_kind(U32.is_eq(entry_kind(entry), 3), vm, receiver, detail, H.entry_class(entry))
+
+# AssertionError(Object): the message is String.valueOf(detail), and a
+# Throwable detail also becomes the cause.
+def assertion_error_init(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +receiver : M.Slot <- slot0(args)
+    +detail : M.Slot <- slot1(args)
+    result : O.Outcome <- assertion_detail_ref(vm, bits_of(receiver), bits_of(detail))
     return result
 
 def throwable_init_st(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
@@ -5475,7 +6303,7 @@ def throwable_empty_suppressed(+vm: M.VM) -> Result<&2, &2, String, O.Outcome>:
 def property_units(+values: +List<M.Slot>) -> +List<U32>:
   match values:
     case Nil{}: Nil{}
-    case Con{M.Slot{tag, bits}, rest}: Con{bits, property_units(rest)}
+    case Con{slot, rest}: Con{M.slot_bits(slot), property_units(rest)}
 
 
 def property_chars(units: +List<U32>) -> +List<Char>:
@@ -5705,12 +6533,79 @@ def baos_reset(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outc
     result : O.Outcome <- void_out(H.put(vm, bits_of(receiver), updated))
     return result
 
+# String.valueOf semantics for printing: null prints "null".
+def printed_reference(+vm: M.VM, +reference: U32) -> Result<&2, &2, String, String>:
+  match reference:
+    case 0: Done{"null"}
+    case _:
+      do Result<&2, &2, String, String>:
+        +entry : M.HeapEntry <- H.get(S.heap(vm), reference)
+        checked : Unit <- S.check(U32.is_eq(entry_kind(entry), 3), "java/lang/ClassCastException")
+        return utf16(entry_chars(entry), 0)
+
+# PrintStream.println(Object) prints String.valueOf(value), calling the
+# receiver's virtual toString() for every non-null, non-String object.
+def emit_text(+vm: M.VM, newline: Bool, +text: String) -> M.VM:
+  Bool.pick(M.VM, newline, S.emit(vm, text), S.emit_raw(vm, text))
+
+# PrintStream.print/println(Object): String.valueOf(value), calling the
+# receiver's virtual toString() for every non-null, non-String object.
+# System.err's PrintStream (heap reference 15, see class_loader.bootstrap_heap).
+def err_stream() -> U32:
+  15
+
+def emit_text_err(err: Bool, +vm: M.VM, +newline: Bool, +text: String) -> M.VM:
+  match err:
+    case True{}: S.emit_error(vm, Bool.pick(String, newline, text ++ "\n", text))
+    case False{}: emit_text(vm, newline, text)
+
+# NeedToString ops: 2/3 println/print to System.out, 4/5 to System.err.
+def print_op(+newline: Bool, +err: Bool) -> U32:
+  Bool.pick(U32, err, Bool.pick(U32, newline, 4, 5), Bool.pick(U32, newline, 2, 3))
+
+def print_object_to(+vm: M.VM, +reference: U32, +newline: Bool, +err: Bool) -> Result<&2, &2, String, O.Outcome>:
+  match reference:
+    case 0: void_out(emit_text_err(err, vm, newline, "null"))
+    case +value:
+      do Result<&2, &2, String, O.Outcome>:
+        +entry : M.HeapEntry <- H.get(S.heap(vm), value)
+        result : O.Outcome <- Bool.pick(Result<&2, &2, String, O.Outcome>, U32.is_eq(entry_kind(entry), 3),
+          void_out(emit_text_err(err, vm, newline, utf16(entry_chars(entry), 0))),
+          call_virtual(push_cont(vm, M.NeedToString{print_op(newline, err), 0}), virtual_on(vm, value, "toString", "()Ljava/lang/String;"), [M.Slot{3, value}]))
+        return result
+
+def print_object_ref(+vm: M.VM, +reference: U32, +newline: Bool) -> Result<&2, &2, String, O.Outcome>:
+  print_object_to(vm, reference, newline, False{})
+
+def println_object_ref(+vm: M.VM, +reference: U32) -> Result<&2, &2, String, O.Outcome>:
+  print_object_ref(vm, reference, True{})
+
 def continue_to_string(+vm: M.VM, +op: U32, +extra: U32, value: M.Slot) -> Result<&2, &2, String, O.Outcome>:
   match op:
     case 1:
       do Result<&2, &2, String, O.Outcome>:
         chars : +List<U32> <- string_chars(vm, bits_of(value))
         result : O.Outcome <- builder_append_chars(vm, extra, chars)
+        return result
+    case 2:
+      do Result<&2, &2, String, O.Outcome>:
+        text : String <- printed_reference(vm, bits_of(value))
+        result : O.Outcome <- void_out(S.emit(vm, text))
+        return result
+    case 3:
+      do Result<&2, &2, String, O.Outcome>:
+        text : String <- printed_reference(vm, bits_of(value))
+        result : O.Outcome <- void_out(S.emit_raw(vm, text))
+        return result
+    case 4:
+      do Result<&2, &2, String, O.Outcome>:
+        text : String <- printed_reference(vm, bits_of(value))
+        result : O.Outcome <- void_out(S.emit_error(vm, text ++ "\n"))
+        return result
+    case 5:
+      do Result<&2, &2, String, O.Outcome>:
+        text : String <- printed_reference(vm, bits_of(value))
+        result : O.Outcome <- void_out(S.emit_error(vm, text))
         return result
     case _:
       returned(vm, Some{value})
@@ -5734,12 +6629,15 @@ def proxy_return_primitive(+vm: M.VM, +name: String, value: M.Slot) -> Result<&2
       do Result<&2, &2, String, M.Slot>:
         checked_tag : Unit <- S.check(U32.is_eq(tag, 3), "java/lang/NullPointerException")
         checked_null : Unit <- S.check(U32.is_ne(reference, 0), "java/lang/NullPointerException")
-        wrapper : String = proxy_wrapper_name(name)
+        +wrapper : String = proxy_wrapper_name(name)
         +wrapper_id : U32 = class_id(vm, wrapper)
-        wrapper_checked : Unit <- S.check(U32.is_ne(wrapper_id, 4294967295), "UnsupportedFeature: proxy wide primitive return")
+        wrapper_checked : Unit <- S.check(U32.is_ne(wrapper_id, 4294967295), "java/lang/ClassCastException")
         +entry : M.HeapEntry <- H.get(S.heap(vm), reference)
         checked_type : Unit <- S.check(U32.is_eq(H.entry_class(entry), wrapper_id), "java/lang/ClassCastException")
-        return reflect_binding_slot(H.binding_find(entry_fields(entry), 0))
+        +primitive : M.Slot <- wrapper_value_slot(vm, entry, reflect_wrapper_tag(wrapper))
+        checked_value : Unit <- S.check(U32.is_eq(M.slot_tag(primitive), wrapper_value_slot_tag(reflect_wrapper_tag(wrapper))), "java/lang/ClassCastException")
+        return primitive
+    case _: Fail{"java/lang/ClassCastException"}
 
 def proxy_return_reference_slot(+vm: M.VM, +name: String, value: M.Slot, tag: U32, reference: U32) -> Result<&2, &2, String, M.Slot>:
   match reference:
@@ -5759,6 +6657,7 @@ def proxy_return_reference_slot(+vm: M.VM, +name: String, value: M.Slot, tag: U3
 def proxy_return_reference(+vm: M.VM, +name: String, value: M.Slot) -> Result<&2, &2, String, M.Slot>:
   match value:
     case M.Slot{+tag, +reference}: proxy_return_reference_slot(vm, name, value, tag, reference)
+    case _: Fail{"java/lang/ClassCastException"}
 
 def proxy_return_value(+vm: M.VM, +descriptor: String, +value: M.Slot) -> Result<&2, &2, String, M.Slot>:
   +name : String = method_return_name(descriptor)
@@ -5771,11 +6670,11 @@ def reflect_box_return(+vm: M.VM, descriptor: String, value: M.Slot) -> Result<&
 def continue_throwable_message(+vm: M.VM, +receiver: U32, +cause: U32, value: M.Slot) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
     +entry : M.HeapEntry <- H.get(S.heap(vm), receiver)
-    updated : M.HeapEntry = M.HeapEntry{H.entry_class(entry), 0, 0, [M.Binding{0, M.Slot{3, bits_of(value)}}, M.Binding{1, M.Slot{3, cause}}, M.Binding{2, M.Slot{3, 0}}, M.Binding{3, M.Slot{1, 1}}], Nil{}, Nil{}}
+    updated : M.HeapEntry = M.HeapEntry{H.entry_class(entry), 0, 0, [M.Binding{0, M.Slot{3, bits_of(value)}}, M.Binding{1, M.Slot{3, cause}}, M.Binding{2, M.Slot{3, 0}}, M.Binding{3, M.Slot{1, Bool.to_u32(U32.is_ne(cause, 0))}}], Nil{}, Nil{}}
     result : O.Outcome <- void_out(H.put(vm, receiver, updated))
     return result
 
-def continue_java(+vm: M.VM, cont: M.Cont, +value: M.Slot) -> Result<&2, &2, String, O.Outcome>:
+@unsafe def continue_java(+vm: M.VM, cont: M.Cont, +value: M.Slot) -> Result<&2, &2, String, O.Outcome>:
   match cont:
     case M.NeedThrowableMessage{+receiver, +cause}:
       continue_throwable_message(vm, receiver, cause, value)
@@ -5791,7 +6690,49 @@ def continue_java(+vm: M.VM, cont: M.Cont, +value: M.Slot) -> Result<&2, &2, Str
     case M.NeedHash{map, key, op, extra}:
       map_lookup(vm, map, key, 0, op)
     case M.CallBoundary{depth, effect, descriptor}: returned(vm, Some{value})
-    case M.InitCallContinuation{depth, intrinsic, args}: returned(vm, Some{value})
+    case M.NeedClassMirror{target}: class_for_name_init(vm, target)
+    case M.NeedTextJoin{+acc, +items}: continue_text_join(vm, acc, items, value)
+    case _: Fail{"InvalidState: runtime continuation passed to Java intrinsic"}
+
+def static_member_owner(flags: U32, owner: U32) -> U32:
+  Bool.pick(U32, U32.is_ne(U32.and(flags, 8), 0), owner, 4294967295)
+
+# The class an intrinsic must see initialized before it runs (JVMS 5.5):
+# reflective static field access and static method invocation initialize the
+# declaring class, Constructor.newInstance the constructed class, and the
+# annotation enum lookups their enum types. 4294967295 means none.
+def initialization_target(+vm: M.VM, +values: +List<M.Slot>, kind: U32) -> Result<&2, &2, String, U32>:
+  match kind:
+    case 179:
+      do Result<&2, &2, String, U32>:
+        +field : M.LoadedField <- reflect_field_member(vm, values)
+        return static_member_owner(M.loaded_field_flags(field), M.loaded_field_owner(field))
+    case 180:
+      do Result<&2, &2, String, U32>:
+        +field : M.LoadedField <- reflect_field_member(vm, values)
+        return static_member_owner(M.loaded_field_flags(field), M.loaded_field_owner(field))
+    case 181:
+      do Result<&2, &2, String, U32>:
+        +field : M.LoadedField <- reflect_field_member(vm, values)
+        return static_member_owner(M.loaded_field_flags(field), M.loaded_field_owner(field))
+    case 182:
+      do Result<&2, &2, String, U32>:
+        +field : M.LoadedField <- reflect_field_member(vm, values)
+        return static_member_owner(M.loaded_field_flags(field), M.loaded_field_owner(field))
+    case 183:
+      do Result<&2, &2, String, U32>:
+        +member : M.LoadedMethod <- reflect_method_member(vm, values)
+        return static_member_owner(M.loaded_method_flags(member), M.loaded_method_owner(member))
+    case 184:
+      do Result<&2, &2, String, U32>:
+        member : M.LoadedMethod <- reflect_constructor_member(vm, values)
+        return M.loaded_method_owner(member)
+    case 558: class_target(vm, values)
+    case 310: Done{class_id(vm, "java/lang/annotation/RetentionPolicy")}
+    case 311: Done{class_id(vm, "java/lang/annotation/RetentionPolicy")}
+    case 312: Done{class_id(vm, "java/lang/annotation/ElementType")}
+    case 313: Done{class_id(vm, "java/lang/annotation/ElementType")}
+    case _: Done{4294967295}
 
 @unsafe def property_utf8_decode(mode: U32, pending: U32, +bytes: +List<U32>, +acc: +List<U32>) -> +List<U32>:
   match mode bytes:
@@ -5855,6 +6796,8 @@ def property_lookup_last_slot(+vm: M.VM, current: M.Slot, found: M.Slot) -> Resu
   match found:
     case M.Slot{tag, 0}: returned(vm, Some{current})
     case M.Slot{tag, bits}: returned(vm, Some{M.Slot{tag, bits}})
+    case M.Wide{tag, high, low}: Fail{"java/lang/ClassCastException"}
+    case M.Unusable{}: Fail{"java/lang/ClassCastException"}
 
 def property_lookup_last_result(+vm: M.VM, current: M.Slot, result: Result<&2, &2, String, O.Outcome>) -> Result<&2, &2, String, O.Outcome>:
   match result:
@@ -6045,4 +6988,2130 @@ def float_unbox(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Out
     receiver : M.Slot <- slot0(args)
     +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
     result : O.Outcome <- returned(vm, Some{M.Slot{2, field_bits(entry_fields(entry), 0)}})
+    return result
+
+# ---- java.lang.reflect.Executable parameters and Parameter (JDK 8) ----
+# A Parameter object keeps its executable in binding 0 and its index in binding 1.
+
+def executable_kind(+constructor: Bool, +vm: M.VM, +executable: U32) -> Result<&2, &2, String, M.LoadedMethod>:
+  match constructor:
+    case True{}: reflect_constructor_member(vm, [M.Slot{3, executable}])
+    case False{}: reflect_method_member(vm, [M.Slot{3, executable}])
+
+def executable_is_constructor(+vm: M.VM, entry: M.HeapEntry) -> Bool:
+  String.eq(class_name_text(vm, H.entry_class(entry)), "java/lang/reflect/Constructor")
+
+def executable_method(+vm: M.VM, +executable: U32) -> Result<&2, &2, String, M.LoadedMethod>:
+  do Result<&2, &2, String, M.LoadedMethod>:
+    +entry : M.HeapEntry <- H.get(S.heap(vm), executable)
+    method : M.LoadedMethod <- executable_kind(executable_is_constructor(vm, entry), vm, executable)
+    return method
+
+def method_parameter_count(+method: M.LoadedMethod) -> U32:
+  match method:
+    case M.LoadedMethod{id, owner, name, descriptor, flags, parameters, resultTag, maxStack, maxLocals, instructions, handlers, intrinsic, switches}: parameters
+
+def method_parameter_records_found(found: Result<&2, &2, String, M.MethodMetadata>) -> +List<M.MethodParameter>:
+  match found:
+    case Fail{error}: Nil{}
+    case Done{M.MethodMetadata{owner, method, metadata, signature, parameters, lines}}: parameters
+
+def method_parameter_records(+vm: M.VM, +method: M.LoadedMethod) -> +List<M.MethodParameter>:
+  method_parameter_records_found(method_metadata_value(vm, M.loaded_method_id(method)))
+
+def parameter_name_valid(+name: String) -> Bool:
+  match name:
+    case SNil{}: True{}
+    case SCon{Chr{46}, rest}: False{}
+    case SCon{Chr{59}, rest}: False{}
+    case SCon{Chr{91}, rest}: False{}
+    case SCon{Chr{47}, rest}: False{}
+    case SCon{unit, rest}: parameter_name_valid(rest)
+
+def parameter_records_valid(+records: +List<M.MethodParameter>) -> Bool:
+  match records:
+    case Nil{}: True{}
+    case Con{M.MethodParameter{name, flags}, rest}: parameter_name_valid(name) && parameter_records_valid(rest)
+
+# Executable.getParameters validates MethodParameters the way the JDK does:
+# a wrong entry count or a name with . ; [ / is MalformedParametersException.
+def parameter_records_check(+records: +List<M.MethodParameter>, +count: U32) -> Result<&2, &2, String, Unit>:
+  do Result<&2, &2, String, Unit>:
+    +length : U32 = M.length(M.MethodParameter, records)
+    sized : Unit <- S.check(U32.is_eq(length, 0) || U32.is_eq(length, count), "java/lang/reflect/MalformedParametersException: Wrong number of parameters in MethodParameters attribute")
+    named : Unit <- S.check(parameter_records_valid(records), "java/lang/reflect/MalformedParametersException: Invalid parameter name")
+    return Unit{}
+
+@unsafe def parameter_objects_next(allocation: Result<&2, &2, String, H.Allocation>, fuel: Nat, +class: U32, +executable: U32, +index: U32, +acc: +List<U32>) -> Result<&2, &2, String, ReflectRefs>:
+  match allocation:
+    case Fail{error}: Fail{error}
+    case Done{H.Allocation{updated, reference}}: parameter_objects(fuel, updated, class, executable, U32.add(index, 1), Con{reference, acc})
+
+@unsafe def parameter_objects(fuel: Nat, +vm: M.VM, +class: U32, +executable: U32, +index: U32, +acc: +List<U32>) -> Result<&2, &2, String, ReflectRefs>:
+  match fuel:
+    case 0n: Done{ReflectRefs{vm, M.reverse(U32, acc)}}
+    case 1n+p: parameter_objects_next(H.allocate(vm, H.object_entry(class, [M.Binding{0, M.Slot{3, executable}}, M.Binding{1, M.Slot{1, index}}])), p, class, executable, index, acc)
+
+def reference_slots(+refs: +List<U32>) -> +List<M.Slot>:
+  match refs:
+    case Nil{}: Nil{}
+    case Con{reference, rest}: Con{M.Slot{3, reference}, reference_slots(rest)}
+
+def parameter_array_out(refs: ReflectRefs) -> Result<&2, &2, String, O.Outcome>:
+  match refs:
+    case ReflectRefs{+vm, refs}:
+      alloc_result(H.allocate(vm, H.reference_array_entry(class_id(vm, "[Ljava/lang/reflect/Parameter;"), class_id(vm, "java/lang/reflect/Parameter"), reference_slots(refs))), vm2 => reference => ref_out(vm2, reference))
+
+def executable_parameters(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    receiver : M.Slot <- slot0(args)
+    +executable : U32 = bits_of(receiver)
+    +method : M.LoadedMethod <- executable_method(vm, executable)
+    +count : U32 = method_parameter_count(method)
+    checked : Unit <- parameter_records_check(method_parameter_records(vm, method), count)
+    +ready : M.VM <- ensure_array_class(vm, "[Ljava/lang/reflect/Parameter;")
+    refs : ReflectRefs <- parameter_objects(U32.to_nat(count), ready, class_id(ready, "java/lang/reflect/Parameter"), executable, 0, Nil{})
+    result : O.Outcome <- parameter_array_out(refs)
+    return result
+
+def executable_parameter_count(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    receiver : M.Slot <- slot0(args)
+    method : M.LoadedMethod <- executable_method(vm, bits_of(receiver))
+    result : O.Outcome <- int_out(vm, method_parameter_count(method))
+    return result
+
+type ParameterParts is Data:
+  ParameterParts{executable: U32, index: U32}
+
+def parameter_parts(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, ParameterParts>:
+  do Result<&2, &2, String, ParameterParts>:
+    receiver : M.Slot <- slot0(args)
+    +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
+    executable : M.Slot <- reflect_binding(entry, 0)
+    index : M.Slot <- reflect_binding(entry, 1)
+    return ParameterParts{bits_of(executable), bits_of(index)}
+
+def parameter_record_name(found: Maybe<&2, M.MethodParameter>) -> String:
+  match found:
+    case None{}: ""
+    case Some{M.MethodParameter{name, flags}}: name
+
+def parameter_record_flags(found: Maybe<&2, M.MethodParameter>) -> U32:
+  match found:
+    case None{}: 0
+    case Some{M.MethodParameter{name, flags}}: flags
+
+# Without a recorded name the JDK synthesizes argN.
+def parameter_display_name(+recorded: String, +index: U32) -> String:
+  Bool.pick(String, String.is_empty(recorded), "arg" ++ U32.show(index), recorded)
+
+def parameter_name(+vm: M.VM, +method: M.LoadedMethod, +index: U32) -> String:
+  parameter_display_name(parameter_record_name(M.nth(M.MethodParameter, method_parameter_records(vm, method), index)), index)
+
+def parameter_flags(+vm: M.VM, +method: M.LoadedMethod, +index: U32) -> U32:
+  parameter_record_flags(M.nth(M.MethodParameter, method_parameter_records(vm, method), index))
+
+def parameter_element(+index: U32, result: Result<&2, &2, String, O.Outcome>) -> Result<&2, &2, String, O.Outcome>:
+  match result:
+    case Fail{error}: Fail{error}
+    case Done{O.Returned{+vm, Some{array}}}:
+      do Result<&2, &2, String, O.Outcome>:
+        +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(array))
+        slot : M.Slot <- S.require(M.Slot, M.nth(M.Slot, entry_values(entry), index), "java/lang/ArrayIndexOutOfBoundsException")
+        result : O.Outcome <- returned(vm, Some{slot})
+        return result
+    case Done{other}: Done{other}
+
+def annotations_or_empty(found: Maybe<&2, +List<M.Annotation>>) -> +List<M.Annotation>:
+  match found:
+    case None{}: Nil{}
+    case Some{values}: values
+
+# Parameter annotations are aligned to the end of the parameter list, as the
+# JDK does when javac omits entries for implicit leading parameters.
+def parameter_annotation_list(+lists: +List<+List<M.Annotation>>, +index: U32, +count: U32) -> +List<M.Annotation>:
+  +length : U32 = M.length(+List<M.Annotation>, lists)
+  +offset : U32 = Bool.pick(U32, U32.is_lt(length, count), U32.sub(count, length), 0)
+  Bool.pick(+List<M.Annotation>, U32.is_lt(index, offset), Nil{},
+    annotations_or_empty(M.nth(+List<M.Annotation>, lists, U32.sub(index, offset))))
+
+def parameter_scope(source: AnnotationMetadataRef, +index: U32, +count: U32) -> AnnotationMetadataRef:
+  match source:
+    case AnnotationMetadataRef{vm, pool, metadata}:
+      AnnotationMetadataRef{vm, pool, M.AnnotationMetadata{0, Nil{}, parameter_annotation_list(metadata_parameters(metadata), index, count), Nil{}, Nil{}, None{}, Nil{}, Nil{}, Nil{}}}
+
+def parameter_annotations(+vm: M.VM, +method: M.LoadedMethod, +index: U32) -> Result<&2, &2, String, AnnotationMetadataRef>:
+  do Result<&2, &2, String, AnnotationMetadataRef>:
+    source : AnnotationMetadataRef <- method_annotation_source(vm, method)
+    return parameter_scope(source, index, method_parameter_count(method))
+
+def parameter_hash(+index: U32, result: Result<&2, &2, String, O.Outcome>) -> Result<&2, &2, String, O.Outcome>:
+  match result:
+    case Done{O.Returned{+vm, Some{hash}}}: int_out(vm, U32.xor(bits_of(hash), index))
+    case other: other
+
+def executable_hash(+constructor: Bool, +vm: M.VM, +executable: U32) -> Result<&2, &2, String, O.Outcome>:
+  match constructor:
+    case True{}: reflect_constructor_hash(vm, [M.Slot{3, executable}])
+    case False{}: reflect_method_hash(vm, [M.Slot{3, executable}])
+
+def parameter_member(entry: M.HeapEntry) -> U32:
+  bits_of(reflect_binding_slot(H.binding_find(entry_fields(entry), 1)))
+
+def parameter_owner(entry: M.HeapEntry) -> U32:
+  bits_of(reflect_binding_slot(H.binding_find(entry_fields(entry), 0)))
+
+# Parameter.equals: same executable (same member of the same reflection kind)
+# and same index.
+def executables_equal_entries(mine: Result<&2, &2, String, M.HeapEntry>, theirs: Result<&2, &2, String, M.HeapEntry>) -> Bool:
+  match mine theirs:
+    case Done{+a} Done{+b}:
+      U32.is_eq(H.entry_class(a), H.entry_class(b)) && U32.is_eq(parameter_member(a), parameter_member(b)) && U32.is_eq(parameter_owner(a), parameter_owner(b))
+    case _ _: False{}
+
+def executables_equal(+vm: M.VM, +executable: U32, +other: U32) -> Bool:
+  executables_equal_entries(H.get(S.heap(vm), executable), H.get(S.heap(vm), other))
+
+def parameter_equal_entry(found: Result<&2, &2, String, M.HeapEntry>, +vm: M.VM, +executable: U32, +index: U32) -> Bool:
+  match found:
+    case Fail{error}: False{}
+    case Done{+entry}:
+      U32.is_eq(H.entry_class(entry), class_id(vm, "java/lang/reflect/Parameter")) &&
+        U32.is_eq(parameter_member(entry), index) &&
+          executables_equal(vm, executable, parameter_owner(entry))
+
+def parameter_equal(+vm: M.VM, +executable: U32, +index: U32, +other: U32) -> Bool:
+  parameter_equal_entry(H.get(S.heap(vm), other), vm, executable, index)
+
+type TextAt is Data:
+  TextAt{vm: M.VM, text: String}
+
+def outcome_text(result: Result<&2, &2, String, O.Outcome>) -> Result<&2, &2, String, TextAt>:
+  match result:
+    case Done{O.Returned{+vm, Some{reference}}}:
+      do Result<&2, &2, String, TextAt>:
+        text : String <- string_text(vm, bits_of(reference))
+        return TextAt{vm, text}
+    case Done{other}: Fail{"InvalidState: expected a String result"}
+    case Fail{error}: Fail{error}
+
+def outcome_reference(result: Result<&2, &2, String, O.Outcome>) -> Result<&2, &2, String, ReflectRefs>:
+  match result:
+    case Done{O.Returned{+vm, Some{reference}}}: Done{ReflectRefs{vm, [bits_of(reference)]}}
+    case Done{other}: Fail{"InvalidState: expected a reference result"}
+    case Fail{error}: Fail{error}
+
+def first_ref(+refs: +List<U32>) -> U32:
+  match refs:
+    case Con{reference, rest}: reference
+    case Nil{}: 0
+
+def drop_two(text: String) -> String:
+  match text:
+    case SCon{a, SCon{b, rest}}: rest
+    case _: text
+
+# A varargs parameter prints its last "[]" as "...".
+def varargs_type_name(+name: String) -> String:
+  Bool.pick(String, String.ends_with(name, "[]"), String.reverse(drop_two(String.reverse(name))) ++ "...", name)
+
+def modifier_prefix(+flags: U32) -> String:
+  Bool.pick(String, U32.is_ne(U32.and(flags, 16), 0), "final", "") ++ Bool.pick(String, U32.is_ne(flags, 0), " ", "")
+
+def parameter_text(+vm: M.VM, +method: M.LoadedMethod, +index: U32, +type_name: String) -> Result<&2, &2, String, O.Outcome>:
+  +flags : U32 = parameter_flags(vm, method, index)
+  +varargs : Bool = U32.is_ne(U32.and(M.loaded_method_flags(method), 128), 0) && U32.is_eq(index, U32.sub(method_parameter_count(method), 1))
+  +text : String = modifier_prefix(flags) ++ Bool.pick(String, varargs, varargs_type_name(type_name), type_name) ++ " " ++ parameter_name(vm, method, index)
+  intern_or_alloc(vm, units_from_string(text))
+
+def parameter_text_named(found: Result<&2, &2, String, TextAt>, +method: M.LoadedMethod, +index: U32) -> Result<&2, &2, String, O.Outcome>:
+  match found:
+    case Fail{error}: Fail{error}
+    case Done{TextAt{+vm, +type_name}}: parameter_text(vm, method, index, type_name)
+
+def parameter_text_typed(found: Result<&2, &2, String, ReflectRefs>, +method: M.LoadedMethod, +index: U32) -> Result<&2, &2, String, O.Outcome>:
+  match found:
+    case Fail{error}: Fail{error}
+    case Done{ReflectRefs{+vm, refs}}: parameter_text_named(outcome_text(type_get_type_name(vm, [M.Slot{3, first_ref(refs)}])), method, index)
+
+# Parameter.toString: modifiers, the generic type name (varargs as "..."), and the name.
+def parameter_to_string(+vm: M.VM, +method: M.LoadedMethod, +index: U32) -> Result<&2, &2, String, O.Outcome>:
+  parameter_text_typed(outcome_reference(parameter_element(index, reflect_member_generic_parameter_types(vm, method))), method, index)
+
+def parameter_query(+op: U32, +vm: M.VM, +executable: U32, +index: U32, +method: M.LoadedMethod, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  match op:
+    case 466: intern_or_alloc(vm, units_from_string(parameter_name(vm, method, index)))
+    case 467: bool_out(vm, Bool.not(String.is_empty(parameter_record_name(M.nth(M.MethodParameter, method_parameter_records(vm, method), index)))))
+    case 468: int_out(vm, parameter_flags(vm, method, index))
+    case 469: bool_out(vm, U32.is_ne(U32.and(parameter_flags(vm, method, index), 32768), 0))
+    case 470: bool_out(vm, U32.is_ne(U32.and(parameter_flags(vm, method, index), 4096), 0))
+    case 471: bool_out(vm, U32.is_ne(U32.and(M.loaded_method_flags(method), 128), 0) && U32.is_eq(index, U32.sub(method_parameter_count(method), 1)))
+    case 472: parameter_element(index, reflect_member_parameter_types(vm, method))
+    case 473: parameter_element(index, reflect_member_generic_parameter_types(vm, method))
+    case 474: ref_out(vm, executable)
+    case 475:
+      do Result<&2, &2, String, O.Outcome>:
+        source : AnnotationMetadataRef <- parameter_annotations(vm, method, index)
+        result : O.Outcome <- class_annotations_array_from(source)
+        return result
+    case 476:
+      do Result<&2, &2, String, O.Outcome>:
+        source : AnnotationMetadataRef <- parameter_annotations(vm, method, index)
+        result : O.Outcome <- class_annotations_array_from(source)
+        return result
+    case 477:
+      do Result<&2, &2, String, O.Outcome>:
+        +name : String <- reflect_annotation_name(vm, args)
+        source : AnnotationMetadataRef <- parameter_annotations(vm, method, index)
+        result : O.Outcome <- class_annotation_one_from(source, name)
+        return result
+    case 478:
+      do Result<&2, &2, String, O.Outcome>:
+        +name : String <- reflect_annotation_name(vm, args)
+        source : AnnotationMetadataRef <- parameter_annotations(vm, method, index)
+        result : O.Outcome <- class_annotation_one_from(source, name)
+        return result
+    case 479:
+      do Result<&2, &2, String, O.Outcome>:
+        +name : String <- reflect_annotation_name(vm, args)
+        source : AnnotationMetadataRef <- parameter_annotations(vm, method, index)
+        result : O.Outcome <- reflect_annotation_present_source(vm, source, name)
+        return result
+    case 480:
+      do Result<&2, &2, String, O.Outcome>:
+        +name : String <- reflect_annotation_name(vm, args)
+        source : AnnotationMetadataRef <- parameter_annotations(vm, method, index)
+        result : O.Outcome <- annotation_arrays_by_type_from(source, name)
+        return result
+    case 481:
+      do Result<&2, &2, String, O.Outcome>:
+        +name : String <- reflect_annotation_name(vm, args)
+        source : AnnotationMetadataRef <- parameter_annotations(vm, method, index)
+        result : O.Outcome <- annotation_arrays_by_type_from(source, name)
+        return result
+    case 482:
+      do Result<&2, &2, String, O.Outcome>:
+        +other : M.Slot <- slot1(args)
+        result : O.Outcome <- bool_out(vm, U32.is_ne(bits_of(other), 0) && parameter_equal(vm, executable, index, bits_of(other)))
+        return result
+    case 483:
+      do Result<&2, &2, String, O.Outcome>:
+        +entry : M.HeapEntry <- H.get(S.heap(vm), executable)
+        result : O.Outcome <- parameter_hash(index, executable_hash(executable_is_constructor(vm, entry), vm, executable))
+        return result
+    case 484: parameter_to_string(vm, method, index)
+    case _: Fail{"InvalidState: unknown Parameter operation"}
+
+def parameter_dispatch(+op: U32, +vm: M.VM, parts: ParameterParts, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  match parts:
+    case ParameterParts{+executable, +index}:
+      do Result<&2, &2, String, O.Outcome>:
+        +method : M.LoadedMethod <- executable_method(vm, executable)
+        result : O.Outcome <- parameter_query(op, vm, executable, index, method, args)
+        return result
+
+def parameter_intrinsic(+op: U32, +vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    parts : ParameterParts <- parameter_parts(vm, args)
+    result : O.Outcome <- parameter_dispatch(op, vm, parts, args)
+    return result
+
+# ---- Comparable.compareTo and the static compare methods (JDK semantics) ----
+
+def int_signed_less(+a: U32, +b: U32) -> Bool:
+  U32.is_lt(U32.xor(a, 2147483648), U32.xor(b, 2147483648))
+
+def int_compare(+a: U32, +b: U32) -> U32:
+  Bool.pick(U32, int_signed_less(a, b), 4294967295, Bool.pick(U32, U32.is_eq(a, b), 0, 1))
+
+# Float.compare: numeric order with -0.0 < 0.0 and NaN above everything.
+def float_key(+bits: U32) -> U32:
+  +magnitude : U32 = U32.and(bits, 2147483647)
+  Bool.pick(U32, U32.is_ne(U32.and(bits, 2147483648), 0), U32.sub(0, magnitude), magnitude)
+
+def float_canonical(+bits: U32) -> U32:
+  Bool.pick(U32, U32.is_lt(2139095040, U32.and(bits, 2147483647)), 2143289344, bits)
+
+def float_compare(+a: U32, +b: U32) -> U32:
+  +ka : U32 = float_canonical(a)
+  +kb : U32 = float_canonical(b)
+  +nan : Bool = U32.is_lt(2139095040, U32.and(a, 2147483647)) || U32.is_lt(2139095040, U32.and(b, 2147483647))
+  +ordered : U32 = int_compare(float_key(a), float_key(b))
+  Bool.pick(U32, nan || U32.is_eq(ordered, 0), int_compare(ka, kb), ordered)
+
+def double_canonical(+value: W.Words) -> W.Words:
+  Bool.pick(W.Words, B64.double_is_nan(value), W.Words{2146959360, 0}, value)
+
+# Double.compare: as Float.compare, on doubleToLongBits after numeric order.
+def double_compare(+a: W.Words, +b: W.Words) -> U32:
+  +nan : Bool = B64.double_is_nan(a) || B64.double_is_nan(b)
+  +ordered : U32 = B64.compare_ordered(a, b)
+  Bool.pick(U32, nan || U32.is_eq(ordered, 0), W.long_cmp(double_canonical(a), double_canonical(b)), ordered)
+
+@unsafe def units_compare_hit(+same: Bool, +x: U32, +y: U32, +xs: +List<U32>, +ys: +List<U32>) -> U32:
+  match same:
+    case True{}: units_compare(xs, ys)
+    case False{}: U32.sub(x, y)
+
+# String.compareTo: the first differing UTF-16 unit, else the length difference.
+@unsafe def units_compare(+a: +List<U32>, +b: +List<U32>) -> U32:
+  match a b:
+    case Nil{} Nil{}: 0
+    case Nil{} rest: U32.sub(0, M.length(U32, rest))
+    case rest Nil{}: M.length(U32, rest)
+    case Con{x, xs} Con{y, ys}: units_compare_hit(U32.is_eq(x, y), x, y, xs, ys)
+
+def compare_class_name(+kind: U32) -> String:
+  match kind:
+    case 485: "java/lang/Integer"
+    case 486: "java/lang/Short"
+    case 487: "java/lang/Byte"
+    case 488: "java/lang/Character"
+    case 489: "java/lang/Boolean"
+    case 490: "java/lang/Long"
+    case 491: "java/lang/Double"
+    case 492: "java/lang/Float"
+    case _: "java/lang/String"
+
+def compare_source(+kind: U32) -> U32:
+  match kind:
+    case 490: 74
+    case 491: 68
+    case 492: 70
+    case _: 73
+
+def compare_slots(+kind: U32, +vm: M.VM, +left: M.Slot, +right: M.Slot) -> Result<&2, &2, String, U32>:
+  match kind:
+    case 490:
+      do Result<&2, &2, String, U32>:
+        +a : W.Words <- wide_words(left, 4)
+        +b : W.Words <- wide_words(right, 4)
+        return W.long_cmp(a, b)
+    case 491:
+      do Result<&2, &2, String, U32>:
+        +a : W.Words <- wide_words(left, 5)
+        +b : W.Words <- wide_words(right, 5)
+        return double_compare(a, b)
+    case 492: Done{float_compare(bits_of(left), bits_of(right))}
+    case 485: Done{int_compare(bits_of(left), bits_of(right))}
+    case 489: Done{int_compare(bits_of(left), bits_of(right))}
+    case _: Done{U32.sub(bits_of(left), bits_of(right))}
+
+def compare_wrappers(+kind: U32, +vm: M.VM, +left: M.HeapEntry, +right: M.HeapEntry) -> Result<&2, &2, String, U32>:
+  do Result<&2, &2, String, U32>:
+    +a : M.Slot <- wrapper_value_slot(vm, left, compare_source(kind))
+    +b : M.Slot <- wrapper_value_slot(vm, right, compare_source(kind))
+    result : U32 <- compare_slots(kind, vm, a, b)
+    return result
+
+def compare_entries(+string: Bool, +kind: U32, +vm: M.VM, +left: M.HeapEntry, +right: M.HeapEntry) -> Result<&2, &2, String, U32>:
+  match string:
+    case True{}:
+      do Result<&2, &2, String, U32>:
+        +a : +List<U32> <- string_chars_entry(left)
+        +b : +List<U32> <- string_chars_entry(right)
+        return units_compare(a, b)
+    case False{}: compare_wrappers(kind, vm, left, right)
+
+# compareTo(T) and its compareTo(Object) bridge: null throws NullPointerException,
+# another class throws ClassCastException (the bridge's checkcast).
+def comparable_compare(+vm: M.VM, +args: +List<M.Slot>, +kind: U32) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    receiver : M.Slot <- slot0(args)
+    +other : M.Slot <- slot1(args)
+    present : Unit <- S.check(U32.is_ne(bits_of(other), 0), npe())
+    +left : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
+    +right : M.HeapEntry <- H.get(S.heap(vm), bits_of(other))
+    +expected : String = compare_class_name(kind)
+    same : Unit <- S.check(U32.is_eq(H.entry_class(right), class_id(vm, expected)), "java/lang/ClassCastException: " ++ internal_to_binary(class_name_text(vm, H.entry_class(right))) ++ " cannot be cast to " ++ internal_to_binary(expected))
+    value : U32 <- compare_entries(U32.is_eq(kind, 493), kind, vm, left, right)
+    result : O.Outcome <- int_out(vm, value)
+    return result
+
+# Integer/Long/Double/Float.compare(x, y).
+def static_compare(+vm: M.VM, +args: +List<M.Slot>, +kind: U32) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +left : M.Slot <- slot0(args)
+    +right : M.Slot <- slot1(args)
+    value : U32 <- compare_slots(Bool.pick(U32, U32.is_eq(kind, 494), 485, Bool.pick(U32, U32.is_eq(kind, 495), 490, Bool.pick(U32, U32.is_eq(kind, 496), 491, 492))), vm, left, right)
+    result : O.Outcome <- int_out(vm, value)
+    return result
+
+# ---- Nested-class reflection: InnerClasses and EnclosingMethod (JDK 8 Class) ----
+
+def nesting_found(found: Result<&2, &2, String, M.ClassMetadata>) -> M.Nesting:
+  match found:
+    case Fail{error}: M.empty_nesting()
+    case Done{M.ClassMetadata{owner, flags, metadata, visibleAnnotations, pool, signature, nesting, source}}: nesting
+
+def class_nesting_of(+vm: M.VM, +id: U32) -> M.Nesting:
+  nesting_found(class_metadata_value(vm, id))
+
+def nesting_entries(+value: M.Nesting) -> +List<M.InnerClass>:
+  match value:
+    case M.Nesting{inner, enclosingClass, method, descriptor}: inner
+
+def nesting_enclosing_class(+value: M.Nesting) -> String:
+  match value:
+    case M.Nesting{inner, enclosingClass, method, descriptor}: enclosingClass
+
+def nesting_method(+value: M.Nesting) -> String:
+  match value:
+    case M.Nesting{inner, enclosingClass, method, descriptor}: method
+
+def nesting_descriptor(+value: M.Nesting) -> String:
+  match value:
+    case M.Nesting{inner, enclosingClass, method, descriptor}: descriptor
+
+def own_outer(+entries: +List<M.InnerClass>, +name: String) -> String:
+  match entries:
+    case Nil{}: ""
+    case Con{M.InnerClass{inner, outer, simple, flags}, rest}:
+      Bool.pick(String, String.eq(inner, name), outer, own_outer(rest, name))
+
+# Class.getDeclaringClass: the outer class recorded for a member class.
+def declaring_name(+vm: M.VM, +id: U32) -> String:
+  own_outer(nesting_entries(class_nesting_of(vm, id)), class_name_text(vm, id))
+
+def local_or_anonymous(+vm: M.VM, +id: U32) -> Bool:
+  Bool.not(String.is_empty(nesting_enclosing_class(class_nesting_of(vm, id))))
+
+# Class.getEnclosingClass: the EnclosingMethod class, else the declaring class.
+def enclosing_name(+vm: M.VM, +id: U32) -> String:
+  +declared : String = nesting_enclosing_class(class_nesting_of(vm, id))
+  Bool.pick(String, String.is_empty(declared), declaring_name(vm, id), declared)
+
+def drop_prefix_length(+text: String, +prefix: String) -> String:
+  match text prefix:
+    case SCon{a, rest} SCon{b, more}: drop_prefix_length(rest, more)
+    case rest _: rest
+
+def drop_digits(+text: String) -> String:
+  match text:
+    case SCon{c, rest}: Bool.pick(String, U32.is_le(48, Char.to_u32(c)) && U32.is_le(Char.to_u32(c), 57), drop_digits(rest), text)
+    case SNil{}: ""
+
+def strip_binary_prefix(+simple: String) -> String:
+  match simple:
+    case SCon{Chr{36}, rest}: drop_digits(rest)
+    case other: other
+
+def last_segment(+text: String, +acc: String) -> String:
+  match text:
+    case SNil{}: acc
+    case SCon{Chr{47}, rest}: last_segment(rest, "")
+    case SCon{c, rest}: last_segment(rest, acc ++ Char.show(c))
+
+def primitive_descriptor_name(+descriptor: String) -> String:
+  match descriptor:
+    case "Z": "boolean"
+    case "B": "byte"
+    case "C": "char"
+    case "S": "short"
+    case "I": "int"
+    case "J": "long"
+    case "F": "float"
+    case "D": "double"
+    case "V": "void"
+    case other: ""
+
+# Class.getSimpleName (JDK 8): arrays add "[]"; top-level classes keep the
+# last name segment; nested classes drop the enclosing class name and any
+# leading "$digits" (so anonymous classes have an empty simple name).
+@unsafe def simple_name(+fuel: Nat, +vm: M.VM, +name: String) -> String:
+  match fuel name:
+    case 0n _: ""
+    case 1n+p SCon{Chr{91}, rest}: simple_component(p, vm, rest) ++ "[]"
+    case 1n+p _: simple_named(vm, name, enclosing_name(vm, class_id(vm, name)))
+
+def simple_named(+vm: M.VM, +name: String, +enclosing: String) -> String:
+  Bool.pick(String, String.is_empty(enclosing), last_segment(name, ""), strip_binary_prefix(drop_prefix_length(name, enclosing)))
+
+@unsafe def simple_component(+fuel: Nat, +vm: M.VM, +descriptor: String) -> String:
+  match descriptor:
+    case SCon{Chr{76}, rest}: simple_name(fuel, vm, CL.take_until_semicolon(rest, ""))
+    case SCon{Chr{91}, rest}: simple_name(fuel, vm, descriptor)
+    case other: primitive_descriptor_name(other)
+
+# Class.getCanonicalName: None for local and anonymous classes (and arrays of them).
+@unsafe def canonical_name(+fuel: Nat, +vm: M.VM, +name: String) -> Maybe<&2, String>:
+  match fuel name:
+    case 0n _: None{}
+    case 1n+p SCon{Chr{91}, rest}: canonical_suffix(canonical_component(p, vm, rest))
+    case 1n+p _: canonical_class(p, vm, name, class_id(vm, name))
+
+def canonical_suffix(found: Maybe<&2, String>) -> Maybe<&2, String>:
+  match found:
+    case None{}: None{}
+    case Some{text}: Some{text ++ "[]"}
+
+@unsafe def canonical_component(+fuel: Nat, +vm: M.VM, +descriptor: String) -> Maybe<&2, String>:
+  match descriptor:
+    case SCon{Chr{76}, rest}: canonical_name(fuel, vm, CL.take_until_semicolon(rest, ""))
+    case SCon{Chr{91}, rest}: canonical_name(fuel, vm, descriptor)
+    case other: Some{primitive_descriptor_name(other)}
+
+@unsafe def canonical_local(local: Bool, +fuel: Nat, +vm: M.VM, +name: String, +id: U32) -> Maybe<&2, String>:
+  match local:
+    case True{}: None{}
+    case False{}: canonical_enclosed(fuel, vm, name, enclosing_name(vm, id))
+
+@unsafe def canonical_class(+fuel: Nat, +vm: M.VM, +name: String, +id: U32) -> Maybe<&2, String>:
+  canonical_local(local_or_anonymous(vm, id), fuel, vm, name, id)
+
+@unsafe def canonical_top(top: Bool, +fuel: Nat, +vm: M.VM, +name: String, +enclosing: String) -> Maybe<&2, String>:
+  match top:
+    case True{}: Some{internal_to_binary(name)}
+    case False{}: canonical_join(canonical_name(fuel, vm, enclosing), simple_name(fuel, vm, name))
+
+@unsafe def canonical_enclosed(+fuel: Nat, +vm: M.VM, +name: String, +enclosing: String) -> Maybe<&2, String>:
+  canonical_top(String.is_empty(enclosing), fuel, vm, name, enclosing)
+
+def canonical_join(found: Maybe<&2, String>, +simple: String) -> Maybe<&2, String>:
+  match found:
+    case None{}: None{}
+    case Some{text}: Some{text ++ "." ++ simple}
+
+def optional_string_out(+vm: M.VM, found: Maybe<&2, String>) -> Result<&2, &2, String, O.Outcome>:
+  match found:
+    case None{}: ref_out(vm, 0)
+    case Some{text}: intern_or_alloc(vm, units_from_string(text))
+
+def class_named_out(+vm: M.VM, +name: String) -> Result<&2, &2, String, O.Outcome>:
+  +id : U32 = class_id(vm, name)
+  Bool.pick(Result<&2, &2, String, O.Outcome>, String.is_empty(name) || U32.is_eq(id, 4294967295), ref_out(vm, 0), class_mirror_out(vm, id))
+
+def method_named(+vm: M.VM, +values: +List<M.LoadedMethod>, +owner: U32, +name: String, +descriptor: String) -> Maybe<&2, M.LoadedMethod>:
+  match values:
+    case Nil{}: None{}
+    case Con{+method, rest}:
+      Bool.pick(Maybe<&2, M.LoadedMethod>,
+        U32.is_eq(M.loaded_method_owner(method), owner) && String.eq(Sy.text(S.symbols(vm), M.loaded_method_name(method)), name) && String.eq(Sy.text(S.symbols(vm), M.loaded_method_descriptor(method)), descriptor),
+        Some{method}, method_named(vm, rest, owner, name, descriptor))
+
+def enclosing_member_out(+vm: M.VM, +constructor: Bool, found: Maybe<&2, M.LoadedMethod>) -> Result<&2, &2, String, O.Outcome>:
+  match found:
+    case None{}: ref_out(vm, 0)
+    case Some{+method}:
+      Bool.pick(Result<&2, &2, String, O.Outcome>, constructor, reflect_constructor_one(vm, M.loaded_method_owner(method), method), reflect_method_one(vm, M.loaded_method_owner(method), method))
+
+# Class.getEnclosingMethod/getEnclosingConstructor from EnclosingMethod.
+def enclosing_member(+vm: M.VM, +id: U32, +constructor: Bool) -> Result<&2, &2, String, O.Outcome>:
+  +nesting : M.Nesting = class_nesting_of(vm, id)
+  +method : String = nesting_method(nesting)
+  +wanted : Bool = Bool.not(String.is_empty(method)) && U32.is_eq(Bool.to_u32(String.eq(method, "<init>")), Bool.to_u32(constructor))
+  +owner : U32 = class_id(vm, nesting_enclosing_class(nesting))
+  Bool.pick(Result<&2, &2, String, O.Outcome>, wanted && U32.is_ne(owner, 4294967295),
+    enclosing_member_out(vm, constructor, method_named(vm, S.methods(vm), owner, method, nesting_descriptor(nesting))),
+    ref_out(vm, 0))
+
+def member_names(+entries: +List<M.InnerClass>, +owner: String) -> +List<String>:
+  match entries:
+    case Nil{}: Nil{}
+    case Con{M.InnerClass{inner, outer, simple, flags}, rest}:
+      +tail = member_names(rest, owner)
+      Bool.pick(+List<String>, String.eq(outer, owner) && Bool.not(String.eq(inner, owner)), Con{inner, tail}, tail)
+
+def loaded_ids(+vm: M.VM, +names: +List<String>) -> +List<U32>:
+  match names:
+    case Nil{}: Nil{}
+    case Con{name, rest}:
+      +id : U32 = class_id(vm, name)
+      +tail = loaded_ids(vm, rest)
+      Bool.pick(+List<U32>, U32.is_eq(id, 4294967295), tail, Con{id, tail})
+
+def declared_class_ids(+vm: M.VM, +id: U32) -> +List<U32>:
+  loaded_ids(vm, member_names(nesting_entries(class_nesting_of(vm, id)), class_name_text(vm, id)))
+
+def inner_flags(+entries: +List<M.InnerClass>, +name: String) -> U32:
+  match entries:
+    case Nil{}: 0
+    case Con{M.InnerClass{inner, outer, simple, flags}, rest}:
+      Bool.pick(U32, String.eq(inner, name), flags, inner_flags(rest, name))
+
+def public_member_ids(+vm: M.VM, +ids: +List<U32>, +owner: U32) -> +List<U32>:
+  match ids:
+    case Nil{}: Nil{}
+    case Con{+id, rest}:
+      +tail = public_member_ids(vm, rest, owner)
+      +flags : U32 = inner_flags(nesting_entries(class_nesting_of(vm, owner)), class_name_text(vm, id))
+      Bool.pick(+List<U32>, U32.is_ne(U32.and(flags, 1), 0), Con{id, tail}, tail)
+
+def class_parent_of(found: Maybe<&2, M.LoadedClass>) -> U32:
+  match found:
+    case None{}: 4294967295
+    case Some{class}: M.loaded_class_parent(class)
+
+def loaded_parent_id(+vm: M.VM, +id: U32) -> U32:
+  class_parent_of(M.nth(M.LoadedClass, S.classes(vm), id))
+
+# Class.getClasses: public member classes of the class and its superclasses.
+@unsafe def public_classes(+fuel: Nat, +vm: M.VM, +id: U32) -> +List<U32>:
+  match fuel id:
+    case 0n _: Nil{}
+    case _ 4294967295: Nil{}
+    case 1n+p _: M.append(U32, public_member_ids(vm, declared_class_ids(vm, id), id), public_classes(p, vm, loaded_parent_id(vm, id)))
+
+@unsafe def mirror_refs(+vm: M.VM, +ids: +List<U32>, +acc: +List<U32>) -> Result<&2, &2, String, ReflectRefs>:
+  match ids:
+    case Nil{}: Done{ReflectRefs{vm, M.reverse(U32, acc)}}
+    case Con{id, rest}: mirror_refs_next(class_mirror_out(vm, id), rest, acc)
+
+@unsafe def mirror_refs_next(result: Result<&2, &2, String, O.Outcome>, +ids: +List<U32>, +acc: +List<U32>) -> Result<&2, &2, String, ReflectRefs>:
+  match result:
+    case Done{O.Returned{+vm, Some{mirror}}}: mirror_refs(vm, ids, Con{bits_of(mirror), acc})
+    case Done{other}: Fail{"InvalidState: class mirror"}
+    case Fail{error}: Fail{error}
+
+def class_array_out(result: Result<&2, &2, String, ReflectRefs>) -> Result<&2, &2, String, O.Outcome>:
+  match result:
+    case Fail{error}: Fail{error}
+    case Done{refs}: reflect_refs_array(refs, "[Ljava/lang/Class;", "java/lang/Class")
+
+def nested_query(+op: U32, +vm: M.VM, +id: U32, +name: String) -> Result<&2, &2, String, O.Outcome>:
+  match op:
+    case 498: intern_or_alloc(vm, units_from_string(simple_name(64n, vm, name)))
+    case 499: optional_string_out(vm, canonical_name(64n, vm, name))
+    case 500: class_named_out(vm, enclosing_name(vm, id))
+    case 501: class_named_out(vm, declaring_name(vm, id))
+    case 502: enclosing_member(vm, id, False{})
+    case 503: enclosing_member(vm, id, True{})
+    case 504: bool_out(vm, Bool.not(String.is_empty(enclosing_name(vm, id))) && Bool.not(local_or_anonymous(vm, id)))
+    case 505: bool_out(vm, local_or_anonymous(vm, id) && Bool.not(String.is_empty(simple_name(64n, vm, name))))
+    case 506: bool_out(vm, String.is_empty(simple_name(64n, vm, name)) && Bool.not(String.starts_with(name, "[")))
+    case 507: class_array_out(mirror_refs(vm, declared_class_ids(vm, id), Nil{}))
+    case 508: class_array_out(mirror_refs(vm, public_classes(64n, vm, id), Nil{}))
+    case _: Fail{"InvalidState: unknown nested-class operation"}
+
+def nested_class_intrinsic(+op: U32, +vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +target : U32 <- class_target(vm, args)
+    result : O.Outcome <- nested_query(op, vm, target, class_name_text(vm, target))
+    return result
+
+# ---- Generic declarations: type parameters, bounds, equality (JDK 8 + oracle format) ----
+
+@unsafe def tv_class_name() -> String:
+  "sun/reflect/generics/reflectiveObjects/TypeVariableImpl"
+
+@unsafe def type_kind_name(+name: String) -> U32:
+  match name:
+    case "java/lang/Class": 1
+    case "sun/reflect/generics/reflectiveObjects/ParameterizedTypeImpl": 2
+    case "sun/reflect/generics/reflectiveObjects/TypeVariableImpl": 3
+    case "sun/reflect/generics/reflectiveObjects/WildcardTypeImpl": 4
+    case "sun/reflect/generics/reflectiveObjects/GenericArrayTypeImpl": 5
+    case _: 9
+
+@unsafe def binding_ref(+entry: M.HeapEntry, +index: U32) -> U32:
+  binding_bits(H.binding_find(entry_fields(entry), index))
+
+@unsafe def heap_or_empty(found: Result<&2, &2, String, M.HeapEntry>) -> M.HeapEntry:
+  match found:
+    case Fail{error}: M.HeapEntry{4294967295, 0, 0, Nil{}, Nil{}, Nil{}}
+    case Done{entry}: entry
+
+@unsafe def entry_at(+vm: M.VM, +reference: U32) -> M.HeapEntry:
+  heap_or_empty(H.get(S.heap(vm), reference))
+
+@unsafe def type_kind_at(+vm: M.VM, +reference: U32) -> U32:
+  Bool.pick(U32, U32.is_eq(reference, 0), 0, type_kind_name(class_name_text(vm, H.entry_class(entry_at(vm, reference)))))
+
+@unsafe def chars_at(+vm: M.VM, +reference: U32) -> +List<U32>:
+  entry_chars(entry_at(vm, reference))
+
+@unsafe def units_equal(+a: +List<U32>, +b: +List<U32>) -> Bool:
+  match a b:
+    case Nil{} Nil{}: True{}
+    case Con{x, xs} Con{y, ys}: U32.is_eq(x, y) && units_equal(xs, ys)
+    case _ _: False{}
+
+# Arrays.equals / Arrays.hashCode over Type[] arrays, and the JDK impl classes'
+# structural equals/hashCode (ParameterizedTypeImpl, WildcardTypeImpl,
+# GenericArrayTypeImpl, TypeVariableImpl); Class compares by identity.
+@unsafe def slots_equal(+fuel: Nat, +vm: M.VM, +a: +List<M.Slot>, +b: +List<M.Slot>) -> Bool:
+  match a b:
+    case Nil{} Nil{}: True{}
+    case Con{x, xs} Con{y, ys}: type_equal(fuel, vm, bits_of(x), bits_of(y)) && slots_equal(fuel, vm, xs, ys)
+    case _ _: False{}
+
+@unsafe def arrays_equal(+fuel: Nat, +vm: M.VM, +a: U32, +b: U32) -> Bool:
+  slots_equal(fuel, vm, entry_values(entry_at(vm, a)), entry_values(entry_at(vm, b)))
+
+@unsafe def type_equal_kind(+kind: U32, +fuel: Nat, +vm: M.VM, +a: U32, +b: U32, +left: M.HeapEntry, +right: M.HeapEntry) -> Bool:
+  match kind:
+    case 2: U32.is_eq(binding_ref(left, 0), binding_ref(right, 0)) && type_equal(fuel, vm, binding_ref(left, 2), binding_ref(right, 2)) && arrays_equal(fuel, vm, binding_ref(left, 1), binding_ref(right, 1))
+    case 3: U32.is_eq(binding_ref(left, 1), binding_ref(right, 1)) && U32.is_eq(binding_ref(left, 2), binding_ref(right, 2)) && units_equal(chars_at(vm, binding_ref(left, 0)), chars_at(vm, binding_ref(right, 0)))
+    case 4: arrays_equal(fuel, vm, binding_ref(left, 0), binding_ref(right, 0)) && arrays_equal(fuel, vm, binding_ref(left, 1), binding_ref(right, 1))
+    case 5: type_equal(fuel, vm, binding_ref(left, 0), binding_ref(right, 0))
+    case _: U32.is_eq(a, b)
+
+@unsafe def type_equal_go(+same: Bool, +fuel: Nat, +vm: M.VM, +a: U32, +b: U32) -> Bool:
+  match same:
+    case True{}: True{}
+    case False{}:
+      +kind : U32 = type_kind_at(vm, a)
+      U32.is_eq(kind, type_kind_at(vm, b)) && U32.is_ne(kind, 0) && U32.is_ne(kind, 1) && type_equal_kind(kind, fuel, vm, a, b, entry_at(vm, a), entry_at(vm, b))
+
+@unsafe def type_equal(+fuel: Nat, +vm: M.VM, +a: U32, +b: U32) -> Bool:
+  match fuel:
+    case 0n: False{}
+    case 1n+p: type_equal_go(U32.is_eq(a, b), p, vm, a, b)
+
+@unsafe def units_hash(+units: +List<U32>) -> U32:
+  string_hash_go(units, 0)
+
+@unsafe def slots_hash(+fuel: Nat, +vm: M.VM, +slots: +List<M.Slot>, +acc: U32) -> U32:
+  match slots:
+    case Nil{}: acc
+    case Con{x, xs}: slots_hash(fuel, vm, xs, U32.add(U32.mul(31, acc), type_hash(fuel, vm, bits_of(x))))
+
+@unsafe def array_hash(+fuel: Nat, +vm: M.VM, +array: U32) -> U32:
+  Bool.pick(U32, U32.is_eq(array, 0), 0, slots_hash(fuel, vm, entry_values(entry_at(vm, array)), 1))
+
+@unsafe def binary_units(+vm: M.VM, +id: U32) -> +List<U32>:
+  units_from_string(internal_to_binary(class_name_text(vm, id)))
+
+# Class.hashCode of a declaration's class, Method.hashCode, or Constructor.hashCode.
+@unsafe def declaration_hash(+vm: M.VM, +kind: U32, +id: U32) -> U32:
+  match kind:
+    case 1: class_identity_hash(vm, id)
+    case _: method_declaration_hash(vm, kind, M.nth(M.LoadedMethod, S.methods(vm), id))
+
+@unsafe def method_declaration_hash(+vm: M.VM, +kind: U32, found: Maybe<&2, M.LoadedMethod>) -> U32:
+  match found:
+    case None{}: 0
+    case Some{+method}:
+      +owner_hash : U32 = units_hash(binary_units(vm, M.loaded_method_owner(method)))
+      Bool.pick(U32, U32.is_eq(kind, 3), owner_hash, U32.xor(owner_hash, units_hash(units_from_string(Sy.text(S.symbols(vm), M.loaded_method_name(method))))))
+
+# Class mirrors hash by the class they mirror (stable without allocating one).
+@unsafe def class_identity_hash(+vm: M.VM, +id: U32) -> U32:
+  id
+
+@unsafe def type_hash_kind(+kind: U32, +fuel: Nat, +vm: M.VM, +reference: U32, +entry: M.HeapEntry) -> U32:
+  match kind:
+    case 0: 0
+    case 1: class_identity_hash(vm, entry_element(entry))
+    case 2: U32.xor(U32.xor(array_hash(fuel, vm, binding_ref(entry, 1)), type_hash(fuel, vm, binding_ref(entry, 2))), class_identity_hash(vm, binding_ref(entry, 0)))
+    case 3: U32.xor(declaration_hash(vm, binding_ref(entry, 1), binding_ref(entry, 2)), units_hash(chars_at(vm, binding_ref(entry, 0))))
+    case 4: U32.xor(array_hash(fuel, vm, binding_ref(entry, 1)), array_hash(fuel, vm, binding_ref(entry, 0)))
+    case 5: type_hash(fuel, vm, binding_ref(entry, 0))
+    case _: reference
+
+@unsafe def type_hash(+fuel: Nat, +vm: M.VM, +reference: U32) -> U32:
+  match fuel:
+    case 0n: 0
+    case 1n+p: type_hash_kind(type_kind_at(vm, reference), p, vm, reference, entry_at(vm, reference))
+
+@unsafe def type_equals_intrinsic(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +receiver : M.Slot <- slot0(args)
+    +other : M.Slot <- slot1(args)
+    +result : O.Outcome <- bool_out(vm, U32.is_ne(bits_of(other), 0) && type_equal(64n, vm, bits_of(receiver), bits_of(other)))
+    return result
+
+@unsafe def type_hash_intrinsic(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +receiver : M.Slot <- slot0(args)
+    +result : O.Outcome <- int_out(vm, type_hash(64n, vm, bits_of(receiver)))
+    return result
+
+@unsafe def type_variable_array(result: Result<&2, &2, String, G.TypeRefs>) -> Result<&2, &2, String, O.Outcome>:
+  match result:
+    case Fail{error}: Fail{error}
+    case Done{G.TypeRefs{+vm, refs}}:
+      alloc_result(H.allocate(vm, H.reference_array_entry(class_id(vm, "[Ljava/lang/reflect/TypeVariable;"), class_id(vm, "java/lang/reflect/TypeVariable"), exception_ref_slots(refs))), vm2 => reference => ref_out(vm2, reference))
+
+@unsafe def declaration_parameters(+vm: M.VM, +params: +List<Sig.TypeParam>, +kind: U32, +id: U32) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +ready : M.VM <- ensure_array_class(vm, "[Ljava/lang/reflect/TypeVariable;")
+    +result : O.Outcome <- type_variable_array(G.type_parameters(ready, params, kind, id))
+    return result
+
+@unsafe def class_type_parameters(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +target : U32 <- class_target(vm, args)
+    +result : O.Outcome <- declaration_parameters(vm, G.class_variables(class_signature(vm, target)), 1, target)
+    return result
+
+@unsafe def executable_type_parameters(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +receiver : M.Slot <- slot0(args)
+    +method : M.LoadedMethod <- executable_method(vm, bits_of(receiver))
+    +result : O.Outcome <- declaration_parameters(vm, G.method_variables(method_signature(vm, method)), method_scope_kind(vm, method), M.loaded_method_id(method))
+    return result
+
+@unsafe def class_generic_interfaces_text(+vm: M.VM, +args: +List<M.Slot>, +target: U32, +text: String) -> Result<&2, &2, String, O.Outcome>:
+  Bool.pick(Result<&2, &2, String, O.Outcome>, String.is_empty(text), class_get_interfaces(vm, args), generic_type_array(class_generic_interfaces(vm, target, text)))
+
+@unsafe def class_generic_interfaces_out(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +target : U32 <- class_target(vm, args)
+    +result : O.Outcome <- class_generic_interfaces_text(vm, args, target, class_signature(vm, target))
+    return result
+
+@unsafe def type_variable_parts(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, M.HeapEntry>:
+  do Result<&2, &2, String, M.HeapEntry>:
+    +receiver : M.Slot <- slot0(args)
+    +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
+    return entry
+
+@unsafe def declaration_member(+vm: M.VM, +kind: U32, found: Maybe<&2, M.LoadedMethod>) -> Result<&2, &2, String, O.Outcome>:
+  match found:
+    case None{}: Fail{"InvalidState: generic declaration"}
+    case Some{+method}:
+      Bool.pick(Result<&2, &2, String, O.Outcome>, U32.is_eq(kind, 3), reflect_constructor_one(vm, M.loaded_method_owner(method), method), reflect_method_one(vm, M.loaded_method_owner(method), method))
+
+# TypeVariable.getGenericDeclaration: the Class, Method or Constructor declaring it.
+@unsafe def type_variable_declaration(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +entry : M.HeapEntry <- type_variable_parts(vm, args)
+    +kind : U32 = binding_ref(entry, 1)
+    +id : U32 = binding_ref(entry, 2)
+    +result : O.Outcome <- Bool.pick(Result<&2, &2, String, O.Outcome>, U32.is_eq(kind, 1), class_mirror_out(vm, id), declaration_member(vm, kind, M.nth(M.LoadedMethod, S.methods(vm), id)))
+    return result
+
+@unsafe def bounds_in_method(+vm: M.VM, found: Maybe<&2, M.LoadedMethod>, +name: String) -> Result<&2, &2, String, G.TypeRefs>:
+  match found:
+    case None{}: Fail{"InvalidState: generic declaration"}
+    case Some{+method}:
+      +params = G.method_variables(method_signature(vm, method))
+      do Result<&2, &2, String, G.TypeRefs>:
+        +ready : M.VM <- ensure_arrays(vm, G.params_arrays(params))
+        +result : G.TypeRefs <- G.bounds_refs(ready, params, name, method_scopes(64n, ready, method))
+        return result
+
+@unsafe def bounds_in_class(+vm: M.VM, +id: U32, +name: String) -> Result<&2, &2, String, G.TypeRefs>:
+  +params = G.class_variables(class_signature(vm, id))
+  do Result<&2, &2, String, G.TypeRefs>:
+    +ready : M.VM <- ensure_arrays(vm, G.params_arrays(params))
+    +result : G.TypeRefs <- G.bounds_refs(ready, params, name, class_scopes(64n, ready, id))
+    return result
+
+@unsafe def type_variable_bounds_of(+vm: M.VM, +entry: M.HeapEntry) -> Result<&2, &2, String, G.TypeRefs>:
+  do Result<&2, &2, String, G.TypeRefs>:
+    +name : String <- string_text(vm, binding_ref(entry, 0))
+    +kind : U32 = binding_ref(entry, 1)
+    +id : U32 = binding_ref(entry, 2)
+    +result : G.TypeRefs <- Bool.pick(Result<&2, &2, String, G.TypeRefs>, U32.is_eq(kind, 1), bounds_in_class(vm, id, name), bounds_in_method(vm, M.nth(M.LoadedMethod, S.methods(vm), id), name))
+    return result
+
+# TypeVariable.getBounds, computed on each call from the declaring signature.
+@unsafe def type_variable_bounds_lazy(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +entry : M.HeapEntry <- type_variable_parts(vm, args)
+    +result : O.Outcome <- generic_type_array(type_variable_bounds_of(vm, entry))
+    return result
+
+# ---- Modifier and the reflection toString/toGenericString renderers ----
+
+@unsafe def modifier_word(+flags: U32, +bit: U32, +word: String) -> String:
+  Bool.pick(String, U32.is_ne(U32.and(flags, bit), 0), word ++ " ", "")
+
+@unsafe def trim_last_space(+text: String) -> String:
+  String.reverse(drop_leading_space(String.reverse(text)))
+
+@unsafe def drop_leading_space(+text: String) -> String:
+  match text:
+    case SCon{Chr{32}, rest}: rest
+    case other: other
+
+# java.lang.reflect.Modifier.toString order.
+@unsafe def modifier_text(+flags: U32) -> String:
+  trim_last_space(modifier_word(flags, 1, "public") ++ modifier_word(flags, 4, "protected") ++ modifier_word(flags, 2, "private") ++
+    modifier_word(flags, 1024, "abstract") ++ modifier_word(flags, 8, "static") ++ modifier_word(flags, 16, "final") ++
+    modifier_word(flags, 128, "transient") ++ modifier_word(flags, 64, "volatile") ++ modifier_word(flags, 32, "synchronized") ++
+    modifier_word(flags, 256, "native") ++ modifier_word(flags, 2048, "strictfp") ++ modifier_word(flags, 512, "interface"))
+
+@unsafe def modifier_prefix_text(+flags: U32) -> String:
+  +text : String = modifier_text(flags)
+  Bool.pick(String, String.is_empty(text), "", text ++ " ")
+
+@unsafe def jvm_type_name(+value: M.JvmType) -> String:
+  match value:
+    case M.Primitive{tag}: primitive_descriptor_name(Char.show(Chr{tag}))
+    case M.ObjectType{name}: internal_to_binary(name)
+    case M.ArrayType{element}: jvm_type_name(element) ++ "[]"
+
+@unsafe def joined_type_names(+values: +List<M.JvmType>) -> String:
+  match values:
+    case Nil{}: ""
+    case Con{value, Nil{}}: jvm_type_name(value)
+    case Con{value, rest}: jvm_type_name(value) ++ "," ++ joined_type_names(rest)
+
+@unsafe def varargs_names(+varargs: Bool, +names: +List<String>) -> +List<String>:
+  match varargs:
+    case False{}: names
+    case True{}: varargs_last(names)
+
+@unsafe def varargs_last(+names: +List<String>) -> +List<String>:
+  match names:
+    case Nil{}: Nil{}
+    case Con{name, Nil{}}: [varargs_type_name(name)]
+    case Con{name, rest}: Con{name, varargs_last(rest)}
+
+@unsafe def join_names(+names: +List<String>, +separator: String) -> String:
+  match names:
+    case Nil{}: ""
+    case Con{name, Nil{}}: name
+    case Con{name, rest}: name ++ separator ++ join_names(rest, separator)
+
+type TextsAt is Data:
+  TextsAt{vm: M.VM, texts: +List<String>}
+
+@unsafe def ref_names(+vm: M.VM, +refs: +List<U32>, +acc: +List<String>) -> Result<&2, &2, String, TextsAt>:
+  match refs:
+    case Nil{}: Done{TextsAt{vm, M.reverse(String, acc)}}
+    case Con{reference, rest}: ref_names_next(outcome_text(type_get_type_name(vm, [M.Slot{3, reference}])), rest, acc)
+
+@unsafe def ref_names_next(found: Result<&2, &2, String, TextAt>, +refs: +List<U32>, +acc: +List<String>) -> Result<&2, &2, String, TextsAt>:
+  match found:
+    case Fail{error}: Fail{error}
+    case Done{TextAt{vm, text}}: ref_names(vm, refs, Con{text, acc})
+
+@unsafe def slot_refs(+values: +List<M.Slot>) -> +List<U32>:
+  match values:
+    case Nil{}: Nil{}
+    case Con{value, rest}: Con{bits_of(value), slot_refs(rest)}
+
+# The type names of a Type[] produced by an intrinsic.
+@unsafe def array_names(result: Result<&2, &2, String, O.Outcome>) -> Result<&2, &2, String, TextsAt>:
+  match result:
+    case Fail{error}: Fail{error}
+    case Done{O.Returned{+vm, Some{array}}}: ref_names(vm, slot_refs(entry_values(entry_at(vm, bits_of(array)))), Nil{})
+    case Done{other}: Fail{"InvalidState: expected a Type[]"}
+
+@unsafe def class_name_texts(+vm: M.VM, +ids: +List<U32>) -> +List<String>:
+  match ids:
+    case Nil{}: Nil{}
+    case Con{id, rest}: Con{internal_to_binary(class_name_text(vm, id)), class_name_texts(vm, rest)}
+
+@unsafe def throws_text(+names: +List<String>) -> String:
+  Bool.pick(String, U32.is_eq(M.length(String, names), 0), "", " throws " ++ join_names(names, ","))
+
+@unsafe def method_interface_default(+vm: M.VM, +method: M.LoadedMethod) -> Bool:
+  U32.is_ne(U32.and(class_flags(vm, M.loaded_method_owner(method)), 512), 0) && U32.is_eq(U32.and(M.loaded_method_flags(method), 1032), 0)
+
+@unsafe def executable_prefix(+vm: M.VM, +method: M.LoadedMethod, +constructor: Bool) -> String:
+  +mask : U32 = Bool.pick(U32, constructor, 7, 3391)
+  modifier_prefix_text(U32.and(M.loaded_method_flags(method), mask)) ++ Bool.pick(String, constructor, "", Bool.pick(String, method_interface_default(vm, method), "default ", ""))
+
+@unsafe def executable_owner_name(+vm: M.VM, +method: M.LoadedMethod) -> String:
+  internal_to_binary(class_name_text(vm, M.loaded_method_owner(method)))
+
+@unsafe def executable_exceptions(+vm: M.VM, +method: M.LoadedMethod) -> Result<&2, &2, String, TextsAt>:
+  do Result<&2, &2, String, TextsAt>:
+    +source : AnnotationMetadataRef <- method_annotation_source(vm, method)
+    +result : TextsAt <- array_names(method_exception_types(source))
+    return result
+
+@unsafe def plain_string_finish(found: Result<&2, &2, String, TextsAt>, +method: M.LoadedMethod, +constructor: Bool, +descriptor: M.Descriptor) -> Result<&2, &2, String, O.Outcome>:
+  match found:
+    case Fail{error}: Fail{error}
+    case Done{TextsAt{+vm, exceptions}}:
+      +owner_name : String = executable_owner_name(vm, method)
+      +head : String = Bool.pick(String, constructor, owner_name, jvm_type_name(D.result_type(descriptor)) ++ " " ++ owner_name ++ "." ++ Sy.text(S.symbols(vm), M.loaded_method_name(method)))
+      intern_or_alloc(vm, units_from_string(executable_prefix(vm, method, constructor) ++ head ++ "(" ++ joined_type_names(D.parameter_types(descriptor)) ++ ")" ++ throws_text(exceptions)))
+
+# Method.toString / Constructor.toString: erased types, as the JDK prints them.
+@unsafe def executable_plain_string(+vm: M.VM, +method: M.LoadedMethod, +constructor: Bool) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +parsed : M.Descriptor <- D.parse_method(Sy.text(S.symbols(vm), M.loaded_method_descriptor(method)))
+    +result : O.Outcome <- plain_string_finish(executable_exceptions(vm, method), method, constructor, parsed)
+    return result
+
+@unsafe def executable_to_string(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +receiver : M.Slot <- slot0(args)
+    +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
+    +method : M.LoadedMethod <- executable_method(vm, bits_of(receiver))
+    +result : O.Outcome <- executable_plain_string(vm, method, executable_is_constructor(vm, entry))
+    return result
+
+@unsafe def field_plain_string(+vm: M.VM, +field: M.LoadedField, +type_name: String) -> Result<&2, &2, String, O.Outcome>:
+  +prefix : String = modifier_prefix_text(U32.and(M.loaded_field_flags(field), 223))
+  +owner_name : String = internal_to_binary(class_name_text(vm, M.loaded_field_owner(field)))
+  intern_or_alloc(vm, units_from_string(prefix ++ type_name ++ " " ++ owner_name ++ "." ++ Sy.text(S.symbols(vm), M.loaded_field_name(field))))
+
+@unsafe def field_to_string(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +field : M.LoadedField <- reflect_field_member(vm, args)
+    +value : M.JvmType <- D.parse_field(Sy.text(S.symbols(vm), M.loaded_field_descriptor(field)))
+    +result : O.Outcome <- field_plain_string(vm, field, jvm_type_name(value))
+    return result
+
+@unsafe def field_generic_named(found: Result<&2, &2, String, TextsAt>, +field: M.LoadedField) -> Result<&2, &2, String, O.Outcome>:
+  match found:
+    case Fail{error}: Fail{error}
+    case Done{TextsAt{+vm, texts}}: field_plain_string(vm, field, join_names(texts, ""))
+
+@unsafe def field_to_generic_string(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +field : M.LoadedField <- reflect_field_member(vm, args)
+    +result : O.Outcome <- field_generic_named(outcome_reference_names(reflect_field_generic_type(vm, args)), field)
+    return result
+
+@unsafe def outcome_reference_names(result: Result<&2, &2, String, O.Outcome>) -> Result<&2, &2, String, TextsAt>:
+  match result:
+    case Done{O.Returned{+vm, Some{reference}}}: ref_names(vm, [bits_of(reference)], Nil{})
+    case Done{other}: Fail{"InvalidState: expected a Type"}
+    case Fail{error}: Fail{error}
+
+# typeVarBounds: a type parameter prints its bounds unless the only bound is Object.
+@unsafe def bound_clause(+name: String, +bounds: +List<String>) -> String:
+  Bool.pick(String, String.eq(join_names(bounds, " & "), "java.lang.Object"), name, name ++ " extends " ++ join_names(bounds, " & "))
+
+@unsafe def type_parameter_texts(+vm: M.VM, +refs: +List<U32>, +acc: +List<String>) -> Result<&2, &2, String, TextsAt>:
+  match refs:
+    case Nil{}: Done{TextsAt{vm, M.reverse(String, acc)}}
+    case Con{reference, rest}:
+      do Result<&2, &2, String, TextsAt>:
+        +name : String <- string_text(vm, binding_ref(entry_at(vm, reference), 0))
+        +result : TextsAt <- type_parameter_next(array_names(generic_type_array(type_variable_bounds_of(vm, entry_at(vm, reference)))), name, rest, acc)
+        return result
+
+@unsafe def type_parameter_next(named: Result<&2, &2, String, TextsAt>, +name: String, +refs: +List<U32>, +acc: +List<String>) -> Result<&2, &2, String, TextsAt>:
+  match named:
+    case Fail{error}: Fail{error}
+    case Done{TextsAt{vm, bounds}}: type_parameter_texts(vm, refs, Con{bound_clause(name, bounds), acc})
+
+@unsafe def type_parameter_block(+names: +List<String>) -> String:
+  Bool.pick(String, U32.is_eq(M.length(String, names), 0), "", "<" ++ join_names(names, ",") ++ "> ")
+
+@unsafe def generic_string_finish(+vm: M.VM, +prefix: String, +header: String, +params: +List<String>, +varargs: Bool, +exceptions: +List<String>) -> Result<&2, &2, String, O.Outcome>:
+  intern_or_alloc(vm, units_from_string(prefix ++ header ++ "(" ++ join_names(varargs_names(varargs, params), ",") ++ ")" ++ throws_text(exceptions)))
+
+@unsafe def generic_exception_names(result: Result<&2, &2, String, TextsAt>) -> Result<&2, &2, String, TextsAt>:
+  result
+
+@unsafe def generic_signature_parameters(+vm: M.VM, +method: M.LoadedMethod) -> Result<&2, &2, String, O.Outcome>:
+  +text : String = method_signature(vm, method)
+  generic_parameters_text(vm, method, text, String.is_empty(text))
+
+@unsafe def generic_signature_exceptions(+vm: M.VM, +method: M.LoadedMethod) -> Result<&2, &2, String, O.Outcome>:
+  +text : String = method_signature(vm, method)
+  generic_exceptions_text(vm, method, text, String.is_empty(text))
+
+@unsafe def generic_signature_return(+vm: M.VM, +method: M.LoadedMethod) -> Result<&2, &2, String, O.Outcome>:
+  +text : String = method_signature(vm, method)
+  generic_return_text(vm, method, Sy.text(S.symbols(vm), M.loaded_method_descriptor(method)), text, String.is_empty(text))
+
+@unsafe def executable_generic_parameters(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +receiver : M.Slot <- slot0(args)
+    +method : M.LoadedMethod <- executable_method(vm, bits_of(receiver))
+    +result : O.Outcome <- generic_signature_parameters(vm, method)
+    return result
+
+@unsafe def executable_generic_exceptions(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +receiver : M.Slot <- slot0(args)
+    +method : M.LoadedMethod <- executable_method(vm, bits_of(receiver))
+    +result : O.Outcome <- generic_signature_exceptions(vm, method)
+    return result
+
+@unsafe def array_refs_of(result: Result<&2, &2, String, O.Outcome>) -> Result<&2, &2, String, ReflectRefs>:
+  match result:
+    case Fail{error}: Fail{error}
+    case Done{O.Returned{+vm, Some{array}}}: Done{ReflectRefs{vm, slot_refs(entry_values(entry_at(vm, bits_of(array))))}}
+    case Done{other}: Fail{"InvalidState: expected an array"}
+
+@unsafe def type_parameter_names(found: Result<&2, &2, String, ReflectRefs>) -> Result<&2, &2, String, TextsAt>:
+  match found:
+    case Fail{error}: Fail{error}
+    case Done{ReflectRefs{+vm, refs}}: type_parameter_texts(vm, refs, Nil{})
+
+@unsafe def generic_stage_finish(found: Result<&2, &2, String, TextsAt>, +method: M.LoadedMethod, +constructor: Bool, +prefix: String, +params: +List<String>, +exceptions: +List<String>) -> Result<&2, &2, String, O.Outcome>:
+  match found:
+    case Fail{error}: Fail{error}
+    case Done{TextsAt{+vm, returned}}:
+      +owner_name : String = executable_owner_name(vm, method)
+      +header : String = Bool.pick(String, constructor, owner_name, join_names(returned, "") ++ " " ++ owner_name ++ "." ++ Sy.text(S.symbols(vm), M.loaded_method_name(method)))
+      intern_or_alloc(vm, units_from_string(prefix ++ header ++ "(" ++ join_names(varargs_names(U32.is_ne(U32.and(M.loaded_method_flags(method), 128), 0), params), ",") ++ ")" ++ throws_text(exceptions)))
+
+@unsafe def generic_return_texts(+vm: M.VM, +method: M.LoadedMethod, +constructor: Bool) -> Result<&2, &2, String, TextsAt>:
+  Bool.pick(Result<&2, &2, String, TextsAt>, constructor, Done{TextsAt{vm, Nil{}}}, outcome_reference_names(generic_signature_return(vm, method)))
+
+@unsafe def generic_stage_exceptions(found: Result<&2, &2, String, TextsAt>, +method: M.LoadedMethod, +constructor: Bool, +prefix: String, +params: +List<String>) -> Result<&2, &2, String, O.Outcome>:
+  match found:
+    case Fail{error}: Fail{error}
+    case Done{TextsAt{+vm, exceptions}}: generic_stage_finish(generic_return_texts(vm, method, constructor), method, constructor, prefix, params, exceptions)
+
+@unsafe def generic_stage_parameters(found: Result<&2, &2, String, TextsAt>, +method: M.LoadedMethod, +constructor: Bool, +prefix: String) -> Result<&2, &2, String, O.Outcome>:
+  match found:
+    case Fail{error}: Fail{error}
+    case Done{TextsAt{+vm, params}}: generic_stage_exceptions(array_names(generic_signature_exceptions(vm, method)), method, constructor, prefix, params)
+
+@unsafe def generic_stage_types(found: Result<&2, &2, String, TextsAt>, +method: M.LoadedMethod, +constructor: Bool) -> Result<&2, &2, String, O.Outcome>:
+  match found:
+    case Fail{error}: Fail{error}
+    case Done{TextsAt{+vm, types}}: generic_stage_parameters(array_names(generic_signature_parameters(vm, method)), method, constructor, executable_prefix(vm, method, constructor) ++ type_parameter_block(types))
+
+# toGenericString in the oracle JDK's format: modifiers, "<T extends B> ", the
+# generic return type and qualified name, generic parameters (varargs as ...),
+# and generic exceptions.
+@unsafe def executable_to_generic_string(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +receiver : M.Slot <- slot0(args)
+    +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
+    +method : M.LoadedMethod <- executable_method(vm, bits_of(receiver))
+    +result : O.Outcome <- generic_stage_types(type_parameter_names(array_refs_of(executable_type_parameters(vm, args))), method, executable_is_constructor(vm, entry))
+    return result
+
+def modifier_test(+vm: M.VM, +args: +List<M.Slot>, +bit: U32) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +flags : M.Slot <- slot0(args)
+    result : O.Outcome <- bool_out(vm, U32.is_ne(U32.and(bits_of(flags), bit), 0))
+    return result
+
+def modifier_string(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +flags : M.Slot <- slot0(args)
+    result : O.Outcome <- intern_or_alloc(vm, units_from_string(modifier_text(bits_of(flags))))
+    return result
+
+# --- Security manager and privileged actions (plan 03, C11) ---
+# There is no security manager, as on JDK 24+ and in an unrestricted Java 8 VM,
+# so privileged actions simply run on the caller's stack.
+
+def security_manager(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  ref_out(vm, 0)
+
+def privileged_run(+vm: M.VM, +action: U32) -> Result<&2, &2, String, M.LoadedMethod>:
+  do Result<&2, &2, String, M.LoadedMethod>:
+    checked : Unit <- S.check(U32.is_ne(action, 0), npe())
+    method : M.LoadedMethod <- S.require(M.LoadedMethod, virtual_on(vm, action, "run", "()Ljava/lang/Object;"), "java/lang/AbstractMethodError")
+    return method
+
+# doPrivileged(PrivilegedAction[, context]): the action's exceptions propagate unchanged.
+def do_privileged(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +action : M.Slot <- slot0(args)
+    method : M.LoadedMethod <- privileged_run(vm, bits_of(action))
+    return O.Call{vm, method, [M.Slot{3, bits_of(action)}]}
+
+# doPrivileged(PrivilegedExceptionAction[, context]): a checked exception leaving
+# run() is wrapped in PrivilegedActionException at the PrivilegedCall boundary.
+def do_privileged_exception(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +action : M.Slot <- slot0(args)
+    method : M.LoadedMethod <- privileged_run(vm, bits_of(action))
+    return O.Call{S.with_effect(vm, M.PrivilegedCall{}), method, [M.Slot{3, bits_of(action)}]}
+
+def access_control_context_alloc(result: Result<&2, &2, String, H.Allocation>) -> Result<&2, &2, String, O.Outcome>:
+  match result:
+    case Fail{error}: Fail{error}
+    case Done{H.Allocation{updated, reference}}: ref_out(updated, reference)
+
+def access_control_context(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  access_control_context_alloc(H.allocate(vm, H.object_entry(class_id(vm, "java/security/AccessControlContext"), Nil{})))
+
+# PrivilegedActionException(Exception) has a null message and the exception as its cause.
+def privileged_exception_init(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +cause : M.Slot <- slot1(args)
+    result : O.Outcome <- throwable_init(vm, args, 0, bits_of(cause), 1)
+    return result
+
+# --- JDK field accessor messages (plan 03, C4) ---
+
+# Field.getType().getName() from a field descriptor.
+@unsafe def field_type_get_name(+descriptor: String) -> String:
+  match descriptor:
+    case SCon{Chr{91}, rest}: class_display_name(descriptor)
+    case SCon{Chr{76}, rest}: internal_to_binary(CL.take_until_semicolon(rest, ""))
+    case other: primitive_descriptor_name(other)
+
+@unsafe def attempted_text(+attempted_type: String, +attempted_value: String) -> String:
+  Bool.pick(String, Bool.not(String.is_empty(attempted_value)), "(" ++ attempted_type ++ ")" ++ attempted_value,
+    Bool.pick(String, Bool.not(String.is_empty(attempted_type)), attempted_type, "null value"))
+
+@unsafe def field_qualified_name(+vm: M.VM, +field: M.LoadedField) -> String:
+  class_display_name(class_name_text(vm, M.loaded_field_owner(field))) ++ "." ++ Sy.text(S.symbols(vm), M.loaded_field_name(field))
+
+# FieldAccessorImpl.getSetMessage.
+@unsafe def field_set_message(+vm: M.VM, +field: M.LoadedField, +attempted_type: String, +attempted_value: String) -> String:
+  +flags : U32 = M.loaded_field_flags(field)
+  "Can not set" ++ Bool.pick(String, U32.is_ne(U32.and(flags, 8), 0), " static", "") ++ Bool.pick(String, U32.is_ne(U32.and(flags, 16), 0), " final", "") ++
+    " " ++ field_type_get_name(Sy.text(S.symbols(vm), M.loaded_field_descriptor(field))) ++ " field " ++ field_qualified_name(vm, field) ++ " to " ++
+    attempted_text(attempted_type, attempted_value)
+
+@unsafe def object_type_name_entry(+vm: M.VM, result: Result<&2, &2, String, M.HeapEntry>) -> String:
+  match result:
+    case Fail{error}: ""
+    case Done{entry}: class_display_name(class_name_text(vm, H.entry_class(entry)))
+
+# The attempted type of a reference value: its class name, or "" for null.
+@unsafe def object_type_name(+vm: M.VM, +reference: U32) -> String:
+  match reference:
+    case 0: ""
+    case +ref: object_type_name_entry(vm, H.get(S.heap(vm), ref))
+
+# ensureObj: an instance field needs a receiver of its declaring class.
+@unsafe def field_receiver_verdict(belongs: Bool, +vm: M.VM, +field: M.LoadedField, +target: U32) -> Result<&2, &2, String, Unit>:
+  match belongs:
+    case True{}: Done{Unit{}}
+    case False{}: Fail{"java/lang/IllegalArgumentException: " ++ field_set_message(vm, field, object_type_name(vm, target), "")}
+
+@unsafe def field_receiver_entry(+vm: M.VM, +field: M.LoadedField, +target: U32, result: Result<&2, &2, String, M.HeapEntry>) -> Result<&2, &2, String, Unit>:
+  match result:
+    case Fail{error}: Fail{error}
+    case Done{entry}: field_receiver_verdict(H.assignable(S.classes(vm), S.symbols(vm), H.entry_class(entry), M.loaded_field_owner(field)), vm, field, target)
+
+@unsafe def field_receiver_instance(+vm: M.VM, +field: M.LoadedField, +target: U32) -> Result<&2, &2, String, Unit>:
+  match target:
+    case 0: Fail{npe()}
+    case +ref: field_receiver_entry(vm, field, ref, H.get(S.heap(vm), ref))
+
+@unsafe def field_receiver_static(static: Bool, +vm: M.VM, +field: M.LoadedField, +target: U32) -> Result<&2, &2, String, Unit>:
+  match static:
+    case True{}: Done{Unit{}}
+    case False{}: field_receiver_instance(vm, field, target)
+
+@unsafe def field_receiver_check(+vm: M.VM, +field: M.LoadedField, +target: U32) -> Result<&2, &2, String, Unit>:
+  field_receiver_static(U32.is_ne(U32.and(M.loaded_field_flags(field), 8), 0), vm, field, target)
+
+@unsafe def field_final_verdict(allowed: Bool, +vm: M.VM, +field: M.LoadedField, +attempted_type: String, +attempted_value: String) -> Result<&2, &2, String, Unit>:
+  match allowed:
+    case True{}: Done{Unit{}}
+    case False{}: Fail{"java/lang/IllegalAccessException: " ++ field_set_message(vm, field, attempted_type, attempted_value)}
+
+# Conversion failures carry the JDK's set message.
+@unsafe def field_convert_message(result: Result<&2, &2, String, M.Slot>, +vm: M.VM, +field: M.LoadedField, +attempted_type: String, +attempted_value: String) -> Result<&2, &2, String, M.Slot>:
+  match result:
+    case Done{value}: Done{value}
+    case Fail{+error}:
+      Bool.pick(Result<&2, &2, String, M.Slot>, String.eq(error, "java/lang/IllegalArgumentException"),
+        Fail{"java/lang/IllegalArgumentException: " ++ field_set_message(vm, field, attempted_type, attempted_value)}, Fail{error})
+
+@unsafe def wide_attempt_value(+value: M.Slot, +source: U32) -> String:
+  match source:
+    case 74: wide_long_text(wide_words(value, 4))
+    case 68: wide_double_text(wide_words(value, 5))
+    case _: ""
+
+@unsafe def wide_long_text(result: Result<&2, &2, String, W.Words>) -> String:
+  match result:
+    case Fail{error}: ""
+    case Done{words}: W.long_show(words)
+
+@unsafe def wide_double_text(result: Result<&2, &2, String, W.Words>) -> String:
+  match result:
+    case Fail{error}: ""
+    case Done{words}: wide_double_show(B64.double_to_string(words))
+
+@unsafe def wide_double_show(result: Result<&2, &2, String, String>) -> String:
+  match result:
+    case Fail{error}: ""
+    case Done{text}: text
+
+@unsafe def source_type_name(+source: U32) -> String:
+  match source:
+    case 74: "long"
+    case 68: "double"
+    case 73: "int"
+    case _: ""
+
+@unsafe def field_type_gate(ok: Bool, raw: O.Outcome) -> Result<&2, &2, String, O.Outcome>:
+  match ok:
+    case True{}: Done{raw}
+    case False{}: Fail{"java/lang/IllegalArgumentException"}
+
+# FieldAccessorImpl.newGetIllegalArgumentException.
+@unsafe def field_get_conversion(result: Result<&2, &2, String, O.Outcome>, +vm: M.VM, +field: M.LoadedField, +target: U32) -> Result<&2, &2, String, O.Outcome>:
+  match result:
+    case Done{outcome}: Done{outcome}
+    case Fail{+error}:
+      Bool.pick(Result<&2, &2, String, O.Outcome>, String.eq(error, "java/lang/IllegalArgumentException"),
+        Fail{"java/lang/IllegalArgumentException: Attempt to get " ++ field_type_get_name(Sy.text(S.symbols(vm), M.loaded_field_descriptor(field))) ++ " field \"" ++ field_qualified_name(vm, field) ++ "\" with illegal data type conversion to " ++ source_type_name(target)}, Fail{error})
+
+# Class.newInstance (Java 8): the nullary declared constructor, checked like
+# Constructor.newInstance, but exceptions from the constructor propagate
+# unwrapped (the HandleConstructor boundary does not wrap them).
+@unsafe def class_new_instance_invoke(+vm: M.VM, +method: M.LoadedMethod, +reference: U32) -> Result<&2, &2, String, O.Outcome>:
+  Done{O.Call{S.with_effect(vm, M.HandleConstructor{reference}), method, [M.Slot{3, reference}]}}
+
+@unsafe def class_new_instance_call(+vm: M.VM, +method: M.LoadedMethod, +owner: U32) -> Result<&2, &2, String, O.Outcome>:
+  alloc_result(H.allocate(vm, H.object_entry(owner, reflect_instance_fields(S.fields(vm), S.classes(vm), owner))), vm2 => reference => class_new_instance_invoke(vm2, method, reference))
+
+@unsafe def class_new_instance(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +target : U32 <- class_target(vm, args)
+    not_class : Unit <- S.check(U32.is_ne(target, class_id(vm, "java/lang/Class")), "java/lang/IllegalAccessException: Can not call newInstance() on the Class for java.lang.Class")
+    +name : String = class_display_name(class_name_text(vm, target))
+    +method : M.LoadedMethod <- S.require(M.LoadedMethod, own_method(S.methods(vm), target, Sy.find(S.symbols(vm), "<init>"), Sy.find(S.symbols(vm), "()V")), "java/lang/InstantiationException: " ++ name)
+    instantiable : Unit <- S.check(constructor_instantiable(vm, target) && Bool.not(primitive_name(class_name_text(vm, target))) && Bool.not(String.starts_with(class_name_text(vm, target), "[")), "java/lang/InstantiationException: " ++ name)
+    checked : Unit <- reflect_constructor_access(vm, False{}, target, M.loaded_method_flags(method))
+    result : O.Outcome <- class_new_instance_call(vm, method, target)
+    return result
+
+def take_until_semicolon_text(+text: String) -> String:
+  CL.take_until_semicolon(text, "")
+
+# The binary name of the outermost class enclosing `target` (by '$' nesting in
+# InnerClasses), used by Java 8 Lookup.in for same-top-level private access.
+@unsafe def outermost_name(+vm: M.VM, +target: U32) -> String:
+  outermost_from(64n, vm, class_name_text(vm, target))
+
+@unsafe def outermost_from(+fuel: Nat, +vm: M.VM, +name: String) -> String:
+  match fuel:
+    case 0n: name
+    case 1n+p:
+      +enclosing : String = enclosing_name(vm, class_id(vm, name))
+      Bool.pick(String, String.is_empty(enclosing), name, outermost_from(p, vm, enclosing))
+
+@unsafe def cast_failure(+vm: M.VM, +reference: U32, +target: String) -> String:
+  "java/lang/ClassCastException: Cannot cast " ++ object_type_name(vm, reference) ++ " to " ++ field_type_get_name(target)
+
+# --- Text joining with Java toString callbacks ---
+# A rendered text is a list of literal units and references whose toString() is
+# user code; text_join concatenates them, calling toString through NeedTextJoin.
+
+@unsafe def text_join(+vm: M.VM, +acc: +List<U32>, +items: +List<M.TextItem>) -> Result<&2, &2, String, O.Outcome>:
+  match items:
+    case Nil{}: intern_or_alloc(vm, acc)
+    case Con{M.TextUnits{units}, rest}: text_join(vm, M.append(U32, acc, units), rest)
+    case Con{M.TextCall{reference}, rest}: text_join_call(vm, acc, reference, rest)
+    case Con{M.TextThrow{reference}, rest}: throw_ref(vm, reference)
+
+@unsafe def text_join_call(+vm: M.VM, +acc: +List<U32>, +reference: U32, +rest: +List<M.TextItem>) -> Result<&2, &2, String, O.Outcome>:
+  match reference:
+    case 0: text_join(vm, M.append(U32, acc, units_from_string("null")), rest)
+    case +ref: call_virtual(push_cont(vm, M.NeedTextJoin{acc, rest}), virtual_on(vm, ref, "toString", "()Ljava/lang/String;"), [M.Slot{3, ref}])
+
+@unsafe def continue_text_join(+vm: M.VM, +acc: +List<U32>, +items: +List<M.TextItem>, +value: M.Slot) -> Result<&2, &2, String, O.Outcome>:
+  continue_text_join_ref(vm, acc, items, bits_of(value))
+
+@unsafe def continue_text_join_ref(+vm: M.VM, +acc: +List<U32>, +items: +List<M.TextItem>, +reference: U32) -> Result<&2, &2, String, O.Outcome>:
+  match reference:
+    case 0: text_join(vm, M.append(U32, acc, units_from_string("null")), items)
+    case +ref:
+      do Result<&2, &2, String, O.Outcome>:
+        +chars : +List<U32> <- string_chars(vm, ref)
+        result : O.Outcome <- text_join(vm, M.append(U32, acc, chars), items)
+        return result
+
+# --- Annotation toString (JDK AnnotationInvocationHandler.toStringImpl) ---
+
+type Rendered is Data:
+  Rendered{vm: M.VM, items: +List<M.TextItem>}
+
+@unsafe def text_of(+text: String) -> M.TextItem:
+  M.TextUnits{units_from_string(text)}
+
+@unsafe def lower_hex_digit(+value: U32) -> String:
+  String.from_list([Chr{Bool.pick(U32, U32.is_lt(value, 10), U32.add(48, value), U32.add(87, value))}])
+
+@unsafe def lower_hex(+value: U32, +digits: Nat) -> String:
+  match digits:
+    case 0n: ""
+    case 1n+p: lower_hex(U32.shrn(value, 4n), p) ++ lower_hex_digit(U32.and(value, 15))
+
+# quote(char): Java escapes; an apostrophe is escaped only as a char literal.
+@unsafe def quote_unit(+unit: U32, +in_string: Bool) -> String:
+  match unit:
+    case 8: "\\b"
+    case 12: "\\f"
+    case 10: "\\n"
+    case 13: "\\r"
+    case 9: "\\t"
+    case 34: "\\\""
+    case 92: "\\\\"
+    case 39: Bool.pick(String, in_string, "'", "\\'")
+    case +other: Bool.pick(String, U32.is_ge(other, 32) && U32.is_le(other, 126), String.from_list([Chr{other}]), "\\u" ++ lower_hex(other, 4n))
+
+@unsafe def quoted_units(+units: +List<U32>) -> String:
+  match units:
+    case Nil{}: ""
+    case Con{+unit, rest}: quote_unit(unit, True{}) ++ quoted_units(rest)
+
+@unsafe def float_source(+bits: U32) -> String:
+  +special : Bool = U32.is_eq(U32.and(bits, 2139095040), 2139095040)
+  +nan : Bool = special && U32.is_ne(U32.and(bits, 8388607), 0)
+  Bool.pick(String, nan, "0.0f/0.0f",
+    Bool.pick(String, special, Bool.pick(String, V.negative(bits), "-1.0f/0.0f", "1.0f/0.0f"), float_text(bits) ++ "f"))
+
+@unsafe def double_source(+words: W.Words) -> String:
+  match words:
+    case W.Words{+high, +low}:
+      +special : Bool = U32.is_eq(U32.and(high, 2146435072), 2146435072)
+      +nan : Bool = special && (U32.is_ne(U32.and(high, 1048575), 0) || U32.is_ne(low, 0))
+      Bool.pick(String, nan, "0.0/0.0",
+        Bool.pick(String, special, Bool.pick(String, V.negative(high), "-1.0/0.0", "1.0/0.0"), wide_double_show(B64.double_to_string(W.Words{high, low}))))
+
+@unsafe def class_source_component(+vm: M.VM, +descriptor: String, +brackets: String) -> String:
+  match descriptor:
+    case SCon{Chr{91}, rest}: class_source_component(vm, rest, brackets ++ "[]")
+    case SCon{Chr{76}, rest}: class_source_named(vm, take_until_semicolon_text(rest)) ++ brackets ++ ".class"
+    case other: primitive_descriptor_name(other) ++ brackets ++ ".class"
+
+@unsafe def class_source_named(+vm: M.VM, +name: String) -> String:
+  class_source_found(canonical_name(64n, vm, name))
+
+@unsafe def class_source_found(found: Maybe<&2, String>) -> String:
+  match found:
+    case Some{text}: text
+    case None{}: "<no canonical name>"
+
+# toSourceString(Class): canonical name, array brackets, then ".class".
+@unsafe def class_source(+vm: M.VM, +target: U32) -> String:
+  +name : String = class_name_text(vm, target)
+  Bool.pick(String, String.starts_with(name, "["), class_source_component(vm, name, ""),
+    Bool.pick(String, primitive_name(name), name ++ ".class", class_source_named(vm, name) ++ ".class"))
+
+@unsafe def mirror_source(+vm: M.VM, +reference: U32) -> Result<&2, &2, String, String>:
+  do Result<&2, &2, String, String>:
+    +entry : M.HeapEntry <- H.get(S.heap(vm), reference)
+    return class_source(vm, entry_element(entry))
+
+@unsafe def enum_constant_name(+vm: M.VM, +reference: U32) -> Result<&2, &2, String, String>:
+  do Result<&2, &2, String, String>:
+    +entry : M.HeapEntry <- H.get(S.heap(vm), reference)
+    +name : String <- string_text(vm, field_bits(entry_fields(entry), 0))
+    return name
+
+@unsafe def enum_overrides_to_string(+vm: M.VM, +reference: U32) -> Bool:
+  enum_override_found(virtual_on(vm, reference, "toString", "()Ljava/lang/String;"), class_id(vm, "java/lang/Enum"))
+
+@unsafe def enum_override_found(found: Maybe<&2, M.LoadedMethod>, +enum_class: U32) -> Bool:
+  match found:
+    case None{}: False{}
+    case Some{method}: U32.is_ne(M.loaded_method_owner(method), enum_class)
+
+@unsafe def rendered_text(+vm: M.VM, +text: Result<&2, &2, String, String>) -> Result<&2, &2, String, Rendered>:
+  match text:
+    case Fail{error}: Fail{error}
+    case Done{value}: Done{Rendered{vm, [text_of(value)]}}
+
+# A non-array enum member prints its toString(); array elements print name().
+@unsafe def render_enum(+vm: M.VM, +reference: U32, +in_array: Bool) -> Result<&2, &2, String, Rendered>:
+  render_enum_select(Bool.not(in_array) && enum_overrides_to_string(vm, reference), vm, reference)
+
+@unsafe def render_enum_select(call: Bool, +vm: M.VM, +reference: U32) -> Result<&2, &2, String, Rendered>:
+  match call:
+    case True{}: Done{Rendered{vm, [M.TextCall{reference}]}}
+    case False{}: rendered_text(vm, enum_constant_name(vm, reference))
+
+@unsafe def render_reference(+vm: M.VM, +descriptor: String, +reference: U32, +in_array: Bool) -> Result<&2, &2, String, Rendered>:
+  match descriptor:
+    case "Ljava/lang/String;":
+      do Result<&2, &2, String, Rendered>:
+        +units : +List<U32> <- string_chars(vm, reference)
+        return Rendered{vm, [text_of("\"" ++ quoted_units(units) ++ "\"")]}
+    case "Ljava/lang/Class;": rendered_text(vm, mirror_source(vm, reference))
+    case _: render_object(vm, reference, in_array)
+
+@unsafe def render_object_entry(+vm: M.VM, +reference: U32, +in_array: Bool, result: Result<&2, &2, String, M.HeapEntry>) -> Result<&2, &2, String, Rendered>:
+  match result:
+    case Fail{error}: Fail{error}
+    case Done{+entry}: render_object_kind(entry_kind(entry), vm, reference, in_array)
+
+@unsafe def render_object_kind(kind: U32, +vm: M.VM, +reference: U32, +in_array: Bool) -> Result<&2, &2, String, Rendered>:
+  match kind:
+    case 9: annotation_render(vm, reference)
+    case _: render_enum(vm, reference, in_array)
+
+@unsafe def render_object(+vm: M.VM, +reference: U32, +in_array: Bool) -> Result<&2, &2, String, Rendered>:
+  render_object_entry(vm, reference, in_array, H.get(S.heap(vm), reference))
+
+@unsafe def render_wide(+descriptor: String, +slot: M.Slot) -> Result<&2, &2, String, String>:
+  match descriptor:
+    case "J":
+      do Result<&2, &2, String, String>:
+        +words : W.Words <- wide_words(slot, 4)
+        return W.long_show(words) ++ "L"
+    case _:
+      do Result<&2, &2, String, String>:
+        +words : W.Words <- wide_words(slot, 5)
+        return double_source(words)
+
+@unsafe def render_scalar(+descriptor: String, +bits: U32) -> String:
+  match descriptor:
+    case "Z": Bool.pick(String, U32.is_ne(bits, 0), "true", "false")
+    case "B": "(byte)0x" ++ lower_hex(U32.and(bits, 255), 2n)
+    case "C": "'" ++ quote_unit(U32.and(bits, 65535), False{}) ++ "'"
+    case "F": float_source(bits)
+    case _: V.int_show(bits)
+
+@unsafe def render_value(+vm: M.VM, +descriptor: String, +slot: M.Slot, +in_array: Bool) -> Result<&2, &2, String, Rendered>:
+  match descriptor:
+    case SCon{Chr{91}, +component}: render_array(vm, component, bits_of(slot))
+    case SCon{Chr{76}, rest}: render_reference(vm, descriptor, bits_of(slot), in_array)
+    case "J": rendered_text(vm, render_wide("J", slot))
+    case "D": rendered_text(vm, render_wide("D", slot))
+    case +other: Done{Rendered{vm, [text_of(render_scalar(other, bits_of(slot)))]}}
+
+@unsafe def render_array(+vm: M.VM, +component: String, +reference: U32) -> Result<&2, &2, String, Rendered>:
+  do Result<&2, &2, String, Rendered>:
+    +entry : M.HeapEntry <- H.get(S.heap(vm), reference)
+    +inner : Rendered <- render_elements(vm, component, entry_values(entry), True{})
+    return rendered_wrap(inner, "{", "}")
+
+@unsafe def rendered_wrap(+inner: Rendered, +open: String, +close: String) -> Rendered:
+  match inner:
+    case Rendered{+vm, +items}: Rendered{vm, Con{text_of(open), M.append(M.TextItem, items, [text_of(close)])}}
+
+@unsafe def rendered_append(+first: Rendered, +rest: Result<&2, &2, String, Rendered>) -> Result<&2, &2, String, Rendered>:
+  match first rest:
+    case _ Fail{error}: Fail{error}
+    case Rendered{_, head} Done{Rendered{vm, tail}}: Done{Rendered{vm, M.append(M.TextItem, head, tail)}}
+
+@unsafe def render_elements(+vm: M.VM, +component: String, +values: +List<M.Slot>, +first: Bool) -> Result<&2, &2, String, Rendered>:
+  match values:
+    case Nil{}: Done{Rendered{vm, Nil{}}}
+    case Con{+slot, rest}:
+      do Result<&2, &2, String, Rendered>:
+        +rendered : Rendered <- render_value(vm, component, slot, True{})
+        +separated : Rendered = rendered_prefix(rendered, Bool.pick(String, first, "", ", "))
+        +result : Rendered <- rendered_append(separated, render_elements(rendered_vm(separated), component, rest, False{}))
+        return result
+
+@unsafe def rendered_vm(+value: Rendered) -> M.VM:
+  match value:
+    case Rendered{+vm, +items}: vm
+
+@unsafe def rendered_prefix(+value: Rendered, +prefix: String) -> Rendered:
+  match value:
+    case Rendered{+vm, +items}: Rendered{vm, Con{text_of(prefix), items}}
+
+# HashMap iteration order of the member defaults (AnnotationType.memberDefaults,
+# a HashMap(0)), which LinkedHashMap(memberDefaults) preserves in memberValues.
+@unsafe def hash_capacity(+count: U32, +capacity: U32) -> U32:
+  hash_capacity_fits(U32.is_le(U32.mul(count, 4), U32.mul(capacity, 3)), count, capacity)
+
+@unsafe def hash_capacity_fits(fits: Bool, +count: U32, +capacity: U32) -> U32:
+  match fits:
+    case True{}: capacity
+    case False{}: hash_capacity(count, U32.mul(capacity, 2))
+
+@unsafe def member_bucket(+vm: M.VM, +method: M.LoadedMethod, +capacity: U32) -> U32:
+  +hash : U32 = units_hash(units_from_string(Sy.text(S.symbols(vm), M.loaded_method_name(method))))
+  U32.and(U32.xor(hash, U32.shrn(hash, 16n)), U32.sub(capacity, 1))
+
+type Bucketed is Data:
+  Bucketed{bucket: U32, method: M.LoadedMethod}
+
+@unsafe def bucketed_insert(+item: Bucketed, +sorted: +List<Bucketed>) -> +List<Bucketed>:
+  match sorted:
+    case Nil{}: [item]
+    case Con{+head, rest}: bucketed_insert_step(U32.is_lt(bucketed_key(item), bucketed_key(head)), item, head, rest)
+
+@unsafe def bucketed_insert_step(before: Bool, +item: Bucketed, +head: Bucketed, +rest: +List<Bucketed>) -> +List<Bucketed>:
+  match before:
+    case True{}: Con{item, Con{head, rest}}
+    case False{}: Con{head, bucketed_insert(item, rest)}
+
+@unsafe def bucketed_key(+item: Bucketed) -> U32:
+  match item:
+    case Bucketed{bucket, method}: bucket
+
+@unsafe def bucketed_method(+item: Bucketed) -> M.LoadedMethod:
+  match item:
+    case Bucketed{bucket, method}: method
+
+@unsafe def bucketed_methods(+items: +List<Bucketed>) -> +List<M.LoadedMethod>:
+  match items:
+    case Nil{}: Nil{}
+    case Con{+item, rest}: Con{bucketed_method(item), bucketed_methods(rest)}
+
+# Insertion keeps declaration order within a bucket (a stable sort).
+@unsafe def bucket_sort(+vm: M.VM, +methods: +List<M.LoadedMethod>, +capacity: U32, +sorted: +List<Bucketed>) -> +List<M.LoadedMethod>:
+  match methods:
+    case Nil{}: bucketed_methods(sorted)
+    case Con{+method, rest}: bucket_sort(vm, rest, capacity, bucketed_insert_last(Bucketed{member_bucket(vm, method, capacity), method}, sorted))
+
+@unsafe def bucketed_insert_last(+item: Bucketed, +sorted: +List<Bucketed>) -> +List<Bucketed>:
+  M.reverse(Bucketed, bucketed_insert_reversed(item, M.reverse(Bucketed, sorted)))
+
+# Insert into a list sorted descending (the reversed ascending list) after every
+# element with a smaller-or-equal bucket, so equal buckets keep insertion order.
+@unsafe def bucketed_insert_reversed(+item: Bucketed, +sorted: +List<Bucketed>) -> +List<Bucketed>:
+  match sorted:
+    case Nil{}: [item]
+    case Con{+head, rest}: bucketed_reversed_step(U32.is_ge(bucketed_key(item), bucketed_key(head)), item, head, rest)
+
+@unsafe def bucketed_reversed_step(stop: Bool, +item: Bucketed, +head: Bucketed, +rest: +List<Bucketed>) -> +List<Bucketed>:
+  match stop:
+    case True{}: Con{item, Con{head, rest}}
+    case False{}: Con{head, bucketed_insert_reversed(item, rest)}
+
+@unsafe def member_has_default(+vm: M.VM, +method: M.LoadedMethod) -> Bool:
+  default_present(AR.default_metadata(S.metadata(vm), M.loaded_method_id(method)))
+
+@unsafe def default_present(found: Maybe<&2, M.AnnotationValue>) -> Bool:
+  match found:
+    case Some{value}: True{}
+    case None{}: False{}
+
+@unsafe def default_members(+vm: M.VM, +methods: +List<M.LoadedMethod>) -> +List<M.LoadedMethod>:
+  match methods:
+    case Nil{}: Nil{}
+    case Con{+method, rest}: default_member_step(member_has_default(vm, method), method, default_members(vm, rest))
+
+@unsafe def default_member_step(keep: Bool, +method: M.LoadedMethod, +rest: +List<M.LoadedMethod>) -> +List<M.LoadedMethod>:
+  match keep:
+    case True{}: Con{method, rest}
+    case False{}: rest
+
+# Explicit members without a default, in the order the class file lists them.
+@unsafe def explicit_members(+vm: M.VM, +bindings: +List<M.Binding>) -> +List<M.LoadedMethod>:
+  match bindings:
+    case Nil{}: Nil{}
+    case Con{M.Binding{id, slot}, rest}: explicit_member_step(M.nth(M.LoadedMethod, S.methods(vm), id), vm, explicit_members(vm, rest))
+
+@unsafe def explicit_member_step(found: Maybe<&2, M.LoadedMethod>, +vm: M.VM, +rest: +List<M.LoadedMethod>) -> +List<M.LoadedMethod>:
+  match found:
+    case None{}: rest
+    case Some{+method}: default_member_step(Bool.not(member_has_default(vm, method)), method, rest)
+
+@unsafe def annotation_member_order(+vm: M.VM, +owner: U32, +bindings: +List<M.Binding>) -> +List<M.LoadedMethod>:
+  +defaults : +List<M.LoadedMethod> = default_members(vm, AR.member_methods(S.methods(vm), owner, S.symbols(vm)))
+  +capacity : U32 = hash_capacity(M.length(M.LoadedMethod, defaults), 2)
+  M.append(M.LoadedMethod, bucket_sort(vm, defaults, capacity, Nil{}), explicit_members(vm, bindings))
+
+@unsafe def render_member_value(value: AR.Value, +descriptor: String) -> Result<&2, &2, String, Rendered>:
+  match value:
+    case AR.Value{vm, M.Slot{99, reference}}: Done{Rendered{vm, [M.TextThrow{reference}]}}
+    case AR.Value{+vm, +slot}: render_value(vm, descriptor, slot, False{})
+
+@unsafe def render_members(+vm: M.VM, +members: +List<M.LoadedMethod>, +bindings: +List<M.Binding>, +lone: Bool, +first: Bool) -> Result<&2, &2, String, Rendered>:
+  match members:
+    case Nil{}: Done{Rendered{vm, Nil{}}}
+    case Con{+method, rest}:
+      do Result<&2, &2, String, Rendered>:
+        +name : String = Sy.text(S.symbols(vm), M.loaded_method_name(method))
+        +value : AR.Value <- AR.effective(vm, method, H.binding_find(bindings, M.loaded_method_id(method)))
+        +rendered : Rendered <- render_member_value(value, AR.descriptor(AR.value_vm(value), method))
+        +label : String = Bool.pick(String, first, "", ", ") ++ Bool.pick(String, lone && String.eq(name, "value"), "", name ++ "=")
+        +labeled : Rendered = rendered_prefix(rendered, label)
+        +result : Rendered <- rendered_append(labeled, render_members(rendered_vm(labeled), rest, bindings, False{}, False{}))
+        return result
+
+@unsafe def annotation_render(+vm: M.VM, +reference: U32) -> Result<&2, &2, String, Rendered>:
+  do Result<&2, &2, String, Rendered>:
+    +entry : M.HeapEntry <- H.get(S.heap(vm), reference)
+    +owner : U32 = entry_element(entry)
+    +bindings : +List<M.Binding> = entry_fields(entry)
+    +members : +List<M.LoadedMethod> = annotation_member_order(vm, owner, bindings)
+    +lone : Bool = U32.is_eq(M.length(M.LoadedMethod, members), 1)
+    +inner : Rendered <- render_members(vm, members, bindings, lone, True{})
+    return rendered_wrap(inner, "@" ++ class_source_named(vm, class_name_text(vm, owner)) ++ "(", ")")
+
+@unsafe def annotation_to_string_rendered(result: Result<&2, &2, String, Rendered>) -> Result<&2, &2, String, O.Outcome>:
+  match result:
+    case Fail{error}: Fail{error}
+    case Done{Rendered{+vm, +items}}: text_join(vm, Nil{}, items)
+
+@unsafe def annotation_to_string(+vm: M.VM, +reference: U32) -> Result<&2, &2, String, O.Outcome>:
+  annotation_to_string_rendered(annotation_render(vm, reference))
+
+@unsafe def float_text(+bits: U32) -> String:
+  float_text_special(bits, U32.is_eq(U32.and(bits, 2139095040), 2139095040))
+
+@unsafe def float_text_special(+bits: U32, special: Bool) -> String:
+  match special:
+    case False{}: float_text_decimal(F32.show(V.from_bits(bits)))
+    case True{}: Bool.pick(String, U32.is_ne(U32.and(bits, 8388607), 0), "NaN", Bool.pick(String, V.negative(bits), "-Infinity", "Infinity"))
+
+@unsafe def float_text_decimal(+text: String) -> String:
+  Bool.pick(String, String.contains(text, ".") || String.contains(text, "e") || String.contains(text, "E"), text, text ++ ".0")
+
+# --- java.lang.Enum: compareTo and getDeclaringClass ---
+
+# getDeclaringClass: a constant with a body is an anonymous subclass of its enum.
+@unsafe def enum_declaring_id(+vm: M.VM, +class: U32) -> U32:
+  +parent : U32 = enum_parent_id(vm, class)
+  Bool.pick(U32, U32.is_eq(parent, class_id(vm, "java/lang/Enum")), class, parent)
+
+@unsafe def enum_parent_id(+vm: M.VM, +class: U32) -> U32:
+  class_parent_found(M.nth(M.LoadedClass, S.classes(vm), class))
+
+@unsafe def enum_declaring_class(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +receiver : M.Slot <- slot0(args)
+    +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
+    result : O.Outcome <- class_mirror_out(vm, enum_declaring_id(vm, H.entry_class(entry)))
+    return result
+
+@unsafe def enum_compare(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +receiver : M.Slot <- slot0(args)
+    +other : M.Slot <- slot1(args)
+    checked : Unit <- S.check(U32.is_ne(bits_of(other), 0), npe())
+    +left : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
+    +right : M.HeapEntry <- H.get(S.heap(vm), bits_of(other))
+    same : Unit <- S.check(U32.is_eq(enum_declaring_id(vm, H.entry_class(left)), enum_declaring_id(vm, H.entry_class(right))), "java/lang/ClassCastException")
+    result : O.Outcome <- int_out(vm, U32.sub(field_bits(entry_fields(left), 1), field_bits(entry_fields(right), 1)))
+    return result
+
+# Array clone(): a shallow copy with the same class and element type.
+@unsafe def array_clone(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +receiver : M.Slot <- slot0(args)
+    checked : Unit <- S.check(U32.is_ne(bits_of(receiver), 0), npe())
+    +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
+    +result : O.Outcome <- alloc_result(H.allocate(vm, entry), vm2 => reference => ref_out(vm2, reference))
+    return result
+
+# AbstractCollection.toString for the MiniJRE lists: "[a, b]", elements by
+# their toString(), "(this Collection)" for the list itself, "null" for null.
+@unsafe def list_element_items(+vm: M.VM, +list: U32, +values: +List<M.Slot>, +first: Bool) -> +List<M.TextItem>:
+  match values:
+    case Nil{}: [M.TextUnits{units_from_string("]")}]
+    case Con{+slot, rest}:
+      Con{M.TextUnits{units_from_string(Bool.pick(String, first, "", ", "))}, Con{list_element_item(vm, list, bits_of(slot)), list_element_items(vm, list, rest, False{})}}
+
+@unsafe def list_element_item(+vm: M.VM, +list: U32, +reference: U32) -> M.TextItem:
+  Bool.pick(M.TextItem, U32.is_eq(reference, list), M.TextUnits{units_from_string("(this Collection)")}, string_or_call(vm, reference, H.get(S.heap(vm), reference)))
+
+@unsafe def string_or_call(+vm: M.VM, +reference: U32, found: Result<&2, &2, String, M.HeapEntry>) -> M.TextItem:
+  match found:
+    case Done{+entry}: Bool.pick(M.TextItem, U32.is_eq(entry_kind(entry), 3), M.TextUnits{entry_chars(entry)}, M.TextCall{reference})
+    case Fail{error}: M.TextCall{reference}
+
+@unsafe def list_to_string(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +receiver : M.Slot <- slot0(args)
+    +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
+    +values : +List<M.Slot> = M.take(M.Slot, entry_values(entry), U32.to_nat(entry_element(entry)))
+    +result : O.Outcome <- text_join(vm, units_from_string("["), list_element_items(vm, bits_of(receiver), values, True{}))
+    return result
+
+# --- AnnotatedType family (plan 03, C3) ---
+# An annotated type is an instance of one of the JDK's AnnotatedTypeFactory
+# impl classes with bindings 0 member (field, method or class id), 1 site (the
+# type annotation target type), 2 site index, 3 type path (int[] of packed
+# steps, or null) and 4 the Type it annotates. Its annotations are the member's
+# type annotations at that site, index and path.
+
+@unsafe def annotated_impl_for(+vm: M.VM, +type_ref: U32) -> String:
+  annotated_impl_entry(H.get(S.heap(vm), type_ref), vm)
+
+@unsafe def annotated_impl_entry(found: Result<&2, &2, String, M.HeapEntry>, +vm: M.VM) -> String:
+  match found:
+    case Fail{error}: "sun/reflect/annotation/AnnotatedTypeFactory$AnnotatedTypeBaseImpl"
+    case Done{+entry}: annotated_impl_named(class_name_text(vm, H.entry_class(entry)), U32.is_eq(entry_kind(entry), 8) && String.starts_with(class_name_text(vm, entry_element(entry)), "["))
+
+@unsafe def annotated_impl_named(+name: String, +array_class: Bool) -> String:
+  Bool.pick(String, String.eq(name, "sun/reflect/generics/reflectiveObjects/ParameterizedTypeImpl"), "sun/reflect/annotation/AnnotatedTypeFactory$AnnotatedParameterizedTypeImpl",
+    Bool.pick(String, String.eq(name, "sun/reflect/generics/reflectiveObjects/WildcardTypeImpl"), "sun/reflect/annotation/AnnotatedTypeFactory$AnnotatedWildcardTypeImpl",
+      Bool.pick(String, String.eq(name, "sun/reflect/generics/reflectiveObjects/TypeVariableImpl"), "sun/reflect/annotation/AnnotatedTypeFactory$AnnotatedTypeVariableImpl",
+        Bool.pick(String, String.eq(name, "sun/reflect/generics/reflectiveObjects/GenericArrayTypeImpl") || array_class, "sun/reflect/annotation/AnnotatedTypeFactory$AnnotatedArrayTypeImpl",
+          "sun/reflect/annotation/AnnotatedTypeFactory$AnnotatedTypeBaseImpl"))))
+
+@unsafe def new_annotated(+vm: M.VM, +member: U32, +site: U32, +index: U32, +path: U32, +type_ref: U32) -> Result<&2, &2, String, G.TypeRef>:
+  G.alloc_ref(H.allocate(vm, H.object_entry(class_id(vm, annotated_impl_for(vm, type_ref)), [M.Binding{0, M.Slot{1, member}}, M.Binding{1, M.Slot{1, site}}, M.Binding{2, M.Slot{1, index}}, M.Binding{3, M.Slot{3, path}}, M.Binding{4, M.Slot{3, type_ref}}])))
+
+@unsafe def type_ref_out(result: Result<&2, &2, String, G.TypeRef>) -> Result<&2, &2, String, O.Outcome>:
+  match result:
+    case Fail{error}: Fail{error}
+    case Done{G.TypeRef{vm, reference}}: ref_out(vm, reference)
+
+# The reference an intrinsic returned, with its VM.
+@unsafe def returned_ref(result: Result<&2, &2, String, O.Outcome>) -> Result<&2, &2, String, G.TypeRef>:
+  match result:
+    case Done{O.Returned{vm, Some{slot}}}: Done{G.TypeRef{vm, M.slot_bits(slot)}}
+    case Done{O.ThrownName{vm, name}}: Fail{name}
+    case Done{_}: Fail{"InvalidState: generic type query did not return"}
+    case Fail{error}: Fail{error}
+
+@unsafe def annotated_array(+vm: M.VM, +refs: +List<U32>) -> Result<&2, &2, String, O.Outcome>:
+  alloc_result(H.allocate(vm, H.reference_array_entry(class_id(vm, "[Ljava/lang/reflect/AnnotatedType;"), class_id(vm, "java/lang/reflect/AnnotatedType"), annotated_ref_slots(refs))), vm2 => reference => ref_out(vm2, reference))
+
+# One annotated type per Type in `types`; `step` is the path step to append
+# (none for declaration sites whose index varies instead).
+type AnnotatedSpec is Data:
+  AnnotatedSpec{member: U32, site: U32, index: U32, indexStep: U32, path: U32, step: U32, stepStride: U32}
+
+@unsafe def annotated_each(+vm: M.VM, +spec: AnnotatedSpec, +types: +List<U32>, +position: U32, +acc: +List<U32>) -> Result<&2, &2, String, O.Outcome>:
+  match types:
+    case Nil{}: annotated_array(vm, M.reverse(U32, acc))
+    case Con{+type_ref, rest}:
+      do Result<&2, &2, String, O.Outcome>:
+        +child_path : G.TypeRef <- spec_path(vm, spec, position)
+        +child : G.TypeRef <- spec_child(child_path, spec, position, type_ref)
+        +result : O.Outcome <- annotated_each_next(child, spec, rest, position, acc)
+        return result
+
+@unsafe def annotated_each_next(+child: G.TypeRef, +spec: AnnotatedSpec, +rest: +List<U32>, +position: U32, +acc: +List<U32>) -> Result<&2, &2, String, O.Outcome>:
+  match child:
+    case G.TypeRef{+vm, +reference}: annotated_each(vm, spec, rest, U32.add(position, 1), Con{reference, acc})
+
+@unsafe def spec_child(+path: G.TypeRef, +spec: AnnotatedSpec, +position: U32, +type_ref: U32) -> Result<&2, &2, String, G.TypeRef>:
+  match path spec:
+    case G.TypeRef{+vm, +path_ref} AnnotatedSpec{member, site, index, indexStep, old_path, step, stride}:
+      new_annotated(vm, member, site, U32.add(index, U32.mul(position, indexStep)), path_ref, type_ref)
+
+# The child's path: the parent's steps plus step + position * stride (or the
+# parent's path when there is no step).
+@unsafe def spec_path(+vm: M.VM, +spec: AnnotatedSpec, +position: U32) -> Result<&2, &2, String, G.TypeRef>:
+  match spec:
+    case AnnotatedSpec{member, site, index, indexStep, path, step, stride}:
+      Bool.pick(Result<&2, &2, String, G.TypeRef>, U32.is_eq(step, 4294967295), Done{G.TypeRef{vm, path}}, path_append(vm, path, U32.add(step, U32.mul(position, stride))))
+
+@unsafe def path_values(+vm: M.VM, +path: U32) -> +List<M.Slot>:
+  match path:
+    case 0: Nil{}
+    case +ref: path_entry_values(H.get(S.heap(vm), ref))
+
+@unsafe def path_entry_values(found: Result<&2, &2, String, M.HeapEntry>) -> +List<M.Slot>:
+  match found:
+    case Fail{error}: Nil{}
+    case Done{+entry}: entry_values(entry)
+
+@unsafe def path_append(+vm: M.VM, +path: U32, +step: U32) -> Result<&2, &2, String, G.TypeRef>:
+  G.alloc_ref(H.allocate(vm, H.primitive_array_entry(class_id(vm, "[I"), 10, M.append(M.Slot, path_values(vm, path), [M.Slot{1, step}]))))
+
+@unsafe def annotated_receiver(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, M.HeapEntry>:
+  do Result<&2, &2, String, M.HeapEntry>:
+    +receiver : M.Slot <- slot0(args)
+    +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
+    return entry
+
+@unsafe def annotated_spec(+entry: M.HeapEntry, +step: U32, +stride: U32) -> AnnotatedSpec:
+  +fields : +List<M.Binding> = entry_fields(entry)
+  AnnotatedSpec{field_bits(fields, 0), field_bits(fields, 1), field_bits(fields, 2), 0, field_bits(fields, 3), step, stride}
+
+@unsafe def array_refs(+vm: M.VM, +array: U32) -> +List<U32>:
+  slot_bits(path_values(vm, array))
+
+@unsafe def type_binding(+vm: M.VM, +type_ref: U32, +index: U32) -> U32:
+  type_binding_entry(H.get(S.heap(vm), type_ref), index)
+
+@unsafe def type_binding_entry(found: Result<&2, &2, String, M.HeapEntry>, +index: U32) -> U32:
+  match found:
+    case Fail{error}: 0
+    case Done{+entry}: field_bits(entry_fields(entry), index)
+
+# getAnnotatedActualTypeArguments: TYPE_ARGUMENT steps (kind 3, argument index).
+@unsafe def annotated_actuals(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +entry : M.HeapEntry <- annotated_receiver(vm, args)
+    +type_ref : U32 = field_bits(entry_fields(entry), 4)
+    +result : O.Outcome <- annotated_each(vm, annotated_spec(entry, 768, 1), array_refs(vm, type_binding(vm, type_ref, 1)), 0, Nil{})
+    return result
+
+# getAnnotatedGenericComponentType: one ARRAY step (kind 0).
+@unsafe def annotated_component(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +entry : M.HeapEntry <- annotated_receiver(vm, args)
+    +type_ref : U32 = field_bits(entry_fields(entry), 4)
+    +component : G.TypeRef <- component_type(vm, type_ref)
+    +path : G.TypeRef <- path_append(type_ref_vm(component), field_bits(entry_fields(entry), 3), 0)
+    +child : G.TypeRef <- spec_child(path, annotated_spec(entry, 0, 0), 0, type_ref_reference(component))
+    +result : O.Outcome <- type_ref_out(Done{child})
+    return result
+
+@unsafe def type_ref_vm(+value: G.TypeRef) -> M.VM:
+  match value:
+    case G.TypeRef{+vm, +reference}: vm
+
+@unsafe def type_ref_reference(+value: G.TypeRef) -> U32:
+  match value:
+    case G.TypeRef{+vm, +reference}: reference
+
+# A GenericArrayType's component, or an array class's component mirror.
+@unsafe def component_type(+vm: M.VM, +type_ref: U32) -> Result<&2, &2, String, G.TypeRef>:
+  do Result<&2, &2, String, G.TypeRef>:
+    +entry : M.HeapEntry <- H.get(S.heap(vm), type_ref)
+    +result : G.TypeRef <- Bool.pick(Result<&2, &2, String, G.TypeRef>, U32.is_eq(entry_kind(entry), 8),
+      returned_ref(class_mirror_out(vm, array_component_id(vm, class_name_text(vm, entry_element(entry))))),
+      Done{G.TypeRef{vm, field_bits(entry_fields(entry), 0)}})
+    return result
+
+@unsafe def array_component_id(+vm: M.VM, +name: String) -> U32:
+  match name:
+    case SCon{Chr{91}, +rest}: class_id(vm, Bool.pick(String, String.starts_with(rest, "L"), take_until_semicolon_text(drop_first(rest)), Bool.pick(String, String.starts_with(rest, "["), rest, primitive_descriptor_name(rest))))
+    case _: 4294967295
+
+@unsafe def drop_first(+text: String) -> String:
+  match text:
+    case SCon{head, rest}: rest
+    case SNil{}: ""
+
+# getAnnotatedUpperBounds/getAnnotatedLowerBounds: one WILDCARD step (kind 2);
+# an unbounded wildcard's upper bound is Object.
+@unsafe def annotated_wildcard(+vm: M.VM, +args: +List<M.Slot>, +upper: Bool) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +entry : M.HeapEntry <- annotated_receiver(vm, args)
+    +type_ref : U32 = field_bits(entry_fields(entry), 4)
+    +bounds : +List<U32> = array_refs(vm, type_binding(vm, type_ref, Bool.pick(U32, upper, 0, 1)))
+    +lower : +List<U32> = array_refs(vm, type_binding(vm, type_ref, 1))
+    +object : G.TypeRef <- returned_ref(class_mirror_out(vm, class_id(vm, "java/lang/Object")))
+    +result : O.Outcome <- wildcard_bounds(object, entry, bounds, upper && chars_nonempty(lower))
+    return result
+
+# AnnotatedWildcardTypeImpl: the upper bound is implicit (Object, unannotated)
+# whenever the wildcard has lower bounds.
+@unsafe def wildcard_bounds(+object: G.TypeRef, +entry: M.HeapEntry, +bounds: +List<U32>, +implicit: Bool) -> Result<&2, &2, String, O.Outcome>:
+  match object:
+    case G.TypeRef{+vm, +reference}:
+      implicit_or_bounds(implicit, vm, entry, reference, bounds)
+
+# An unbounded wildcard's implicit Object bound carries no annotations (the
+# JDK builds it at the base location with none), so it gets the empty site.
+@unsafe def implicit_or_bounds(implicit: Bool, +vm: M.VM, +entry: M.HeapEntry, +object: U32, +bounds: +List<U32>) -> Result<&2, &2, String, O.Outcome>:
+  match implicit:
+    case True{}: annotated_each(vm, AnnotatedSpec{0, 4294967295, 0, 0, 0, 4294967295, 0}, [object], 0, Nil{})
+    case False{}: annotated_each(vm, annotated_spec(entry, 512, 0), bounds, 0, Nil{})
+
+# A type variable's annotated bounds come from its declaration: bound
+# annotations (CLASS/METHOD_TYPE_PARAMETER_BOUND) at the variable's index; the
+# class bound slot is skipped when the first bound is an interface.
+@unsafe def variable_declaration(+vm: M.VM, +variable: U32) -> Result<&2, &2, String, VariableSite>:
+  do Result<&2, &2, String, VariableSite>:
+    +entry : M.HeapEntry <- H.get(S.heap(vm), variable)
+    +fields : +List<M.Binding> = entry_fields(entry)
+    +label : String <- string_text(vm, field_bits(fields, 0))
+    +kind : U32 = field_bits(fields, 1)
+    +id : U32 = field_bits(fields, 2)
+    +params : +List<Sig.TypeParam> <- variable_params(vm, kind, id)
+    return VariableSite{kind, id, param_index(params, label, 0)}
+
+type VariableSite is Data:
+  VariableSite{kind: U32, id: U32, index: U32}
+
+@unsafe def variable_params(+vm: M.VM, +kind: U32, +id: U32) -> Result<&2, &2, String, +List<Sig.TypeParam>>:
+  match kind:
+    case 1: Done{G.class_variables(class_signature(vm, id))}
+    case _:
+      do Result<&2, &2, String, +List<Sig.TypeParam>>:
+        +method : M.LoadedMethod <- S.require(M.LoadedMethod, M.nth(M.LoadedMethod, S.methods(vm), id), "java/lang/NoSuchMethodException")
+        return G.method_variables(method_signature(vm, method))
+
+@unsafe def param_index(+params: +List<Sig.TypeParam>, +label: String, +index: U32) -> U32:
+  match params:
+    case Nil{}: 0
+    case Con{Sig.TypeParam{+name, bounds}, rest}: Bool.pick(U32, String.eq(name, label), index, param_index(rest, label, U32.add(index, 1)))
+
+@unsafe def first_bound_interface(+vm: M.VM, +bounds: +List<U32>) -> Bool:
+  match bounds:
+    case Nil{}: False{}
+    case Con{+first, rest}: bound_is_interface(vm, first)
+
+@unsafe def bound_is_interface(+vm: M.VM, +bound: U32) -> Bool:
+  bound_entry_interface(vm, H.get(S.heap(vm), bound))
+
+# A bound is a Class (kind 8) or a ParameterizedType whose binding 0 is its raw class.
+@unsafe def bound_entry_interface(+vm: M.VM, found: Result<&2, &2, String, M.HeapEntry>) -> Bool:
+  match found:
+    case Fail{error}: False{}
+    case Done{+entry}: U32.is_ne(U32.and(class_flags(vm, Bool.pick(U32, U32.is_eq(entry_kind(entry), 8), entry_element(entry), field_bits(entry_fields(entry), 0))), 512), 0)
+
+@unsafe def variable_annotated_bounds(+vm: M.VM, +variable: U32) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +site : VariableSite <- variable_declaration(vm, variable)
+    +bounds_array : G.TypeRef <- returned_ref(type_variable_bounds_lazy(vm, [M.Slot{3, variable}]))
+    +result : O.Outcome <- variable_bounds_each(bounds_array, site)
+    return result
+
+@unsafe def variable_bounds_each(+bounds_array: G.TypeRef, +site: VariableSite) -> Result<&2, &2, String, O.Outcome>:
+  match bounds_array site:
+    case G.TypeRef{+vm, +array} VariableSite{+kind, +id, +index}:
+      +bounds : +List<U32> = array_refs(vm, array)
+      +start : U32 = Bool.pick(U32, first_bound_interface(vm, bounds), 1, 0)
+      annotated_each(vm, AnnotatedSpec{id, Bool.pick(U32, U32.is_eq(kind, 1), 17, 18), U32.add(U32.mul(index, 256), start), 1, 0, 4294967295, 0}, bounds, 0, Nil{})
+
+@unsafe def type_variable_annotated_bounds(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +receiver : M.Slot <- slot0(args)
+    +result : O.Outcome <- variable_annotated_bounds(vm, bits_of(receiver))
+    return result
+
+@unsafe def annotated_variable_bounds(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +entry : M.HeapEntry <- annotated_receiver(vm, args)
+    +result : O.Outcome <- variable_annotated_bounds(vm, field_bits(entry_fields(entry), 4))
+    return result
+
+# Field.getAnnotatedType, Method.getAnnotatedReturnType/ParameterTypes and
+# Class.getAnnotatedSuperclass/Interfaces start at their declaration sites.
+@unsafe def field_annotated(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +field : M.LoadedField <- reflect_field_member(vm, args)
+    +type_ref : G.TypeRef <- returned_ref(reflect_field_generic_type(vm, args))
+    +result : O.Outcome <- type_ref_out(site_annotated(type_ref, M.loaded_field_id(field), 19, 0))
+    return result
+
+@unsafe def site_annotated(+type_ref: G.TypeRef, +member: U32, +site: U32, +index: U32) -> Result<&2, &2, String, G.TypeRef>:
+  match type_ref:
+    case G.TypeRef{+vm, +reference}: new_annotated(vm, member, site, index, 0, reference)
+
+@unsafe def method_annotated_return(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +method : M.LoadedMethod <- reflect_method_from_args(vm, args)
+    +type_ref : G.TypeRef <- returned_ref(reflect_method_generic_return(vm, args))
+    +result : O.Outcome <- type_ref_out(site_annotated(type_ref, M.loaded_method_id(method), 20, 0))
+    return result
+
+@unsafe def method_annotated_parameters(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +method : M.LoadedMethod <- reflect_method_from_args(vm, args)
+    +types : G.TypeRef <- returned_ref(reflect_method_generic_parameter_types(vm, args))
+    +result : O.Outcome <- site_each(types, M.loaded_method_id(method), 22)
+    return result
+
+@unsafe def site_each(+types: G.TypeRef, +member: U32, +site: U32) -> Result<&2, &2, String, O.Outcome>:
+  match types:
+    case G.TypeRef{+vm, +array}: annotated_each(vm, AnnotatedSpec{member, site, 0, 1, 0, 4294967295, 0}, array_refs(vm, array), 0, Nil{})
+
+# Type annotations on a type variable's declaration (TypeVariable is an
+# AnnotatedElement): CLASS_TYPE_PARAMETER or METHOD_TYPE_PARAMETER at its index.
+@unsafe def variable_annotation_source(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, AnnotationMetadataRef>:
+  do Result<&2, &2, String, AnnotationMetadataRef>:
+    +receiver : M.Slot <- slot0(args)
+    +site : VariableSite <- variable_declaration(vm, bits_of(receiver))
+    +result : AnnotationMetadataRef <- variable_site_source(vm, site)
+    return result
+
+@unsafe def variable_site_source(+vm: M.VM, +site: VariableSite) -> Result<&2, &2, String, AnnotationMetadataRef>:
+  match site:
+    case VariableSite{+kind, +id, +index}: annotated_source(vm, id, Bool.pick(U32, U32.is_eq(kind, 1), 0, 1), index, Nil{})
+
+@unsafe def class_type_annotation_source(+vm: M.VM, +class: U32, +target: U32, +index: U32, +expected: +List<U32>) -> Result<&2, &2, String, AnnotationMetadataRef>:
+  do Result<&2, &2, String, AnnotationMetadataRef>:
+    +class_metadata : M.ClassMetadata <- class_metadata_value(vm, class)
+    +metadata : M.AnnotationMetadata = class_metadata_annotation_data(class_metadata)
+    +annotations : +List<M.Annotation> = type_annotation_values(metadata_type_annotations(metadata), target, index, expected, Nil{})
+    return AnnotationMetadataRef{vm, class_metadata_pool(class_metadata), M.AnnotationMetadata{0, Nil{}, annotations, Nil{}, Nil{}, None{}, Nil{}, Nil{}, Nil{}}}
+
+@unsafe def class_metadata_annotation_data(+value: M.ClassMetadata) -> M.AnnotationMetadata:
+  match value:
+    case M.ClassMetadata{owner, flags, annotations, visible, pool, signature, nesting, source}: annotations
+
+# The annotations of a site: fields (19), class sites (type parameters 0,
+# supertypes 16, bounds 17), method sites (everything else).
+@unsafe def annotated_source(+vm: M.VM, +member: U32, +target: U32, +index: U32, +expected: +List<U32>) -> Result<&2, &2, String, AnnotationMetadataRef>:
+  match target:
+    case 4294967295: Done{AnnotationMetadataRef{vm, Nil{}, M.AnnotationMetadata{0, Nil{}, Nil{}, Nil{}, Nil{}, None{}, Nil{}, Nil{}, Nil{}}}}
+    case 19: field_type_annotation_source(vm, member, target, index, expected)
+    case 0: class_type_annotation_source(vm, member, target, index, expected)
+    case 16: class_type_annotation_source(vm, member, target, index, expected)
+    case 17: class_type_annotation_source(vm, member, target, index, expected)
+    case _:
+      do Result<&2, &2, String, AnnotationMetadataRef>:
+        +method : M.LoadedMethod <- S.require(M.LoadedMethod, M.nth(M.LoadedMethod, S.methods(vm), member), "java/lang/NoSuchMethodException")
+        +result : AnnotationMetadataRef <- method_type_annotation_source(vm, method, target, index, expected)
+        return result
+
+@unsafe def variable_annotations(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +source : AnnotationMetadataRef <- variable_annotation_source(vm, args)
+    +result : O.Outcome <- class_annotations_array_from(source)
+    return result
+
+@unsafe def variable_annotation(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +source : AnnotationMetadataRef <- variable_annotation_source(vm, args)
+    +name : String <- reflect_annotation_name(vm, args)
+    +result : O.Outcome <- class_annotation_one_from(source, name)
+    return result
+
+@unsafe def variable_annotation_present(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +source : AnnotationMetadataRef <- variable_annotation_source(vm, args)
+    +name : String <- reflect_annotation_name(vm, args)
+    +result : O.Outcome <- reflect_annotation_present_source(vm, source, name)
     return result

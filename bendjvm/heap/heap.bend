@@ -12,12 +12,26 @@ def binding_find(xs: +List<M.Binding>, +id: U32) -> Maybe<&2, M.Slot>:
     case Con{M.Binding{binding_id, value}, rest}:
       Bool.pick(Maybe<&2, M.Slot>, U32.is_eq(binding_id, id), Some{value}, binding_find(rest, id))
 
-def binding_set(xs: +List<M.Binding>, +id: U32, +value: M.Slot) -> +List<M.Binding>:
+def binding_replace(xs: +List<M.Binding>, +id: U32, +value: M.Slot) -> +List<M.Binding>:
   match xs:
     case Nil{}:
       Nil{}
     case Con{M.Binding{+binding_id, old}, rest}:
-      Con{M.Binding{binding_id, Bool.pick(M.Slot, U32.is_eq(binding_id, id), value, old)}, binding_set(rest, id, value)}
+      Con{M.Binding{binding_id, Bool.pick(M.Slot, U32.is_eq(binding_id, id), value, old)}, binding_replace(rest, id, value)}
+
+def binding_has(xs: +List<M.Binding>, +id: U32) -> Bool:
+  match xs:
+    case Nil{}: False{}
+    case Con{M.Binding{+binding_id, old}, rest}: U32.is_eq(binding_id, id) || binding_has(rest, id)
+
+def binding_upsert(has: Bool, +xs: +List<M.Binding>, +id: U32, +value: M.Slot) -> +List<M.Binding>:
+  match has:
+    case True{}: binding_replace(xs, id, value)
+    case False{}: M.append(M.Binding, xs, [M.Binding{id, value}])
+
+# Writes a binding, adding it when absent; a write is never silently dropped.
+def binding_set(+xs: +List<M.Binding>, +id: U32, +value: M.Slot) -> +List<M.Binding>:
+  binding_upsert(binding_has(xs, id), xs, id, value)
 
 def get_nonnull(heap: +List<M.HeapEntry>, reference: U32, null: Bool) -> Result<&2, &2, String, M.HeapEntry>:
   match null:
@@ -61,7 +75,7 @@ def named_class(classes: +List<M.LoadedClass>, +symbols: +List<String>, +name: S
   match classes:
     case Nil{}:
       4294967295
-    case Con{M.LoadedClass{class_id, class_name, parent, interfaces, fields, methods, initializer, state}, rest}:
+    case Con{M.LoadedClass{class_id, class_name, parent, interfaces, fields, methods, initializer, state, bootstrapMethods}, rest}:
       Bool.pick(U32, symbol_equal(M.nth(String, symbols, class_name), name), class_id, named_class(rest, symbols, name))
 
 def name_value(value: Maybe<&2, String>) -> String:
@@ -76,7 +90,7 @@ def ancestry_expand(class: Maybe<&2, M.LoadedClass>, rest: +List<U32>) -> +List<
   match class:
     case None{}:
       rest
-    case Some{M.LoadedClass{id, name, parent, interfaces, fields, methods, initializer, state}}:
+    case Some{M.LoadedClass{id, name, parent, interfaces, fields, methods, initializer, state, bootstrapMethods}}:
       Con{parent, M.append(U32, interfaces, rest)}
 
 def contains(xs: +List<U32>, +value: U32) -> Bool:
@@ -93,18 +107,87 @@ def ancestry_next(+classes: +List<M.LoadedClass>, +id: U32, rest: +List<U32>, vi
     case False{}:
       ancestry_expand(M.nth(M.LoadedClass, classes, id), rest)
 
-def ancestry(fuel: Nat, +classes: +List<M.LoadedClass>, frontier: +List<U32>, +target: U32, +visited: +List<U32>) -> Bool:
+@unsafe def ancestry_hit(hit: Bool, fuel: Nat, +classes: +List<M.LoadedClass>, +id: U32, rest: +List<U32>, +target: U32, +visited: +List<U32>) -> Bool:
+  match hit:
+    case True{}:
+      True{}
+    case False{}:
+      ancestry(fuel, classes, ancestry_next(classes, id, rest, visited, contains(visited, id)), target, Con{id, visited})
+
+# Generated JavaScript evaluates Bool.or eagerly, so the match in ancestry_hit is
+# what stops the walk at the first hit.
+@unsafe def ancestry(fuel: Nat, +classes: +List<M.LoadedClass>, frontier: +List<U32>, +target: U32, +visited: +List<U32>) -> Bool:
   match fuel frontier:
     case 0n _:
       False{}
     case 1n+p Nil{}:
       False{}
     case 1n+p Con{+id, rest}:
-      Bool.or(U32.is_eq(id, target), ancestry(p, classes, ancestry_next(classes, id, rest, visited, contains(visited, id)), target, Con{id, visited}))
+      ancestry_hit(U32.is_eq(id, target), p, classes, id, rest, target, visited)
 
 def hierarchy(+classes: +List<M.LoadedClass>, source: U32, target: U32) -> Bool:
   +count = M.length(M.LoadedClass, classes)
   ancestry(U32.to_nat(U32.add(U32.mul(count, U32.add(count, 1)), 1)), classes, Con{source, Nil{}}, target, Nil{})
+
+@unsafe def declared_field(+fields: +List<M.LoadedField>, +owner: U32, +name: U32, +descriptor: U32) -> Maybe<&2, M.LoadedField>:
+  match fields:
+    case Nil{}:
+      None{}
+    case Con{+field, rest}:
+      declared_field_match(U32.is_eq(M.loaded_field_owner(field), owner) && U32.is_eq(M.loaded_field_name(field), name) && U32.is_eq(M.loaded_field_descriptor(field), descriptor), field, rest, owner, name, descriptor)
+
+@unsafe def declared_field_match(hit: Bool, +field: M.LoadedField, +rest: +List<M.LoadedField>, +owner: U32, +name: U32, +descriptor: U32) -> Maybe<&2, M.LoadedField>:
+  match hit:
+    case True{}:
+      Some{field}
+    case False{}:
+      declared_field(rest, owner, name, descriptor)
+
+# JVMS 5.4.3.2 search order after the class itself: direct superinterfaces
+# (each followed by its own superinterfaces), then the superclass chain.
+def parent_then(parent: U32, rest: +List<U32>) -> +List<U32>:
+  match parent:
+    case 4294967295:
+      rest
+    case value:
+      Con{value, rest}
+
+def field_lookup_supers(class: Maybe<&2, M.LoadedClass>, rest: +List<U32>) -> +List<U32>:
+  match class:
+    case None{}:
+      rest
+    case Some{M.LoadedClass{id, name, parent, interfaces, fields, methods, initializer, state, bootstrapMethods}}:
+      M.append(U32, interfaces, parent_then(parent, rest))
+
+@unsafe def resolve_field_found(found: Maybe<&2, M.LoadedField>, fuel: Nat, +classes: +List<M.LoadedClass>, +fields: +List<M.LoadedField>, +id: U32, +rest: +List<U32>, +visited: +List<U32>, +name: U32, +descriptor: U32) -> Maybe<&2, M.LoadedField>:
+  match found:
+    case Some{field}:
+      Some{field}
+    case None{}:
+      resolve_field_go(fuel, classes, fields, field_lookup_supers(M.nth(M.LoadedClass, classes, id), rest), Con{id, visited}, name, descriptor)
+
+@unsafe def resolve_field_visit(seen: Bool, fuel: Nat, +classes: +List<M.LoadedClass>, +fields: +List<M.LoadedField>, +id: U32, +rest: +List<U32>, +visited: +List<U32>, +name: U32, +descriptor: U32) -> Maybe<&2, M.LoadedField>:
+  match seen:
+    case True{}:
+      resolve_field_go(fuel, classes, fields, rest, visited, name, descriptor)
+    case False{}:
+      resolve_field_found(declared_field(fields, id, name, descriptor), fuel, classes, fields, id, rest, visited, name, descriptor)
+
+# Interfaces reached twice through a diamond are searched once.
+@unsafe def resolve_field_go(fuel: Nat, +classes: +List<M.LoadedClass>, +fields: +List<M.LoadedField>, +queue: +List<U32>, +visited: +List<U32>, +name: U32, +descriptor: U32) -> Maybe<&2, M.LoadedField>:
+  match fuel queue:
+    case 0n _:
+      None{}
+    case 1n+p Nil{}:
+      None{}
+    case 1n+p Con{+id, rest}:
+      resolve_field_visit(contains(visited, id), p, classes, fields, id, rest, visited, name, descriptor)
+
+# Field resolution (JVMS 5.4.3.2) starting at class id `owner`; the result's
+# owner is the declaring class, which is the one a static access initializes.
+def resolve_field(+classes: +List<M.LoadedClass>, +fields: +List<M.LoadedField>, owner: U32, name: U32, descriptor: U32) -> Maybe<&2, M.LoadedField>:
+  +count = M.length(M.LoadedClass, classes)
+  resolve_field_go(U32.to_nat(U32.add(U32.mul(count, U32.add(count, 1)), 1)), classes, fields, Con{owner, Nil{}}, Nil{}, name, descriptor)
 
 def object_descriptor(s: String) -> String:
   match s:
@@ -139,7 +222,7 @@ def class_symbol(class: Maybe<&2, M.LoadedClass>) -> U32:
   match class:
     case None{}:
       4294967295
-    case Some{M.LoadedClass{id, class_name, parent, interfaces, fields, methods, initializer, state}}:
+    case Some{M.LoadedClass{id, class_name, parent, interfaces, fields, methods, initializer, state, bootstrapMethods}}:
       class_name
 
 def assignable(+classes: +List<M.LoadedClass>, +symbols: +List<String>, +source: U32, +target: U32) -> Bool:
@@ -148,6 +231,28 @@ def assignable(+classes: +List<M.LoadedClass>, +symbols: +List<String>, +source:
 def entry_class(entry: M.HeapEntry) -> U32:
   M.HeapEntry{class, kind, element, fields, values, chars} = entry
   class
+
+# HeapEntry.kind registry. Dispatch, reflection, and intrinsics branch on the
+# kind alone, so every value must stay unique across modules:
+#   0 object or throwable    1 primitive array        2 reference array
+#   3 String                  4 byte stream            5 ArrayList
+#   6 HashMap                 7 StringBuilder          8 Class mirror
+#   9 annotation instance    10 dynamic proxy         11 pending annotation value
+#   20-24 java.lang.invoke objects, named below.
+def kind_method_type() -> U32:
+  20
+
+def kind_method_handle() -> U32:
+  21
+
+def kind_call_site() -> U32:
+  22
+
+def kind_lookup() -> U32:
+  23
+
+def kind_lambda_plan() -> U32:
+  24
 
 def object_entry(class: U32, fields: +List<M.Binding>) -> M.HeapEntry:
   M.HeapEntry{class, 0, 0, fields, Nil{}, Nil{}}
@@ -207,7 +312,7 @@ def stream_entry(class: U32, bytes: +List<U32>) -> M.HeapEntry:
 def stream_closed_found(found: Maybe<&2, M.Slot>) -> Bool:
   match found:
     case None{}: False{}
-    case Some{M.Slot{tag, bits}}: U32.is_ne(bits, 0)
+    case Some{slot}: U32.is_ne(M.slot_bits(slot), 0)
 
 def stream_closed(fields: +List<M.Binding>) -> Bool:
   stream_closed_found(binding_find(fields, 0))
@@ -239,7 +344,7 @@ def drop_chars(xs: +List<U32>, n: Nat) -> +List<U32>:
 def integer_value_found(found: Maybe<&2, M.Slot>) -> U32:
   match found:
     case None{}: 0
-    case Some{M.Slot{tag, bits}}: bits
+    case Some{slot}: M.slot_bits(slot)
 
 def integer_value(fields: +List<M.Binding>) -> U32:
   integer_value_found(binding_find(fields, 0))
@@ -254,24 +359,3 @@ def integer_intern_scan(entries: +List<M.HeapEntry>, +class: U32, +bits: U32, +r
 
 def integer_intern(+heap: +List<M.HeapEntry>, class: U32, bits: U32) -> Maybe<&2, U32>:
   integer_intern_scan(heap, class, bits, 1)
-def wide_entry(tag: U32, high: U32, low: U32) -> M.HeapEntry:
-  M.HeapEntry{0, 9, tag, [M.Binding{0, M.Slot{1, high}}, M.Binding{1, M.Slot{1, low}}], Nil{}, Nil{}}
-def wide_object_entry(class: U32, tag: U32, high: U32, low: U32) -> M.HeapEntry:
-  M.HeapEntry{class, 9, tag, [M.Binding{0, M.Slot{1, high}}, M.Binding{1, M.Slot{1, low}}], Nil{}, Nil{}}
-
-def wide_word_found(found: Maybe<&2, M.Slot>) -> U32:
-  match found:
-    case None{}:
-      0
-    case Some{M.Slot{tag, bits}}:
-      bits
-
-def wide_high(entry: M.HeapEntry) -> U32:
-  match entry:
-    case M.HeapEntry{class, kind, element, fields, values, chars}:
-      wide_word_found(binding_find(fields, 0))
-
-def wide_low(entry: M.HeapEntry) -> U32:
-  match entry:
-    case M.HeapEntry{class, kind, element, fields, values, chars}:
-      wide_word_found(binding_find(fields, 1))

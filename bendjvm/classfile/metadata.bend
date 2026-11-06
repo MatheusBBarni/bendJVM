@@ -190,7 +190,7 @@ def default_placement(attributes: +List<M.Attribute>, +classFlags: U32, +arity: 
 def methods_checked(methods: +List<M.Method>, +pool: +List<M.Constant>, +classFlags: U32, +constructorPrefix: U32) -> Result<&2, &2, String, +List<M.Method>>:
   match methods:
     case Nil{}: Done{Nil{}}
-    case Con{M.Method{+flags, +name, +descriptor, stack, locals, code, instructions, handlers, +attributes}, tail}:
+    case Con{M.Method{+flags, +name, +descriptor, stack, locals, code, instructions, handlers, +attributes, switches}, tail}:
       do Result<&2, &2, String, +List<M.Method>>:
         +parsed : M.Descriptor <- D.parse_method(descriptor)
         default_placement(attributes, classFlags, D.parameter_count(parsed), name)
@@ -200,7 +200,7 @@ def methods_checked(methods: +List<M.Method>, +pool: +List<M.Constant>, +classFl
         codeMetadata : M.AnnotationMetadata <- method_code_metadata(attributes, pool)
         metadata : M.AnnotationMetadata = AN.merge_code_metadata(declaration, codeMetadata)
         rest : +List<M.Method> <- methods_checked(tail, pool, classFlags, constructorPrefix)
-        return Con{M.Method{flags, name, descriptor, stack, locals, code, instructions, handlers, Con{M.ValidatedAnnotations{metadata}, attributes}}, rest}
+        return Con{M.Method{flags, name, descriptor, stack, locals, code, instructions, handlers, Con{M.ValidatedAnnotations{metadata}, attributes}, switches}, rest}
 
 # One shared encoded-byte budget bounds all annotation nodes in a class,
 # including nested Code attributes, before any structured annotation allocation.
@@ -225,7 +225,7 @@ def fields_budget(values: +List<M.Field>, +budget: U32) -> Result<&2, &2, String
 def methods_budget(values: +List<M.Method>, +budget: U32) -> Result<&2, &2, String, U32>:
   match values:
     case Nil{}: Done{budget}
-    case Con{M.Method{flags, name, descriptor, stack, locals, code, instructions, handlers, attributes}, tail}:
+    case Con{M.Method{flags, name, descriptor, stack, locals, code, instructions, handlers, attributes, switches}, tail}:
       do Result<&2, &2, String, U32>:
         next : U32 <- attributes_budget(attributes, budget)
         methods_budget(tail, next)

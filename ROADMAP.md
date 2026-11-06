@@ -23,32 +23,37 @@ ISO-8859-1/Unicode/continuation-aware `Properties.load(InputStream)` plus
 bounded UTF-8 `Properties.load(Reader)` parsing. Host JDK classes are not
 loaded.
 
-Current source verification: isolated Bend 2.0.36 artifact preparation succeeds;
-the fast suite passes 54 tests, the full suite passes 105, and `bend PROOF.bend`
-reports `ALL PROOFS CHECK`. The full suite also runs the packaged reflective
-component container through the CLI.
+Milestone 4 is implemented for Java 8 class files.
+Long and double values are two-word category-two values with Bend-side binary64 arithmetic and JDK-compatible `Double.toString` output.
+`tableswitch`, `lookupswitch` and every `wide` form decode, verify and execute.
+`invokedynamic` runs user bootstrap methods and Java 8 lambdas and method references through one MethodHandle path.
+Class loading is gated by a StackMapTable type checker written in Bend.
 
-This is not full OpenJDK reflection. Complete Java access-edge compatibility,
-default-method proxy dispatch and multiple loader-namespace rules,
-parent/complex static-initialization semantics, parameter-name reflection,
-exact annotation formatting, and full URL escaping remain bounded or
-unsupported. Supported proxy method-conflict and return validation are
-implemented. Method, field, and class `Signature` attributes and method-return
-and field type-argument annotations are implemented.
+Milestone 5 is implemented.
+Java threads run on a Bend scheduler with round-robin preemption, monitors and `wait`/`notify`, volatile fields and cross-thread class initialization.
+Sockets, `java.nio` channels and selectors, and client/server TLS park only the calling thread while the host performs the I/O.
+Native libraries load through BendJVM's own versioned plugin ABI into a supervised helper process, only from paths the launcher allows.
+The thread, monitor, NIO, TCP and TLS fixtures produce the same output as OpenJDK, and a packaged HTTPS example serves concurrent clients through the CLI.
+
+Current source verification: Bend 2.0.39 artifact preparation succeeds.
+The fast suite passes 105 tests and the full suite passes 162.
+`bend PROOF.bend` reports `ALL PROOFS CHECK`.
+The full suite also runs the packaged reflective component container and the broader-bytecode application through the CLI.
+
+Milestone 3 has no open exclusions left.
+Its completion slices (initialization, parameters, generics and nested classes, Java 8 access rules, default-method handles, user class loaders, subclass proxies, package scanning, formatting, serialization, and privileged actions) each have a fixture that matches the JDK's output byte for byte.
+See [plan 03](.plans/03-reflection-and-metadata.md) for the details and the remaining limitations of each slice.
 
 ## Spring Boot target
 
-An actual Spring Boot application is not supported yet. The bounded milestone-3
-slice does not supply the framework-scale reflection and runtime annotation
-materialization that Spring requires. Spring Boot still requires:
+An actual Spring Boot application is not supported yet.
+Reflection, annotations, proxies, class loaders and serialization now cover what Spring uses, but Spring Boot still requires:
 
-- Framework-scale reflective access, invocation, and annotation materialization.
-- Complete dynamic-proxy semantics, including default-method dispatch and
-  multiple loader namespaces.
-- `invokedynamic`.
-- Threads and synchronization.
+- Class files newer than Java 8 and their linkage forms (`StringConcatFactory`, constant-dynamic).
+- Threads, synchronization and the context class loader (plan 05).
 - Native libraries, NIO, and TLS.
-- A much larger Java standard library and nested-JAR launcher support.
+- A much larger Java standard library (for example the rest of `String`, `java.util.function` default methods, and `java.util.concurrent`).
+- Nested-JAR launcher support (plan 06).
 
 Without these features, a Spring Boot application would fail when it loads
 missing runtime classes or reaches unsupported bytecode.
@@ -70,7 +75,7 @@ missing runtime classes or reaches unsupported bytecode.
 - Blocking TCP client/server sockets with host resume, capability flags, and handle teardown.
 - Typed throwables, catch-type unwinding, and a packaged integrated-app check.
 
-### 3. Reflection and metadata — bounded slice complete
+### 3. Reflection and metadata - complete
 
 - Parse and retain structured visible/invisible annotation, parameter, type,
   default, and `Exceptions` metadata through linking.
@@ -93,25 +98,25 @@ missing runtime classes or reaches unsupported bytecode.
   normalization, origin-bound URL handles, ordered resource enumeration,
   local URL protocol/string forms, ISO-8859-1/Unicode/continuation-aware
   `Properties.load(InputStream)`, and bounded UTF-8 `Properties.load(Reader)`.
-- Explicit follow-on exclusions: true category-two stack layout, default-method
-  proxy dispatch and multiple loader namespaces, parent/complex
-  static-initialization semantics, parameter-name reflection, and complete URL
-  escaping.
+- Completion slices C1-C11: JVMS 5.5 initialization, parameter metadata, generic declarations and nested classes, Java 8 access rules, default-method special invocation, user class loaders with `defineClass` and namespaces, subclass proxies, classpath and package scanning, JDK formatting, object serialization, and privileged actions.
 
-### 4. Broader JVM bytecode support
+### 4. Broader JVM bytecode support - complete
 
-- Implement `invokedynamic`.
-- Add complete `long` and `double` support.
-- Add switch instructions.
-- Improve verifier coverage and compatibility.
+- General `invokedynamic` with user bootstrap methods, cached and reentrant linkage, `BootstrapMethodError` wrapping, and Java 8 LambdaMetafactory lambdas and method references.
+- MethodType, MethodHandles.Lookup `find*` methods, `bindTo`, `asType`, `insertArguments`, varargs collectors, and constant, mutable and volatile call sites.
+- Complete `long` and `double` execution: every opcode and conversion, fields, arrays, calls, wrappers, reflection and annotations.
+- `tableswitch` and `lookupswitch`, plus every Java 8 `wide` form.
+- A JVMS 4.10.1 StackMapTable type checker on every class-loading path, replacing the runner's Python stack check.
+- Remaining exclusions: `StringConcatFactory`, constant-dynamic, newer class-file versions, and further MethodHandle combinators.
 
-### 5. Concurrency and native integration
+### 5. Concurrency and native integration - complete
 
-- Add Java threads.
-- Implement monitors and `synchronized` methods and blocks.
-- Add volatile memory semantics.
-- Define a controlled interface for native libraries.
-- Add the networking and TLS primitives needed by web applications.
+- Java threads multiplexed on the Bend interpreter: lifecycle, interruption, `join`, `sleep`, daemon shutdown, uncaught-exception handlers, and one global fuel budget.
+- Reentrant monitors for `synchronized` methods and blocks, `wait`/`notify`/`notifyAll` with full recursion-depth restore, and a deadlock diagnostic.
+- Volatile fields under a sequentially consistent memory model, with atomic `long`/`double` and race-free class initialization.
+- A versioned, allowlisted native-plugin ABI with copied buffers, opaque handles, mapped errors, deadlines and crash containment.
+- Scheduler-aware TCP, `java.nio` buffers, channels and selectors, and TLS 1.2/1.3 sockets with certificate, hostname and client-certificate checks.
+- See [plan 05](.plans/05-concurrency-and-native-integration.md) for the design, the remaining limits and the checks that demonstrate each row.
 
 ### 6. Spring Boot launcher support
 

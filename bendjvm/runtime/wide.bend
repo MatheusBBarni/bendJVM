@@ -1,12 +1,9 @@
 import Base
 
-# A category-two JVM value is represented by its two raw U32 words. The VM
-# keeps the pair behind a wide heap entry; these pure helpers implement the
-# Java long bit operations without relying on a host 64-bit type.
+# Category-two JVM values retain raw high/low U32 words in model.Slot. These
+# pure helpers implement Java long bit operations without host 64-bit types.
 type Words is Data:
   Words{high: U32, low: U32}
-type DoubleParts is Data:
-  DoubleParts{sign: U32, exponent: U32, mantissa: Words}
 
 
 def add(a: Words, b: Words) -> Words:
@@ -53,21 +50,21 @@ def sar_one(a: Words) -> Words:
       sign : U32 = Bool.pick(U32, U32.is_ge(high, 2147483648), 2147483648, 0)
       Words{U32.or(U32.shrn(high, 1n), sign), U32.or(U32.shrn(low, 1n), U32.shln(U32.and(high, 1), 31n))}
 
-@unsafe def shl_steps(n: Nat, value: Words) -> Words:
+def shl_steps(n: Nat, value: Words) -> Words:
   match n:
     case 0n:
       value
     case 1n+p:
       shl_steps(p, shl_one(value))
 
-@unsafe def shr_steps(n: Nat, value: Words) -> Words:
+def shr_steps(n: Nat, value: Words) -> Words:
   match n:
     case 0n:
       value
     case 1n+p:
       shr_steps(p, shr_one(value))
 
-@unsafe def sar_steps(n: Nat, value: Words) -> Words:
+def sar_steps(n: Nat, value: Words) -> Words:
   match n:
     case 0n:
       value
@@ -86,7 +83,7 @@ def shr(value: Words, count: U32) -> Words:
 def sar(value: Words, count: U32) -> Words:
   sar_steps(shift_count(count), value)
 
-@unsafe def mul_steps(n: Nat, +a: Words, b: Words, +result: Words) -> Words:
+def mul_steps(n: Nat, +a: Words, b: Words, +result: Words) -> Words:
   match n b:
     case 0n _:
       result
@@ -133,9 +130,15 @@ def quotient_step(value: Words, bit: U32) -> Words:
     case Words{high, +low}:
       Words{U32.or(U32.shl(high), U32.shrn(low, 31n)), U32.or(U32.shl(low), bit)}
 
-def unsigned_div_step(bit: Bool, remainder: Words, +divisor: Words) -> DivisionStep:
+def unsigned_remainder_overflows(remainder: Words) -> Bool:
+  match remainder:
+    case Words{high, low}: U32.is_ge(high, 2147483648)
+
+def unsigned_div_step(bit: Bool, +remainder: Words, +divisor: Words) -> DivisionStep:
+  overflow = unsigned_remainder_overflows(remainder)
   +shifted = low_bit(shl_one(remainder), bit)
-  Bool.pick(DivisionStep, unsigned_less(shifted, divisor), DivisionStep{shifted, False{}}, DivisionStep{sub(shifted, divisor), True{}})
+  +take : Bool = overflow || Bool.not(unsigned_less(shifted, divisor))
+  DivisionStep{Bool.pick(Words, take, sub(shifted, divisor), shifted), take}
 def division_remainder(step: DivisionStep) -> Words:
   match step:
     case DivisionStep{remainder, quotientBit}: remainder
@@ -144,7 +147,7 @@ def division_bit(step: DivisionStep) -> Bool:
   match step:
     case DivisionStep{remainder, quotientBit}: quotientBit
 
-@unsafe def divide_steps(n: Nat, +dividend: Words, +divisor: Words, quotient: Words, remainder: Words) -> Division:
+def divide_steps(n: Nat, +dividend: Words, +divisor: Words, quotient: Words, remainder: Words) -> Division:
   match n:
     case 0n:
       Division{quotient, remainder}
@@ -193,127 +196,18 @@ def bit_or(a: Words, b: Words) -> Words:
 def bit_xor(a: Words, b: Words) -> Words:
   match a b:
     case Words{ah, al} Words{bh, bl}: Words{U32.xor(ah, bh), U32.xor(al, bl)}
-def double_unpack(value: Words) -> DoubleParts:
-  match value:
-    case Words{+high, low}:
-      +exponent : U32 = U32.and(U32.shrn(high, 20n), 2047)
-      +fraction : U32 = U32.and(high, 1048575)
-      hidden : U32 = Bool.pick(U32, U32.is_eq(exponent, 0), fraction, U32.or(fraction, 1048576))
-      DoubleParts{U32.and(high, 2147483648), exponent, Words{hidden, low}}
-
-def double_add_parts(+a: DoubleParts, +b: DoubleParts) -> DoubleParts:
-  match a b:
-    case DoubleParts{sa, ea, ma} DoubleParts{sb, eb, mb}:
-      Bool.pick(DoubleParts, U32.is_ge(ea, eb),
-        DoubleParts{sa, ea, add(ma, shr(mb, U32.sub(ea, eb)))},
-        DoubleParts{sb, eb, add(mb, shr(ma, U32.sub(eb, ea)))})
-
-def double_normalize(+value: DoubleParts) -> DoubleParts:
-  match value:
-    case DoubleParts{+sign, +exponent, +mantissa}:
-      match mantissa:
-        case Words{high, low}:
-          Bool.pick(DoubleParts, U32.is_ge(high, 2097152),
-            DoubleParts{sign, U32.add(exponent, 1), shr(mantissa, 1)},
-            DoubleParts{sign, exponent, Words{high, low}})
-
-def double_pack_normalized(value: DoubleParts) -> Words:
-  match value:
-    case DoubleParts{sign, exponent, mantissa}:
-      match mantissa:
-        case Words{high, low}:
-          Words{U32.or(sign, U32.or(U32.shln(exponent, 20n), U32.and(high, 1048575))), low}
-
-def double_pack(+value: DoubleParts) -> Words:
-  double_pack_normalized(double_normalize(value))
-
-def double_add(a: Words, b: Words) -> Words:
-  double_pack(double_add_parts(double_unpack(a), double_unpack(b)))
-
-def double_neg(value: Words) -> Words:
-  match value:
-    case Words{+high, low}: Words{U32.xor(high, 2147483648), low}
-
-def double_sub(a: Words, b: Words) -> Words:
-  double_add(a, double_neg(b))
-type LongTextState is Data:
-  LongPending{division: Division}
-  LongReady{quotient: Words, remainder: Words, zero: Bool}
-
-@unsafe def long_digits(n: Nat, +value: Words, +acc: String, state: Maybe<&2, LongTextState>) -> String:
-  match n state:
-    case 0n _:
-      acc
-    case 1n+p None{}:
-      long_digits(n, value, acc, Some{LongPending{unsigned_divide(value, Words{0, 10})}})
-    case 1n+p Some{LongPending{division}}:
-      match division:
-        case Division{+quotient, remainder}:
-          long_digits(n, value, acc, Some{LongReady{quotient, remainder, long_zero(quotient)}})
-    case 1n+p Some{LongReady{quotient, remainder, zero}}:
-      match zero:
-        case True{}:
-          SCon{Chr{U32.add(48, long_to_int(remainder))}, acc}
-        case False{}:
-          long_digits(p, quotient, SCon{Chr{U32.add(48, long_to_int(remainder))}, acc}, None{})
+# Decimal digits of an unsigned 64-bit magnitude, least significant first into acc.
+# `n` bounds the loop (20 digits suffice for 2^64); `done` stops after the most
+# significant digit, so the recursion is structural and needs no @unsafe.
+def long_digits(n: Nat, done: Bool, +division: Division, +acc: String) -> String:
+  match n done division:
+    case 0n _ _: acc
+    case 1n+p True{} _: acc
+    case 1n+p False{} Division{+quotient, remainder}:
+      long_digits(p, long_zero(quotient), unsigned_divide(quotient, Words{0, 10}), SCon{Chr{U32.add(48, long_to_int(remainder))}, acc})
 
 def long_show(+value: Words) -> String:
   +negative = sign_bit(value)
   +magnitude = Bool.pick(Words, negative, neg(value), value)
-  +digits = long_digits(128n, magnitude, "", None{})
+  +digits = long_digits(21n, False{}, unsigned_divide(magnitude, Words{0, 10}), "")
   Bool.pick(String, negative, "-" ++ digits, digits)
-type DoubleDecimal is Data:
-  DoubleDecimal{integer: Words, remainder: Words, denominator: Words}
-
-type FractionState is Data:
-  FractionPending{division: Division}
-  FractionReady{digit: U32, remainder: Words, zero: Bool}
-
-def double_split(+mantissa: Words, +exponent: U32) -> DoubleDecimal:
-  +left_shift = U32.sub(exponent, 1075)
-  +right_shift = U32.sub(1075, exponent)
-  Bool.pick(DoubleDecimal, U32.is_ge(exponent, 1075),
-    DoubleDecimal{shl(mantissa, left_shift), Words{0, 0}, Words{0, 1}},
-    Bool.pick(DoubleDecimal, U32.is_ge(exponent, 1023),
-      DoubleDecimal{shr(mantissa, right_shift), sub(mantissa, shl(shr(mantissa, right_shift), right_shift)), shl(Words{0, 1}, right_shift)},
-      DoubleDecimal{Words{0, 0}, mantissa, shl(Words{0, 1}, right_shift)}))
-
-@unsafe def double_fraction(n: Nat, +remainder: Words, +denominator: Words, +acc: String, state: Maybe<&2, FractionState>) -> String:
-  match n state:
-    case 0n _:
-      acc
-    case 1n+p None{}:
-      double_fraction(n, remainder, denominator, acc,
-        Some{FractionPending{unsigned_divide(mul(remainder, Words{0, 10}), denominator)}})
-    case 1n+p Some{FractionPending{division}}:
-      match division:
-        case Division{quotient, +remainder}:
-          double_fraction(n, remainder, denominator, acc,
-            Some{FractionReady{long_to_int(quotient), remainder, long_zero(remainder)}})
-    case 1n+p Some{FractionReady{digit, +remainder, zero}}:
-      match zero:
-        case True{}:
-          acc
-        case False{}:
-          double_fraction(p, remainder, denominator, SCon{Chr{U32.add(48, digit)}, acc}, None{})
-
-def double_render_state(+integer: Words, +remainder: Words, +denominator: Words, zero: Bool) -> String:
-  match zero:
-    case True{}:
-      long_show(integer)
-    case False{}:
-      long_show(integer) ++ "." ++ double_fraction(24n, remainder, denominator, "", None{})
-
-def double_render(value: DoubleDecimal) -> String:
-  match value:
-    case DoubleDecimal{integer, +remainder, denominator}:
-      double_render_state(integer, remainder, denominator, long_zero(remainder))
-
-def double_show_parts(value: DoubleParts) -> String:
-  match value:
-    case DoubleParts{sign, exponent, mantissa}:
-      +text = double_render(double_split(mantissa, exponent))
-      Bool.pick(String, U32.is_ne(sign, 0), "-" ++ text, text)
-
-def double_show(value: Words) -> String:
-  double_show_parts(double_unpack(value))

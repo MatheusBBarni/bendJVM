@@ -108,8 +108,8 @@ does not support:
 * Java agents.
 * complete reflection access checks, parameter-name reflection, or the
   complete OpenJDK reflection surface. Method, field, and class signatures are parsed.
-* Method handles.
-* `invokedynamic`.
+* `StringConcatFactory`, constant-dynamic, and MethodHandle combinators beyond
+  the Java 8 subset registered in `loader/bootstrap.bend`.
 * Java threads.
 * Monitors.
 * `synchronized`.
@@ -2927,6 +2927,20 @@ normal JVM bytecode
 
 ---
 
+## Native plugins
+
+A `native` method with no MiniJRE intrinsic is not an error at load time.
+The catalog gives it the intrinsic number `0x80000000 | method id`, and its first call becomes a `NativeCall` host effect.
+The host forwards that call to a plugin library the launcher allowed (`--native-library NAME=PATH`, `--native-allow PATH`) and that `System.load` or `System.loadLibrary` loaded.
+Plugins export `bendjvm_register_v1` (see `bendjvm/native/bendjvm_plugin.h`), mapping exact owner, name, descriptor and staticness to functions.
+They run in a supervised helper process (`bendjvm/native/helper.c`, compiled on first use): a crash or a call past `--native-timeout` ends the helper and fails the calls it held, and the VM keeps running.
+
+Only these values cross: `int`, `long`, `float`, `double`, `boolean`, `byte`, `char`, `short`, `String` (UTF-16, copied), primitive arrays (copied in, copied back after the call returns), and opaque handles the plugin issued.
+Object references never leave the VM.
+This is BendJVM's own bridge, not JNI.
+
+---
+
 # 103. Intrinsic Registry
 
 Key:
@@ -2975,92 +2989,93 @@ This naturally creates a capability boundary.
 
 ---
 
-# 105. Potential Sandbox Mode
-
-Future:
+# 105. Capability Flags
 
 ```bash
-bendjvm \
-  --no-files \
-  --no-network \
-  --max-heap 64mb \
-  --fuel 10000000 \
-  Main.class
+python3 scripts/run.py --no-files --no-net --max-heap 4096 --fuel 10000000 Main.class
 ```
 
-Because JVM IO only exists through BendJVM intrinsics, capabilities can be controlled centrally.
+Because JVM I/O only exists through BendJVM intrinsics, capabilities are controlled centrally.
+Native plugins are disabled unless a `--native-*` flag names them; TLS identity and trust come only from `--tls-*` flags.
+None of this is a sandbox: plugins run with the helper process's permissions.
 
 ---
 
 # 106. Threading
 
-No Java threads in V1.
-
-Future simulated threads:
+Java threads are VM-managed and multiplexed on the one Bend interpreter (`bendjvm/runtime/scheduler.bend`).
 
 ```text
-JvmThread {
-    id
-    frames
-    status
+ThreadState {
+    id, object (its java.lang.Thread), daemon, interrupted,
+    wait, timed, deadline, seq,
+    saved frames, status, exception, result, effect, continuations
+}
+
+Sched {
+    current, threads, monitors, class-initializer owners,
+    clocks, global fuel, quantum
 }
 ```
 
-VM:
+The running thread's execution state lives in the VM record itself; every other thread keeps a saved copy.
+A host round runs round-robin turns of `--quantum` instructions (default 1000) scaled by the thread's priority over 5, and returns to the host after about 24,000 instructions, after any new host request, or when nothing can run.
+A blocked socket read, native call or timer parks only its thread.
 
-```text
-VM {
-    threads
-    currentThread
-    heap
-}
-```
+Each round first re-evaluates every parked thread's wait against shared state: monitor owners, whether a joined thread still exists, class states, deadlines and interrupt flags.
+Nothing depends on a notifier remembering to wake a waiter, so wakeups cannot be lost.
 
-Scheduler executes:
+The memory model is sequentially consistent: one serialized order of shared-memory transitions that preserves each thread's program order.
+Volatile fields therefore need no extra machinery, `long`/`double` accesses are atomic, and `MutableCallSite.syncAll` only validates its argument.
+Compound operations stay non-atomic: `count++` from two threads can lose updates.
 
-```text
-N instructions
-```
-
-per thread.
-
-This preserves one Bend-owned shared JVM state.
+The run ends when no non-daemon thread is alive.
+An exception that ends `main` goes to the thread's or the default `UncaughtExceptionHandler` when one is installed, and the run exits with status 1.
+If every remaining thread waits on another and nothing external can wake them, the run fails with a `Deadlock:` report instead of hanging.
 
 ---
 
 # 107. Thread States
 
-Future:
-
 ```text
-RUNNABLE
-BLOCKED
-WAITING
-TIMED_WAITING
-TERMINATED
+NEW            started == false (kept in Java)
+RUNNABLE       running, ready, or waiting on a host operation
+BLOCKED        entering a monitor, or reacquiring one after wait
+WAITING        untimed wait, untimed join, another thread's class initializer
+TIMED_WAITING  sleep, timed wait, timed join
+TERMINATED     the thread record is gone
 ```
 
 ---
 
 # 108. Monitors
 
-Future heap objects include:
+Monitors are a table in the scheduler, not object fields:
 
 ```text
-monitorOwner
-monitorDepth
-waiters
+Monitor { object, owner thread, depth }
 ```
 
-Required for:
+`monitorenter` is reentrant; a contended entry parks the thread and re-executes the instruction once the owner releases.
+A synchronized method locks its receiver, or its declaring class's mirror when static, before its first instruction, and records the object in its frame.
+Return opcodes release it, and every frame removed by exception unwinding releases it once.
 
-```text
-monitorenter
-monitorexit
-synchronized
-wait
-notify
-```
+`wait` releases all of the owner's acquisitions and remembers the depth.
+`notify` moves the longest waiter, and `notifyAll` every waiter, toward reacquiring; neither hands the monitor over.
+A woken, timed-out or interrupted waiter takes the monitor back at its full depth before `wait` returns or throws.
+
+---
+
+# 108a. Networking and TLS
+
+`java.net` sockets, `java.nio` buffers, channels and selectors, and `javax.net.ssl` are Java classes in `bendjvm/jre/`.
+They reach the host through one intrinsic, `sun.nio.ch.HostIO.call(op, handle, arg, data, off, len)`, which sends a byte range and receives the host's reply in place.
+Buffer positions and channel state change only in Java.
+
+TLS runs in the host's maintained provider (Bun's `node:tls`).
+Bend owns the Java socket and session objects; the provider owns keys, certificates and records.
+Clients verify certificate chains and validity always, and host names when `SSLParameters.setEndpointIdentificationAlgorithm("HTTPS")` asks for it, as on the JDK.
+TLS 1.2 is the minimum.
 
 ---
 
@@ -3149,9 +3164,8 @@ field, and superclass types through `Type`, `ParameterizedType`, `TypeVariable`,
 return/parameter types and field type-argument paths. Class type parameters,
 generic interfaces, and local-variable/expression type-annotation queries
 remain unsupported; parsed metadata is retained.
-Wide annotation constants materialize as boxed raw-word `Long`/`Double`
-reflection values; general category-two bytecode, field, and call execution
-remains unsupported. Complete Java access-edge compatibility, default-method
+Wide annotation constants box to ordinary `Long`/`Double` values, and
+category-two bytecode, field, array, and call execution is supported. Complete Java access-edge compatibility, default-method
 proxy dispatch and loader-namespace rules, parent/complex static-initialization
 semantics, URL escaping, and exact annotation formatting remain bounded or
 unsupported.
@@ -3475,7 +3489,7 @@ semantics.
 
 ## Phase 13 — Threads
 
-Implement simulated Java threads.
+Implemented in milestone 5: Java threads, monitors, volatile fields, networking, TLS and native plugins (sections 106-108a).
 
 ---
 

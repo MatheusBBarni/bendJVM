@@ -92,9 +92,7 @@ def int_show(+x: U32) -> String:
   Bool.pick(String, negative(x), "-" ++ U32.show(negate(x)), U32.show(x))
 
 def slot_tag(slot: M.Slot) -> U32:
-  M.Slot{tag, bits} = slot
-  tag
+  M.slot_tag(slot)
 
 def slot_bits(slot: M.Slot) -> U32:
-  M.Slot{tag, bits} = slot
-  bits
+  M.slot_bits(slot)

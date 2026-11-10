@@ -1,10 +1,41 @@
 # Plan: Mark-and-sweep garbage collection
 
-Status: planned; no collector is implemented.
+Status: complete. See "As built" for where the implementation departs from the original design below.
 Source: `bendjvm-spec.md` sections 64, 65, and 76, and Phase 10.
 Depends on the current heap in milestone 2.
 Later plans that add roots: [bytecode](04-broader-jvm-bytecode-support.md) and [concurrency](05-concurrency-and-native-integration.md).
-`ROADMAP.md` does not list this work.
+
+## As built
+
+The plan was written before plans 03 to 05 landed. Their heap kinds, threads and intrinsics changed three things.
+
+**The safe point moved from `allocate` to the instruction boundary.**
+Intrinsics hold references in Bend locals across allocations (a parameter-mirror array builds its elements first, a throwable allocates its message after itself), so collecting inside `allocate` would free objects the running intrinsic still needs.
+An allocation past the limit now succeeds and sets `Roots.gc` to 1.
+When the instruction finishes, the interpreter collects (`execute.gc_after`), at a point where every reference is in a frame, root table, pending effect or continuation.
+If the live set still does not fit, the instruction is redone from its pre-state, collected and with `Roots.gc` set to 2, where allocation fails with `OutOfMemoryError` at the real site.
+The VM is an immutable value, so a redo has nothing to undo.
+The heap can briefly exceed `--max-heap` inside one instruction; Java cannot observe that.
+
+**The root set is larger than the table below.**
+`heap/gc.bend` also walks saved thread states, monitors, dynamic call sites, defining loaders and every field of `Cont`, `Effect` and `SerialTask` that can hold a reference.
+A field that may or may not hold a reference (for example `NeedToString.extra`) is followed anyway, since retaining one extra object is harmless.
+The bootstrap heap prefix is pinned.
+
+**Interned strings kept one rule.**
+Strings computed at run time (`substring`, `concat`, `StringBuilder.toString`, number formatting, file paths and the like) are fresh.
+Strings whose contents come from class files (member names, class names, descriptors, `ldc` constants) go through the literal table, as HotSpot does for those names, and that table is bounded by the program's symbols.
+`Long.valueOf` has a cache next to `Integer.valueOf`.
+
+Other details:
+
+- Host handles are found on sweep through the `element` tag that `put_handle` writes on file streams, and by field id for the Java-source `Socket`, `ServerSocket`, `SocketChannel` and `ServerSocketChannel`.
+- `heap/gc_core.bend` holds the pure mark and sweep and imports only safe modules, which is what lets `LAWS.bend` prove the hand-built heap law by computation.
+- `BENDJVM_GC_STRESS=N` collects every N instructions and never reuses a slot, so a missing root shows up as `InvalidReference`.
+  The fast suite was run under it at N=251 and N=31 and reported no `InvalidReference`.
+  At N=31 two checks fail for reasons unrelated to roots: `cli/max-heap`, because stress mode has no limit, and `threads/fuel-with-blocked-threads`, because the extra collections push it past the test's 60-second wall-clock limit.
+  Both pass without stress.
+- `BENDJVM_TRACE_CLOSES=1` logs each handle closed by a sweep, which is how the test tells that close from the process-exit sweep.
 
 ## Goal
 
@@ -139,10 +170,10 @@ Allocation order:
 
 1. Pop a free index and `put` the new entry, if the free list is non-empty.
 2. Append, if `length(heap) < maxHeap`.
-3. Collect once, then retry from step 1.
-4. Fail with `OutOfMemoryError` if the live set still does not fit.
+3. Otherwise place the entry anyway and flag the VM. The interpreter collects at the end of the instruction.
+4. If the live set still does not fit, redo the instruction with allocation failures on, which throws `OutOfMemoryError` at the real allocation.
 
-Step 3 runs at most once per allocation.
+Step 3 collects at most once per instruction.
 The collector allocates no JVM objects.
 Its bitmap and worklist are Bend lists.
 A nested collection is a bug.
@@ -224,9 +255,8 @@ The process-exit sweep still closes anything left.
 
 ### Safe point
 
-The only safe point in this milestone is `allocate`, before it reports `OutOfMemoryError`.
-Frames, statics, the pending effect, and continuations are complete at that point.
-No instruction handler needs its own collection call.
+The only safe point is the end of an instruction (`execute.gc_after`), not `allocate`; see "As built".
+Frames, statics, the pending effect, and continuations are complete at that point, and no instruction handler needs its own collection call.
 
 Plan 05's scheduler must collect only at a safe point where every thread's frames and parked continuations are visible, on the single shared heap.
 This milestone does not add threads.

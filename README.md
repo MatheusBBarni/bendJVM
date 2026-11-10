@@ -145,7 +145,7 @@ Useful options:
 | Option | Purpose |
 | --- | --- |
 | `--fuel N` | Stop after at most `N` interpreter steps. Default: `1000000`. |
-| `--max-heap N` | Limit simulated heap entries. Default: `1024`. |
+| `--max-heap N` | Limit live heap entries. A collection runs when an allocation would pass the limit, and `OutOfMemoryError` is thrown if the live set still does not fit. Default: `1024`. |
 | `--no-files` | Deny `FileInputStream`/`FileOutputStream` host effects. |
 | `--no-net` | Deny socket, channel and TLS host effects. |
 | `--quantum N` | Instructions a Java thread runs before the scheduler switches threads. Default: `1000`. |
@@ -396,8 +396,8 @@ that surface; `LambdaMetafactory.metafactory` and `altMetafactory` (including
 `SerializedLambda`) back Java 8 lambdas and method references.
 
 Host file and socket effects use opaque handles scoped to one VM run and never reused. `--no-files`
-and `--no-net` deny those effects with `IOException` (`SocketException` for sockets). `--max-heap` counts heap
-entries. Relative files resolve against the launch working directory. The host
+and `--no-net` deny those effects with `IOException` (`SocketException` for sockets). `--max-heap` counts live heap
+entries. A file or socket that becomes garbage while still open is closed by the host after the collection that reclaimed it; there are no finalizers. Relative files resolve against the launch working directory. The host
 closes remaining handles on every process exit, including fuel exhaustion and
 uncaught exceptions. This is a capability control, not a sandbox.
 
@@ -418,7 +418,7 @@ yet promise:
   inference-based fallback for class files without frames
 - JNI (the native bridge is BendJVM's own restricted ABI), `ThreadLocal`, `java.util.concurrent`, `SSLEngine`, TLS over
   selectable channels, `DatagramChannel` or direct buffers
-- garbage collection, JIT compilation, or Spring Boot nested-JAR layouts
+- moving or generational garbage collection, `System.gc`, soft/weak/phantom references, finalizers, JIT compilation, or Spring Boot nested-JAR layouts
 
 BendJVM is not a sandbox-grade security boundary. Java code only reaches host behavior through registered intrinsics, but untrusted bytecode should still be treated as untrusted input.
 Native plugins run real native code with the helper process's operating-system permissions: the separate process keeps a plugin crash away from the VM, but it does not contain a malicious library.

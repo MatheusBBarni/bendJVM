@@ -89,17 +89,12 @@ def constant_string_allocate(found: Result<&2, &2, String, H.Allocation>) -> Res
     case Fail{error}: Fail{error}
     case Done{allocation}: constant_string_allocated(allocation)
 
-def constant_string_intern(found: Maybe<&2, U32>, +vm: M.VM, class: U32, +chars: +List<U32>) -> Result<&2, &2, String, StaticConstant>:
-  match found:
-    case Some{reference}: Done{StaticConstant{vm, M.Slot{3, reference}}}
-    case None{}: constant_string_allocate(H.allocate(vm, H.string_entry(class, chars)))
-
 def constant_string(+vm: M.VM, text: String) -> Result<&2, &2, String, StaticConstant>:
   do Result<&2, &2, String, StaticConstant>:
     +class : U32 = H.named_class(V.classes(vm), V.symbols(vm), "java/lang/String")
     checked_class : Unit <- V.check(U32.is_ne(class, 4294967295), "NoClassDefFoundError: java/lang/String")
     +chars : +List<U32> = G.units_from_string(text)
-    result : StaticConstant <- constant_string_intern(H.string_intern(V.heap(vm), chars), vm, class, chars)
+    result : StaticConstant <- constant_string_allocate(H.literal_string(vm, chars))
     return result
 def constant_slot(+vm: M.VM, expected: U32, +pool: +List<M.Constant>, value: M.Constant) -> Result<&2, &2, String, StaticConstant>:
   match expected value:
@@ -158,7 +153,8 @@ def vm_from(catalog: C.Catalog, classes: +List<M.LoadedClass>, resources: +List<
       host : M.Host = M.Host{M.Idle{}, ".", 3, 16777216, Nil{}, metadata, Nil{}, M.empty_loaders(), M.empty_sched(), Nil{}}
       statics : +List<M.Binding> = C.static_fields(fields, Nil{})
       patched : +List<M.Binding> = patch_type_fields(fields, symbols, names, patch_out(fields, symbols, statics))
-      vm : M.VM = M.VM{classes, methods, fields, symbols, bootstrap_heap(names), patched, resources, Nil{}, 0, 0, M.Slot{0, 0}, Nil{}, "", maxHeap, 0n, host}
+      +heap : +List<M.HeapEntry> = bootstrap_heap(names)
+      vm : M.VM = M.VM{classes, methods, fields, symbols, heap, patched, resources, Nil{}, 0, 0, M.Slot{0, 0}, Nil{}, "", maxHeap, 0n, host, H.bootstrap_roots(heap)}
       install_class_constants(vm, sources, 0, fields, symbols)
 
 def parse_classes(values: +List<+List<U32>>, +acc: +List<M.ClassFile>) -> Result<&2, &2, String, +List<M.ClassFile>>:
@@ -445,9 +441,9 @@ def check_dependencies(classes: +List<M.ClassFile>, +known: +List<String>) -> Re
 
 def published(+vm: M.VM, +sources: +List<M.ClassFile>, +appended: +List<M.LoadedClass>, +fields: +List<M.LoadedField>, +methods: +List<M.LoadedMethod>, +symbols: +List<String>, metadata: M.Metadata, oldClasses: U32, oldFields: U32) -> Result<&2, &2, String, M.VM>:
   match vm:
-    case M.VM{+classes, old_methods, old_fields, old_symbols, +heap, +statics, resources, frames, status, exception, result, output, error, maxHeap, steps, M.Host{effect, cwd, caps, maxPayload, cont, old_metadata, dynamicSites, loaders, sched, errors}}:
+    case M.VM{+classes, old_methods, old_fields, old_symbols, +heap, +statics, resources, frames, status, exception, result, output, error, maxHeap, steps, M.Host{effect, cwd, caps, maxPayload, cont, old_metadata, dynamicSites, loaders, sched, errors}, roots}:
       +fresh : +List<M.Binding> = C.static_fields(M.drop(M.LoadedField, fields, U32.to_nat(oldFields)), Nil{})
-      +assembled : M.VM = M.VM{M.append(M.LoadedClass, classes, appended), methods, fields, symbols, heap, M.append(M.Binding, statics, fresh), resources, frames, status, exception, result, output, error, maxHeap, steps, M.Host{effect, cwd, caps, maxPayload, cont, metadata, dynamicSites, loaders, sched, errors}}
+      +assembled : M.VM = M.VM{M.append(M.LoadedClass, classes, appended), methods, fields, symbols, heap, M.append(M.Binding, statics, fresh), resources, frames, status, exception, result, output, error, maxHeap, steps, M.Host{effect, cwd, caps, maxPayload, cont, metadata, dynamicSites, loaders, sched, errors}, roots}
       install_class_constants(assembled, sources, oldClasses, fields, symbols)
 def publish_catalog(+vm: M.VM, catalog: C.Catalog, +oldClasses: U32, oldFields: U32) -> Result<&2, &2, String, M.VM>:
   match catalog:

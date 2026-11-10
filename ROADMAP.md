@@ -125,6 +125,15 @@ missing runtime classes or reaches unsupported bytecode.
 - Load application resources and configuration files.
 - Run a small Spring Boot compatibility example.
 
+### 7. Garbage collection - complete
+
+- `--max-heap` limits live entries, and a sequential mark-and-sweep collector written in Bend reclaims everything the roots do not reach.
+- References keep their numbers across a collection, so Java `==` is unaffected.
+- Collection runs at instruction boundaries; an instruction that truly does not fit is redone so `OutOfMemoryError` comes from the real allocation.
+- String literals, the `Integer`/`Long` caches and `Class` mirrors live in explicit tables, and `String.intern` is registered.
+- Open files and sockets that become garbage are closed by the host.
+- See [plan 07](.plans/07-garbage-collection.md).
+
 ### 8. Parallel Java threads - in progress
 
 - Build BendJVM as a native Bend program, since the JavaScript target always runs sequentially, and move the host layer (files, sockets, selectors, DNS, TLS through OpenSSL, the native helper) to native effects.

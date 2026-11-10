@@ -6,6 +6,7 @@ import ../runtime/wide.bend as W
 import ../runtime/binary64.bend as B64
 import ../runtime/value.bend as V
 import ../heap/heap.bend as H
+import ../heap/gc.bend as Gc
 import ../loader/bootstrap.bend as B
 import ../loader/symbols.bend as Sy
 import ../java/intrinsic.bend as I
@@ -226,7 +227,7 @@ def void_frames(+vm: M.VM, frames: +List<M.Frame>) -> M.VM:
         case Con{caller, callers}: S.with_frames(vm, Con{caller, callers})
 def allocate_named_result(+vm: M.VM, name: String, result: Result<&2, &2, String, H.Allocation>) -> M.VM:
   match result:
-    case Fail{error}: S.with_exception(vm, 2)
+    case Fail{error}: S.with_exception(vm, S.roots_oom(S.roots(vm)))
     case Done{H.Allocation{updated, reference}}: S.with_exception(updated, reference)
 
 def allocate_named(+vm: M.VM, +name: String) -> M.VM:
@@ -3629,40 +3630,19 @@ def literal_method_type(+vm: M.VM, +frame: M.Frame, +index: U32, max: U32) -> Re
     constant : M.Constant <- CP.get(pool, index)
     result : M.VM <- literal_method_type_constant(vm, frame, pool, max, constant)
     return result
-def literal_class_found(+vm: M.VM, +frame: M.Frame, class: U32, target: U32, found: Maybe<&2, U32>) -> Result<&2, &2, String, M.VM>:
-  match found:
-    case Some{reference}:
-      Done{S.commit(vm, S.frame_stack(S.advance(frame), Con{M.Slot{3, reference}, S.stack(frame)}))}
-    case None{}:
-      new_object_alloc(frame, H.allocate(vm, H.class_mirror_entry(class, target)))
 def literal_class(+vm0: M.VM, +frame: M.Frame, +targetName: U32) -> Result<&2, &2, String, M.VM>:
   do Result<&2, &2, String, M.VM>:
     +target_text : String <- S.require(String, M.nth(String, S.symbols(vm0), targetName), "InvalidConstant")
     +vm : M.VM <- L.ensure_array_class(vm0, target_text)
     +target : U32 = H.named_class(S.classes(vm), S.symbols(vm), target_text)
-    class : U32 = H.named_class(S.classes(vm), S.symbols(vm), "java/lang/Class")
-    found : Maybe<&2, U32> = H.class_mirror(S.heap(vm), target)
-    result : M.VM <- literal_class_found(vm, frame, class, target, found)
+    result : M.VM <- new_object_alloc(frame, H.class_mirror(vm, target))
     return result
-
-def literal_string_found(+vm: M.VM, +frame: M.Frame, symbol: U32, class: U32, found: Maybe<&2, U32>) -> Result<&2, &2, String, M.VM>:
-  match found:
-    case Some{reference}:
-      Done{S.commit(vm, S.frame_stack(S.advance(frame), Con{M.Slot{3, reference}, S.stack(frame)}))}
-    case None{}:
-      do Result<&2, &2, String, M.VM>:
-        text : String <- S.require(String, M.nth(String, S.symbols(vm), symbol), "InvalidConstant")
-        chars : +List<U32> = string_units(String.to_list(text))
-        result : M.VM <- new_object_alloc(frame, H.allocate(vm, H.string_entry(class, chars)))
-        return result
 
 def literal_string(+vm: M.VM, +frame: M.Frame, +symbol: U32) -> Result<&2, &2, String, M.VM>:
   do Result<&2, &2, String, M.VM>:
     text : String <- S.require(String, M.nth(String, S.symbols(vm), symbol), "InvalidConstant")
-    class : U32 = H.named_class(S.classes(vm), S.symbols(vm), "java/lang/String")
     chars : +List<U32> = string_units(String.to_list(text))
-    found : Maybe<&2, U32> = H.string_intern(S.heap(vm), chars)
-    result : M.VM <- literal_string_found(vm, frame, symbol, class, found)
+    result : M.VM <- new_object_alloc(frame, H.literal_string(vm, chars))
     return result
 
 def wide_read(+tag: U32, slot: M.Slot) -> Result<&2, &2, String, W.Words>:
@@ -4729,11 +4709,6 @@ def run_method_intrinsic(intrinsic: U32, fuel: Nat, +vm: M.VM, +frame: M.Frame, 
 def entry_lock_needed(+method: M.LoadedMethod, +frame: M.Frame) -> Bool:
   U32.is_ne(U32.and(M.loaded_method_flags(method), 32), 0) && U32.is_eq(S.frame_monitor(frame), 0) && U32.is_eq(S.pc(frame), 0) && U32.is_eq(method_intrinsic(method), 0)
 
-def class_lock_found(+vm: M.VM, +owner: U32, found: Maybe<&2, U32>) -> Result<&2, &2, String, H.Allocation>:
-  match found:
-    case Some{reference}: Done{H.Allocation{vm, reference}}
-    case None{}: H.allocate(vm, H.class_mirror_entry(H.named_class(S.classes(vm), S.symbols(vm), "java/lang/Class"), owner))
-
 def receiver_lock(+vm: M.VM, locals: +List<M.Slot>) -> Result<&2, &2, String, H.Allocation>:
   match locals:
     case Con{M.Slot{3, reference}, rest}: Done{H.Allocation{vm, reference}}
@@ -4742,7 +4717,7 @@ def receiver_lock(+vm: M.VM, locals: +List<M.Slot>) -> Result<&2, &2, String, H.
 # The object a synchronized method locks.
 def entry_lock_kind(isStatic: Bool, +vm: M.VM, +frame: M.Frame, +method: M.LoadedMethod) -> Result<&2, &2, String, H.Allocation>:
   match isStatic:
-    case True{}: class_lock_found(vm, M.loaded_method_owner(method), H.class_mirror(S.heap(vm), M.loaded_method_owner(method)))
+    case True{}: H.class_mirror(vm, M.loaded_method_owner(method))
     case False{}: receiver_lock(vm, S.locals(frame))
 
 def entry_lock(+vm: M.VM, +frame: M.Frame, +method: M.LoadedMethod) -> Result<&2, &2, String, H.Allocation>:
@@ -4776,6 +4751,34 @@ def run_frames(fuel: Nat, +vm: M.VM, frames: +List<M.Frame>, continue: U32 -> Na
     case Nil{}: S.with_status(vm, 1)
     case Con{+frame, rest}: run_method(M.nth(M.LoadedMethod, S.methods(vm), S.method_id(frame)), fuel, vm, frame, continue)
 
+# Instruction boundaries are the collector's safe point: every reference is now in
+# a frame, a root table, or a continuation. If the live set still does not fit after
+# collecting, the instruction is redone against the collected state with allocation
+# failures on, so OutOfMemoryError is thrown at the real allocation site.
+@unsafe def gc_after(+status: U32, +next_fuel: Nat, +next: M.VM, +frame: M.Frame, +loop_mode: U32, +fuel: Nat, +before: M.VM, found: Maybe<&2, M.LoadedMethod>) -> M.VM:
+  gc_after_mode(S.roots_gc(S.roots(next)), status, next_fuel, next, frame, loop_mode, fuel, before, found)
+
+@unsafe def gc_after_mode(mode: U32, +status: U32, +next_fuel: Nat, +next: M.VM, +frame: M.Frame, +loop_mode: U32, +fuel: Nat, +before: M.VM, found: Maybe<&2, M.LoadedMethod>) -> M.VM:
+  match mode:
+    case 0: loop_with(0, status, next_fuel, next, S.frames(next), None{}, frame)
+    case 1: gc_after_collected(Gc.collect(next), next_fuel, frame, loop_mode, fuel, before, found)
+    case 2:
+      +cleared : M.VM = Gc.clear_strict(next)
+      loop_with(0, status, next_fuel, cleared, S.frames(cleared), None{}, frame)
+    case _:
+      +ticked : M.VM = Gc.stress(next)
+      loop_with(0, S.status(ticked), next_fuel, ticked, S.frames(ticked), None{}, frame)
+
+@unsafe def gc_after_collected(+collected: M.VM, +next_fuel: Nat, +frame: M.Frame, +loop_mode: U32, +fuel: Nat, +before: M.VM, found: Maybe<&2, M.LoadedMethod>) -> M.VM:
+  gc_after_fit(Gc.fits(collected), collected, next_fuel, frame, loop_mode, fuel, before, found)
+
+@unsafe def gc_after_fit(fits: Bool, +collected: M.VM, +next_fuel: Nat, +frame: M.Frame, +loop_mode: U32, +fuel: Nat, +before: M.VM, found: Maybe<&2, M.LoadedMethod>) -> M.VM:
+  match fits:
+    case True{}: loop_with(0, S.status(collected), next_fuel, collected, S.frames(collected), None{}, frame)
+    case False{}:
+      +redo : M.VM = Gc.strict(before)
+      loop_with(loop_mode, S.status(redo), fuel, redo, S.frames(redo), found, frame)
+
 @unsafe def loop_with(mode: U32, status: U32, +fuel: Nat, +vm: M.VM, +frames: +List<M.Frame>, found: Maybe<&2, M.LoadedMethod>, +frame: M.Frame) -> M.VM:
   match mode:
     case 0:
@@ -4795,12 +4798,12 @@ def run_frames(fuel: Nat, +vm: M.VM, frames: +List<M.Frame>, continue: U32 -> Na
         case _:
           match fuel:
             case 0n: S.with_left(S.with_status(vm, 3), 0n)
-            case 1n+p: run_frames(p, vm, frames, nextStatus => nextFuel => +nextVm => loop_with(0, nextStatus, nextFuel, nextVm, S.frames(nextVm), None{}, frame))
+            case 1n+p: run_frames(p, vm, frames, nextStatus => nextFuel => +nextVm => gc_after(nextStatus, nextFuel, nextVm, frame, 0, fuel, vm, found))
     case _:
       match found:
         case None{}: uncaught(vm, pending_exception_report(vm))
-        case Some{method}:
-          exception_resume_java(pending_exception_report(vm), vm, frame, method, fuel, nextStatus => nextFuel => +nextVm => loop_with(0, nextStatus, nextFuel, nextVm, S.frames(nextVm), None{}, frame))
+        case Some{+method}:
+          exception_resume_java(pending_exception_report(vm), vm, frame, method, fuel, nextStatus => nextFuel => +nextVm => gc_after(nextStatus, nextFuel, nextVm, frame, 1, fuel, vm, Some{method}))
 
 @unsafe def loop(fuel: Nat, +vm: M.VM) -> M.VM:
   loop_with(0, S.status(vm), fuel, vm, S.frames(vm), None{}, M.Frame{0, 0, 0, Nil{}, Nil{}, 4294967295, 0})
@@ -4862,8 +4865,9 @@ def resume_ref(+vm: M.VM, reference: U32) -> M.VM:
 
 
 def put_handle_entry(+vm: M.VM, +reference: U32, +handle: U32, extra: U32, entry: M.HeapEntry) -> M.VM:
-  M.HeapEntry{class, kind, element, fields, values, chars} = entry
-  H.put(vm, reference, M.HeapEntry{class, kind, element, [M.Binding{0, M.Slot{1, 0}}, M.Binding{1, M.Slot{1, handle}}, M.Binding{2, M.Slot{1, extra}}], values, chars})
+  M.HeapEntry{class, kind, old_element, fields, values, chars} = entry
+  # Element 1 marks a file stream that owns a host handle (see heap/gc.bend).
+  H.put(vm, reference, M.HeapEntry{class, kind, 1, [M.Binding{0, M.Slot{1, 0}}, M.Binding{1, M.Slot{1, handle}}, M.Binding{2, M.Slot{1, extra}}], values, chars})
 
 def put_handle_found(+vm: M.VM, +reference: U32, +handle: U32, extra: U32, result: Result<&2, &2, String, M.HeapEntry>) -> M.VM:
   match result:

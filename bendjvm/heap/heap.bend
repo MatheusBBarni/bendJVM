@@ -1,6 +1,8 @@
 import Base
 import ../model.bend as M
 import ../runtime/state.bend as S
+import ./trie.bend as T
+import ./gc_core.bend as C
 
 type Allocation is Data:
   Allocation{vm: M.VM, reference: U32}
@@ -33,12 +35,25 @@ def binding_upsert(has: Bool, +xs: +List<M.Binding>, +id: U32, +value: M.Slot) -
 def binding_set(+xs: +List<M.Binding>, +id: U32, +value: M.Slot) -> +List<M.Binding>:
   binding_upsert(binding_has(xs, id), xs, id, value)
 
+def free_kind() -> U32:
+  C.free_kind()
+
+def entry_kind(entry: M.HeapEntry) -> U32:
+  M.HeapEntry{class, kind, element, fields, values, chars} = entry
+  kind
+
+# A swept slot fails like a bad index: it must never alias the object that reuses it.
+def require_live(found: Maybe<&2, M.HeapEntry>) -> Result<&2, &2, String, M.HeapEntry>:
+  match found:
+    case None{}: Fail{"InvalidReference"}
+    case Some{+entry}: Bool.pick(Result<&2, &2, String, M.HeapEntry>, U32.is_eq(entry_kind(entry), free_kind()), Fail{"InvalidReference"}, Done{entry})
+
 def get_nonnull(heap: +List<M.HeapEntry>, reference: U32, null: Bool) -> Result<&2, &2, String, M.HeapEntry>:
   match null:
     case True{}:
       Fail{"java/lang/NullPointerException"}
     case False{}:
-      S.require(M.HeapEntry, M.nth(M.HeapEntry, heap, U32.sub(reference, 1)), "InvalidReference")
+      require_live(M.nth(M.HeapEntry, heap, U32.sub(reference, 1)))
 
 def get(heap: +List<M.HeapEntry>, +reference: U32) -> Result<&2, &2, String, M.HeapEntry>:
   get_nonnull(heap, reference, U32.is_eq(reference, 0))
@@ -46,16 +61,45 @@ def get(heap: +List<M.HeapEntry>, +reference: U32) -> Result<&2, &2, String, M.H
 def put(+vm: M.VM, reference: U32, entry: M.HeapEntry) -> M.VM:
   S.with_heap(vm, M.replace(M.HeapEntry, S.heap(vm), U32.to_nat(U32.sub(reference, 1)), entry))
 
-def allocate_room(+vm: M.VM, entry: M.HeapEntry, room: Bool) -> Result<&2, &2, String, Allocation>:
-  match room:
-    case False{}:
-      Fail{"OutOfMemoryError"}
-    case True{}:
-      +heap = S.heap(vm)
-      Done{Allocation{S.with_heap(vm, M.append(M.HeapEntry, heap, Con{entry, Nil{}})), U32.add(M.length(M.HeapEntry, heap), 1)}}
+# Takes the lowest free slot, or extends the heap list.
+def allocate_place(+vm: M.VM, entry: M.HeapEntry, free: +List<U32>, +roots: M.Roots) -> Allocation:
+  match free:
+    case Nil{}:
+      +reference : U32 = U32.add(S.roots_spine(roots), 1)
+      Allocation{S.with_roots(S.with_heap(vm, M.append(M.HeapEntry, S.heap(vm), [entry])), S.roots_appended(roots)), reference}
+    case Con{+reference, rest}:
+      Allocation{S.with_roots(S.with_heap(vm, M.replace(M.HeapEntry, S.heap(vm), U32.to_nat(U32.sub(reference, 1)), entry)), S.roots_reused(roots, rest)), reference}
 
+def allocate_over(+vm: M.VM, entry: M.HeapEntry, +roots: M.Roots, mode: U32) -> Result<&2, &2, String, Allocation>:
+  match mode:
+    case 2: Fail{"OutOfMemoryError"}
+    case _: Done{allocate_place(vm, entry, S.roots_free(roots), S.roots_with_gc(roots, 1))}
+
+def allocate_room(+vm: M.VM, entry: M.HeapEntry, +roots: M.Roots, room: Bool) -> Result<&2, &2, String, Allocation>:
+  match room:
+    case True{}: Done{allocate_place(vm, entry, S.roots_free(roots), roots)}
+    case False{}: allocate_over(vm, entry, roots, S.roots_gc(roots))
+
+# --max-heap limits live entries. An allocation past the limit still succeeds and
+# flags the VM; the interpreter collects at the end of the instruction, when every
+# reference is back in a frame, a root table, or a continuation, and redoes the
+# instruction with mode 2 if the live set truly does not fit. Intrinsics hold
+# references in Bend locals across allocations, so collecting here would be unsafe.
+# Stress mode has no limit: it exists to catch missing roots.
 def allocate(+vm: M.VM, entry: M.HeapEntry) -> Result<&2, &2, String, Allocation>:
-  allocate_room(vm, entry, U32.is_lt(M.length(M.HeapEntry, S.heap(vm)), S.max_heap(vm)))
+  +roots : M.Roots = S.roots(vm)
+  allocate_room(vm, entry, roots, U32.is_lt(S.roots_live(roots), S.max_heap(vm)) || U32.is_eq(S.roots_gc(roots), 3))
+
+def mirror_scan(entries: +List<M.HeapEntry>, +reference: U32, +table: M.Trie) -> M.Trie:
+  match entries:
+    case Nil{}: table
+    case Con{M.HeapEntry{class, +kind, +element, fields, values, chars}, rest}:
+      mirror_scan(rest, U32.add(reference, 1), Bool.pick(M.Trie, U32.is_eq(kind, 8), T.set(table, element, reference), table))
+
+# The bootstrap heap is fully live and pinned; its Class mirrors seed the mirror table.
+def bootstrap_roots(+heap: +List<M.HeapEntry>) -> M.Roots:
+  +size : U32 = M.length(M.HeapEntry, heap)
+  M.Roots{Nil{}, size, size, 0, 0, 0, size, 2, M.TrieEmpty{}, M.TrieEmpty{}, M.TrieEmpty{}, mirror_scan(heap, 1, M.TrieEmpty{}), Nil{}}
 
 def filled(n: Nat, +value: M.Slot) -> +List<M.Slot>:
   match n:
@@ -238,7 +282,7 @@ def entry_class(entry: M.HeapEntry) -> U32:
 #   3 String                  4 byte stream            5 ArrayList
 #   6 HashMap                 7 StringBuilder          8 Class mirror
 #   9 annotation instance    10 dynamic proxy         11 pending annotation value
-#   20-24 java.lang.invoke objects, named below.
+#   20-24 java.lang.invoke objects, named below.  255 free slot (plan 07).
 def kind_method_type() -> U32:
   20
 
@@ -275,31 +319,92 @@ def units_equal(left: +List<U32>, right: +List<U32>) -> Bool:
     case _ _:
       False{}
 
-def string_intern_scan(entries: +List<M.HeapEntry>, +chars: +List<U32>, +reference: U32) -> Maybe<&2, U32>:
-  match entries:
-    case Nil{}:
-      None{}
-    case Con{entry, rest}:
-      match entry:
-        case M.HeapEntry{class, kind, element, fields, values, +entry_chars}:
-          Bool.pick(Maybe<&2, U32>, U32.is_eq(kind, 3) && units_equal(entry_chars, chars), Some{reference}, string_intern_scan(rest, chars, (reference + 1 : U32)))
+def units_hash(chars: +List<U32>, +acc: U32) -> U32:
+  match chars:
+    case Nil{}: acc
+    case Con{+c, rest}: units_hash(rest, U32.add(U32.mul(acc, 31), c))
 
-def string_intern(+heap: +List<M.HeapEntry>, +chars: +List<U32>) -> Maybe<&2, U32>:
-  string_intern_scan(heap, chars, 1)
-def class_mirror_scan(entries: +List<M.HeapEntry>, +target: U32, +reference: U32) -> Maybe<&2, U32>:
-  match entries:
-    case Nil{}:
-      None{}
-    case Con{+entry, rest}:
-      match entry:
-        case M.HeapEntry{class, kind, element, fields, values, chars}:
-          Bool.pick(Maybe<&2, U32>, U32.is_eq(kind, 8) && U32.is_eq(element, target), Some{reference}, class_mirror_scan(rest, target, (reference + 1 : U32)))
+def entry_chars_equal(found: Maybe<&2, M.HeapEntry>, +chars: +List<U32>) -> Bool:
+  match found:
+    case Some{M.HeapEntry{class, +kind, element, fields, values, +entry_chars}}: U32.is_eq(kind, 3) && units_equal(entry_chars, chars)
+    case None{}: False{}
 
-def class_mirror(heap: +List<M.HeapEntry>, +target: U32) -> Maybe<&2, U32>:
-  class_mirror_scan(heap, target, 1)
+# Probe{0, h}: free cell at h. Probe{r, h}: the canonical string r lives at h.
+type Probe is Data:
+  Probe{reference: U32, hash: U32}
+
+@unsafe def literal_probe_next(same: Bool, fuel: Nat, +table: M.Trie, +heap: +List<M.HeapEntry>, +chars: +List<U32>, +hash: U32, +reference: U32) -> Probe:
+  match same:
+    case True{}: Probe{reference, hash}
+    case False{}: literal_probe(fuel, table, heap, chars, U32.add(hash, 1))
+
+# Collisions probe the next hash; a slot always exists because the table is finite.
+@unsafe def literal_probe(fuel: Nat, +table: M.Trie, +heap: +List<M.HeapEntry>, +chars: +List<U32>, +hash: U32) -> Probe:
+  match fuel:
+    case 0n: Probe{0, hash}
+    case 1n+p:
+      +reference : U32 = T.get(table, hash)
+      literal_probe_slot(U32.is_eq(reference, 0), p, table, heap, chars, hash, reference)
+
+@unsafe def literal_probe_slot(empty: Bool, fuel: Nat, +table: M.Trie, +heap: +List<M.HeapEntry>, +chars: +List<U32>, +hash: U32, +reference: U32) -> Probe:
+  match empty:
+    case True{}: Probe{0, hash}
+    case False{}: literal_probe_next(entry_chars_equal(M.nth(M.HeapEntry, heap, U32.sub(reference, 1)), chars), fuel, table, heap, chars, hash, reference)
+
+def literal_lookup(+vm: M.VM, +chars: +List<U32>) -> Probe:
+  literal_probe(1048576n, S.roots_literals(S.roots(vm)), S.heap(vm), chars, units_hash(chars, 0))
+
+def literal_record(+vm: M.VM, +hash: U32, +reference: U32) -> M.VM:
+  +roots : M.Roots = S.roots(vm)
+  S.with_roots(vm, S.roots_with_literals(roots, T.set(S.roots_literals(roots), hash, reference)))
+
+def literal_install(result: Result<&2, &2, String, Allocation>, +hash: U32) -> Result<&2, &2, String, Allocation>:
+  match result:
+    case Fail{error}: Fail{error}
+    case Done{Allocation{updated, +reference}}: Done{Allocation{literal_record(updated, hash, reference), reference}}
+
+def literal_found(probe: Probe, +vm: M.VM, +class: U32, +chars: +List<U32>) -> Result<&2, &2, String, Allocation>:
+  match probe:
+    case Probe{0, +hash}: literal_install(allocate(vm, string_entry(class, chars)), hash)
+    case Probe{+reference, hash}: Done{Allocation{vm, reference}}
+
+# The string literal pool: one object per UTF-16 contents for the whole run.
+def literal_string(+vm: M.VM, +chars: +List<U32>) -> Result<&2, &2, String, Allocation>:
+  literal_found(literal_lookup(vm, chars), vm, named_class(S.classes(vm), S.symbols(vm), "java/lang/String"), chars)
+
+# String.intern: the receiver becomes canonical unless an equal string already is.
+def literal_adopt_found(probe: Probe, +vm: M.VM, +receiver: U32) -> Allocation:
+  match probe:
+    case Probe{0, +hash}: Allocation{literal_record(vm, hash, receiver), receiver}
+    case Probe{+reference, hash}: Allocation{vm, reference}
+
+def literal_adopt(+vm: M.VM, +receiver: U32, +chars: +List<U32>) -> Allocation:
+  literal_adopt_found(literal_lookup(vm, chars), vm, receiver)
 
 def class_mirror_entry(mirror_class: U32, target: U32) -> M.HeapEntry:
   M.HeapEntry{mirror_class, 8, target, Nil{}, Nil{}, Nil{}}
+
+def mirror_lookup(+vm: M.VM, +target: U32) -> Maybe<&2, U32>:
+  +reference : U32 = T.get(S.roots_mirrors(S.roots(vm)), target)
+  Bool.pick(Maybe<&2, U32>, U32.is_eq(reference, 0), None{}, Some{reference})
+
+def mirror_record(+vm: M.VM, +target: U32, +reference: U32) -> M.VM:
+  +roots : M.Roots = S.roots(vm)
+  S.with_roots(vm, S.roots_with_mirrors(roots, T.set(S.roots_mirrors(roots), target, reference)))
+
+def mirror_install(result: Result<&2, &2, String, Allocation>, +target: U32) -> Result<&2, &2, String, Allocation>:
+  match result:
+    case Fail{error}: Fail{error}
+    case Done{Allocation{updated, +reference}}: Done{Allocation{mirror_record(updated, target, reference), reference}}
+
+def mirror_found(found: Maybe<&2, U32>, +vm: M.VM, +target: U32) -> Result<&2, &2, String, Allocation>:
+  match found:
+    case Some{reference}: Done{Allocation{vm, reference}}
+    case None{}: mirror_install(allocate(vm, class_mirror_entry(named_class(S.classes(vm), S.symbols(vm), "java/lang/Class"), target)), target)
+
+# The one Class object of a loaded class.
+def class_mirror(+vm: M.VM, +target: U32) -> Result<&2, &2, String, Allocation>:
+  mirror_found(mirror_lookup(vm, target), vm, target)
 
 def byte_slots(bytes: +List<U32>) -> +List<M.Slot>:
   match bytes:
@@ -349,13 +454,18 @@ def integer_value_found(found: Maybe<&2, M.Slot>) -> U32:
 def integer_value(fields: +List<M.Binding>) -> U32:
   integer_value_found(binding_find(fields, 0))
 
-def integer_intern_scan(entries: +List<M.HeapEntry>, +class: U32, +bits: U32, +reference: U32) -> Maybe<&2, U32>:
-  match entries:
-    case Nil{}: None{}
-    case Con{entry, rest}:
-      match entry:
-        case M.HeapEntry{+cls, kind, element, +fields, values, chars}:
-          Bool.pick(Maybe<&2, U32>, U32.is_eq(kind, 0) && U32.is_eq(cls, class) && U32.is_eq(integer_value(fields), bits), Some{reference}, integer_intern_scan(rest, class, bits, (reference + 1 : U32)))
+def integer_cached(+vm: M.VM, +bits: U32) -> Maybe<&2, U32>:
+  +reference : U32 = T.get(S.roots_integers(S.roots(vm)), bits)
+  Bool.pick(Maybe<&2, U32>, U32.is_eq(reference, 0), None{}, Some{reference})
 
-def integer_intern(+heap: +List<M.HeapEntry>, class: U32, bits: U32) -> Maybe<&2, U32>:
-  integer_intern_scan(heap, class, bits, 1)
+def integer_record(+vm: M.VM, +bits: U32, +reference: U32) -> M.VM:
+  +roots : M.Roots = S.roots(vm)
+  S.with_roots(vm, S.roots_with_integers(roots, T.set(S.roots_integers(roots), bits, reference)))
+
+def long_cached(+vm: M.VM, +low: U32) -> Maybe<&2, U32>:
+  +reference : U32 = T.get(S.roots_longs(S.roots(vm)), low)
+  Bool.pick(Maybe<&2, U32>, U32.is_eq(reference, 0), None{}, Some{reference})
+
+def long_record(+vm: M.VM, +low: U32, +reference: U32) -> M.VM:
+  +roots : M.Roots = S.roots(vm)
+  S.with_roots(vm, S.roots_with_longs(roots, T.set(S.roots_longs(roots), low, reference)))

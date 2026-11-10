@@ -6,6 +6,7 @@ import Base
 import ./bendjvm/model.bend as M
 import ./bendjvm/runtime/wide.bend as W
 import ./bendjvm/runtime/threads.bend as Th
+import ./bendjvm/heap/gc_core.bend as Gc
 
 law long_low_roundtrip:
   for value: U32
@@ -92,3 +93,17 @@ law host_wait_is_runnable:
   for +op: U32
   for +timed: Bool
   {Th.public_state_of(M.HostOp{op}, timed) == 1 : U32}
+
+# The collector on a hand-built heap (plan 07, section 76 of the spec): object 1
+# is the root, object 2 is reached by a field, object 3 only reaches itself and is
+# freed. This is a check of one graph, not a proof of the general walk.
+def gc_heap() -> +List<M.HeapEntry>:
+  [M.HeapEntry{0, 0, 0, [M.Binding{0, M.Slot{3, 2}}], Nil{}, Nil{}},
+   M.HeapEntry{0, 0, 0, Nil{}, Nil{}, Nil{}},
+   M.HeapEntry{0, 0, 0, [M.Binding{0, M.Slot{3, 3}}], Nil{}, Nil{}}]
+
+law gc_frees_unreachable_cycle:
+  {Gc.swept_free(Gc.reclaim(gc_heap(), [1])) == [3] : +List<U32>}
+
+law gc_keeps_live_entries:
+  {M.take(M.HeapEntry, Gc.swept_kept(Gc.reclaim(gc_heap(), [1])), 2n) == M.take(M.HeapEntry, gc_heap(), 2n) : +List<M.HeapEntry>}

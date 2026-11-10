@@ -62,26 +62,15 @@ def alloc_ref(result: Result<&2, &2, String, H.Allocation>) -> Result<&2, &2, St
     case Fail{error}: Fail{error}
     case Done{H.Allocation{vm, reference}}: Done{TypeRef{vm, reference}}
 
-def string_ref_found(+vm: M.VM, +chars: +List<U32>, found: Maybe<&2, U32>) -> Result<&2, &2, String, TypeRef>:
-  match found:
-    case Some{reference}: Done{TypeRef{vm, reference}}
-    case None{}: alloc_ref(H.allocate(vm, H.string_entry(class_id(vm, "java/lang/String"), chars)))
-
 def string_ref(+vm: M.VM, text: String) -> Result<&2, &2, String, TypeRef>:
-  +chars = units_from_string(text)
-  string_ref_found(vm, chars, H.string_intern(S.heap(vm), chars))
-
-def mirror_found(+vm: M.VM, +target: U32, found: Maybe<&2, U32>) -> Result<&2, &2, String, TypeRef>:
-  match found:
-    case Some{reference}: Done{TypeRef{vm, reference}}
-    case None{}: alloc_ref(H.allocate(vm, H.class_mirror_entry(class_id(vm, "java/lang/Class"), target)))
+  alloc_ref(H.literal_string(vm, units_from_string(text)))
 
 def mirror_missing(+vm: M.VM, name: String, missing: Bool) -> Result<&2, &2, String, TypeRef>:
   match missing:
     case True{}: Fail{"java/lang/NoClassDefFoundError"}
     case False{}:
       +target = class_id(vm, name)
-      mirror_found(vm, target, H.class_mirror(S.heap(vm), target))
+      alloc_ref(H.class_mirror(vm, target))
 
 def mirror_ref(+vm: M.VM, +name: String) -> Result<&2, &2, String, TypeRef>:
   mirror_missing(vm, name, U32.is_eq(class_id(vm, name), 4294967295))

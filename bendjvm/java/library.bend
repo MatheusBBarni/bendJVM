@@ -229,14 +229,14 @@ def alloc_result(result: Result<&2, &2, String, H.Allocation>, cont: M.VM -> U32
     case Fail{error}: Fail{error}
     case Done{allocation}: alloc_ok(allocation, cont)
 
-def intern_or_alloc_found(+vm: M.VM, +chars: +List<U32>, found: Maybe<&2, U32>) -> Result<&2, &2, String, O.Outcome>:
-  match found:
-    case Some{reference}: ref_out(vm, reference)
-    case None{}:
-      alloc_result(H.allocate(vm, H.string_entry(class_id(vm, "java/lang/String"), chars)), vm2 => reference => ref_out(vm2, reference))
-
+# The literal pool: strings whose contents come from class files. Constants,
+# member names, and the like; one object per contents for the whole run.
 def intern_or_alloc(+vm: M.VM, +chars: +List<U32>) -> Result<&2, &2, String, O.Outcome>:
-  intern_or_alloc_found(vm, chars, H.string_intern(S.heap(vm), chars))
+  alloc_result(H.literal_string(vm, chars), vm2 => reference => ref_out(vm2, reference))
+
+# A new String: Java does not intern computed strings, so nothing canonicalizes these.
+def string_out(+vm: M.VM, +chars: +List<U32>) -> Result<&2, &2, String, O.Outcome>:
+  alloc_result(H.allocate(vm, H.string_entry(class_id(vm, "java/lang/String"), chars)), vm2 => reference => ref_out(vm2, reference))
 
 def units_from_char(+u: U32, +rest: +List<U32>) -> +List<U32>:
   Bool.pick(+List<U32>, U32.is_le(u, 65535), Con{u, rest}, Con{U32.add(55296, U32.shrn(U32.sub(u, 65536), 10n)), Con{U32.add(56320, U32.and(U32.sub(u, 65536), 1023)), rest}})
@@ -248,15 +248,9 @@ def units_from_list(values: +List<Char>) -> +List<U32>:
 
 def units_from_string(text: String) -> +List<U32>:
   units_from_list(String.to_list(text))
-def class_mirror_out_found(+vm: M.VM, +target: U32, found: Maybe<&2, U32>) -> Result<&2, &2, String, O.Outcome>:
-  match found:
-    case Some{reference}:
-      ref_out(vm, reference)
-    case None{}:
-      alloc_result(H.allocate(vm, H.class_mirror_entry(class_id(vm, "java/lang/Class"), target)), vm2 => reference => ref_out(vm2, reference))
-
 def class_mirror_out(+vm: M.VM, +target: U32) -> Result<&2, &2, String, O.Outcome>:
-  class_mirror_out_found(vm, target, H.class_mirror(S.heap(vm), target))
+  alloc_result(H.class_mirror(vm, target), vm2 => reference => ref_out(vm2, reference))
+
 def proxy_field(+vm: M.VM, reference: U32, index: U32) -> Result<&2, &2, String, U32>:
   do Result<&2, &2, String, U32>:
     entry : M.HeapEntry <- H.get(S.heap(vm), reference)
@@ -1457,7 +1451,7 @@ def url_open_stream(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O
     entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
     origin_ref : U32 <- url_field(entry, 1)
     origin : String <- string_text(vm, origin_ref)
-    result : O.Outcome <- intern_or_alloc(vm, units_from_string(url_path_info(url_origin_info(origin))))
+    result : O.Outcome <- string_out(vm, units_from_string(url_path_info(url_origin_info(origin))))
     return result
 def url_origin_scan(chars: +List<Char>, +acc: +List<Char>, archive: Bool) -> UrlOrigin:
   match chars:
@@ -1518,7 +1512,7 @@ def url_get_protocol(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, 
     +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
     origin_ref : U32 <- url_field(entry, 1)
     origin : String <- string_text(vm, origin_ref)
-    result : O.Outcome <- intern_or_alloc(vm, units_from_string(url_protocol_info(url_origin_info(origin))))
+    result : O.Outcome <- string_out(vm, units_from_string(url_protocol_info(url_origin_info(origin))))
     return result
 
 def url_to_external_form(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
@@ -1527,7 +1521,7 @@ def url_to_external_form(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, Stri
     +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
     origin_ref : U32 <- url_field(entry, 1)
     origin : String <- string_text(vm, origin_ref)
-    result : O.Outcome <- intern_or_alloc(vm, units_from_string(url_external_info(url_origin_info(origin))))
+    result : O.Outcome <- string_out(vm, units_from_string(url_external_info(url_origin_info(origin))))
     return result
 
 def url_to_string(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
@@ -4921,7 +4915,7 @@ def object_to_string(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, 
     checked : Unit <- S.check(U32.is_ne(ref, 0), npe())
     +entry : M.HeapEntry <- H.get(S.heap(vm), ref)
     text : String = slash_to_dot(class_name_text(vm, H.entry_class(entry))) ++ "@" ++ hex_go(8n, ref, "")
-    result : O.Outcome <- intern_or_alloc(vm, units_from_string(text))
+    result : O.Outcome <- string_out(vm, units_from_string(text))
     return result
 
 def require_non_null(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
@@ -5029,7 +5023,7 @@ def substring_range(+vm: M.VM, +chars: +List<U32>, +begin: U32, +end: U32) -> Re
     +len : U32 = chars_len(chars)
     checked : Unit <- S.check(Bool.not(V.negative(begin)) && Bool.not(V.negative(end)) && U32.is_le(begin, end) && U32.is_le(end, len), sioob())
     sliced : +List<U32> = H.slice_chars(H.drop_chars(chars, U32.to_nat(begin)), U32.to_nat(U32.sub(end, begin)))
-    result : O.Outcome <- intern_or_alloc(vm, sliced)
+    result : O.Outcome <- string_out(vm, sliced)
     return result
 
 def string_substring1(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
@@ -5056,7 +5050,7 @@ def string_concat(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.O
     checked : Unit <- S.check(U32.is_ne(bits_of(right), 0), npe())
     a : +List<U32> <- string_chars(vm, bits_of(left))
     b : +List<U32> <- string_chars(vm, bits_of(right))
-    result : O.Outcome <- intern_or_alloc(vm, concat_chars(a, b))
+    result : O.Outcome <- string_out(vm, concat_chars(a, b))
     return result
 
 def chars_nonempty(values: +List<U32>) -> Bool:
@@ -5109,7 +5103,7 @@ def string_to_string(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, 
 def string_value_of_int(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
     +value : M.Slot <- slot0(args)
-    result : O.Outcome <- intern_or_alloc(vm, units_from_string(V.int_show(bits_of(value))))
+    result : O.Outcome <- string_out(vm, units_from_string(V.int_show(bits_of(value))))
     return result
 
 def string_value_of_bool(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
@@ -5232,20 +5226,47 @@ def builder_to_string(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String,
   do Result<&2, &2, String, O.Outcome>:
     +receiver : M.Slot <- slot0(args)
     chars : +List<U32> <- builder_get(vm, bits_of(receiver))
-    result : O.Outcome <- intern_or_alloc(vm, chars)
+    result : O.Outcome <- string_out(vm, chars)
     return result
 
 def boxed_range(+bits: U32) -> Bool:
   Bool.not(V.signed_lt(bits, 4294967168)) && Bool.not(V.signed_lt(127, bits))
 
-def integer_box_cached(+vm: M.VM, +bits: U32, cached: Bool, found: Maybe<&2, U32>) -> Result<&2, &2, String, O.Outcome>:
-  match cached found:
-    case True{} Some{reference}: ref_out(vm, reference)
-    case _ _:
-      alloc_result(H.allocate(vm, M.HeapEntry{class_id(vm, "java/lang/Integer"), 0, 0, [M.Binding{0, M.Slot{1, bits}}], Nil{}, Nil{}}), vm2 => reference => ref_out(vm2, reference))
+def integer_cache_found(in_range: Bool, +vm: M.VM, +bits: U32) -> Maybe<&2, U32>:
+  match in_range:
+    case True{}: H.integer_cached(vm, bits)
+    case False{}: None{}
+
+def integer_box_alloc(+vm: M.VM, +bits: U32) -> Result<&2, &2, String, H.Allocation>:
+  H.allocate(vm, M.HeapEntry{class_id(vm, "java/lang/Integer"), 0, 0, [M.Binding{0, M.Slot{1, bits}}], Nil{}, Nil{}})
+
+def integer_box_store(+vm: M.VM, +bits: U32, +cached: Bool, +reference: U32) -> M.VM:
+  Bool.pick(M.VM, cached, H.integer_record(vm, bits, reference), vm)
+
+def integer_box_new(+vm: M.VM, +bits: U32, +cached: Bool) -> Result<&2, &2, String, O.Outcome>:
+  alloc_result(integer_box_alloc(vm, bits), vm2 => +reference => ref_out(integer_box_store(vm2, bits, cached, reference), reference))
+
+# Integer.valueOf caches -128..127 on Roots; outside that range every box is new.
+def integer_box_cached(+vm: M.VM, +bits: U32, +cached: Bool, found: Maybe<&2, U32>) -> Result<&2, &2, String, O.Outcome>:
+  match found:
+    case Some{reference}: ref_out(vm, reference)
+    case None{}: integer_box_new(vm, bits, cached)
 
 def integer_box(+vm: M.VM, +bits: U32) -> Result<&2, &2, String, O.Outcome>:
-  integer_box_cached(vm, bits, boxed_range(bits), H.integer_intern(S.heap(vm), class_id(vm, "java/lang/Integer"), bits))
+  integer_box_cached(vm, bits, boxed_range(bits), integer_cache_found(boxed_range(bits), vm, bits))
+
+def string_intern_done(allocation: H.Allocation) -> Result<&2, &2, String, O.Outcome>:
+  match allocation:
+    case H.Allocation{updated, canonical}: ref_out(updated, canonical)
+
+def string_intern(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
+  do Result<&2, &2, String, O.Outcome>:
+    +receiver : M.Slot <- slot0(args)
+    +reference : U32 = bits_of(receiver)
+    checked : Unit <- S.check(U32.is_ne(reference, 0), npe())
+    +entry : M.HeapEntry <- H.get(S.heap(vm), reference)
+    result : O.Outcome <- string_intern_done(H.literal_adopt(vm, reference, entry_chars(entry)))
+    return result
 
 def integer_value_of(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
@@ -5275,37 +5296,21 @@ def long_cache_range(+value: W.Words) -> Bool:
   Bool.not(W.signed_less(value, W.Words{4294967295, 4294967168})) &&
     Bool.not(W.signed_less(W.Words{0, 127}, value))
 
-def wide_binding_matches(found: Maybe<&2, M.Slot>, high: U32, low: U32) -> Bool:
-  match found:
-    case Some{M.Wide{4, actual_high, actual_low}}:
-      U32.is_eq(actual_high, high) && U32.is_eq(actual_low, low)
-    case _: False{}
-
-@unsafe def long_intern_scan(entries: +List<M.HeapEntry>, +class: U32, +field: U32, +high: U32, +low: U32, +reference: U32) -> Maybe<&2, U32>:
-  match entries:
-    case Nil{}: None{}
-    case Con{entry, rest}:
-      match entry:
-        case M.HeapEntry{object_class, kind, element, fields, values, chars}:
-          selected : Bool = U32.is_eq(object_class, class) && U32.is_eq(kind, 0) &&
-            wide_binding_matches(H.binding_find(fields, field), high, low)
-          Bool.pick(Maybe<&2, U32>, selected, Some{reference}, long_intern_scan(rest, class, field, high, low, (reference + 1 : U32)))
-
-def long_intern(heap: +List<M.HeapEntry>, class: U32, field: U32, high: U32, low: U32) -> Maybe<&2, U32>:
-  long_intern_scan(heap, class, field, high, low, 1)
-
 def wide_box_allocate(+vm: M.VM, +class_name: String, +field: U32, +value: M.Slot) -> Result<&2, &2, String, O.Outcome>:
   alloc_result(H.allocate(vm, H.object_entry(class_id(vm, class_name), [M.Binding{field, value}])), vm2 => reference => ref_out(vm2, reference))
 
-def wide_box_cached(vm: M.VM, class_name: String, field: U32, value: M.Slot, found: Maybe<&2, U32>) -> Result<&2, &2, String, O.Outcome>:
+def wide_box_long_store(+vm: M.VM, +low: U32, +class_name: String, +field: U32, +value: M.Slot) -> Result<&2, &2, String, O.Outcome>:
+  alloc_result(H.allocate(vm, H.object_entry(class_id(vm, class_name), [M.Binding{field, value}])), vm2 => +reference => ref_out(H.long_record(vm2, low, reference), reference))
+
+def wide_box_cached(+vm: M.VM, class_name: String, field: U32, value: M.Slot, +low: U32, found: Maybe<&2, U32>) -> Result<&2, &2, String, O.Outcome>:
   match found:
     case Some{reference}: ref_out(vm, reference)
-    case None{}: wide_box_allocate(vm, class_name, field, value)
+    case None{}: wide_box_long_store(vm, low, class_name, field, value)
+# Long.valueOf caches -128..127 on Roots, keyed by the low word.
 def wide_box_long_range(+vm: M.VM, +class_name: String, +field: U32, +value: M.Slot, +high: U32, +low: U32, cached: Bool) -> Result<&2, &2, String, O.Outcome>:
   match cached:
     case True{}:
-      wide_box_cached(vm, class_name, field, value,
-        long_intern(S.heap(vm), class_id(vm, class_name), field, high, low))
+      wide_box_cached(vm, class_name, field, value, low, H.long_cached(vm, low))
     case False{}:
       wide_box_allocate(vm, class_name, field, value)
 def wide_box_with_field(+vm: M.VM, +class_name: String, field: U32, +value: M.Slot) -> Result<&2, &2, String, O.Outcome>:
@@ -5350,7 +5355,7 @@ def long_to_string(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.
     value : M.Slot <- wide_value_from_binding(vm, receiver, 4)
     +words : W.Words <- wide_words(value, 4)
     text : String = W.long_show(words)
-    result : O.Outcome <- intern_or_alloc(vm, units_from_string(text))
+    result : O.Outcome <- string_out(vm, units_from_string(text))
     return result
 def double_to_string(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
@@ -5358,14 +5363,14 @@ def double_to_string(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, 
     value : M.Slot <- wide_value_from_binding(vm, receiver, 5)
     +words : W.Words <- wide_words(value, 5)
     text : String <- B64.double_to_string(words)
-    result : O.Outcome <- intern_or_alloc(vm, units_from_string(text))
+    result : O.Outcome <- string_out(vm, units_from_string(text))
     return result
 def string_value_of_wide(+vm: M.VM, +args: +List<M.Slot>, +tag: U32) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
     value : M.Slot <- slot0(args)
     +words : W.Words <- wide_words(value, tag)
     text : String <- wide_text(tag, words)
-    result : O.Outcome <- intern_or_alloc(vm, units_from_string(text))
+    result : O.Outcome <- string_out(vm, units_from_string(text))
     return result
 
 def builder_append_wide(+vm: M.VM, +args: +List<M.Slot>, +tag: U32) -> Result<&2, &2, String, O.Outcome>:
@@ -5632,7 +5637,7 @@ def integer_to_string(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String,
   do Result<&2, &2, String, O.Outcome>:
     +receiver : M.Slot <- slot0(args)
     +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
-    result : O.Outcome <- intern_or_alloc(vm, units_from_string(V.int_show(H.integer_value(entry_fields(entry)))))
+    result : O.Outcome <- string_out(vm, units_from_string(V.int_show(H.integer_value(entry_fields(entry)))))
     return result
 
 def math_abs(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
@@ -6476,11 +6481,11 @@ def throwable_get_suppressed(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, 
 
 def throwable_to_string_msg(+vm: M.VM, name: String, message: U32) -> Result<&2, &2, String, O.Outcome>:
   match message:
-    case 0: intern_or_alloc(vm, units_from_string(name))
+    case 0: string_out(vm, units_from_string(name))
     case _:
       do Result<&2, &2, String, O.Outcome>:
         chars : +List<U32> <- string_chars(vm, message)
-        result : O.Outcome <- intern_or_alloc(vm, concat_chars(units_from_string(name ++ ": "), chars))
+        result : O.Outcome <- string_out(vm, concat_chars(units_from_string(name ++ ": "), chars))
         return result
 
 def throwable_to_string(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
@@ -6972,7 +6977,7 @@ def primitive_to_string(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, Strin
   do Result<&2, &2, String, O.Outcome>:
     receiver : M.Slot <- slot0(args)
     +entry : M.HeapEntry <- H.get(S.heap(vm), bits_of(receiver))
-    result : O.Outcome <- intern_or_alloc(vm, units_from_string(V.int_show(field_bits(entry_fields(entry), 0))))
+    result : O.Outcome <- string_out(vm, units_from_string(V.int_show(field_bits(entry_fields(entry), 0))))
     return result
 
 def byte_value_of(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
@@ -7223,7 +7228,7 @@ def parameter_text(+vm: M.VM, +method: M.LoadedMethod, +index: U32, +type_name: 
   +flags : U32 = parameter_flags(vm, method, index)
   +varargs : Bool = U32.is_ne(U32.and(M.loaded_method_flags(method), 128), 0) && U32.is_eq(index, U32.sub(method_parameter_count(method), 1))
   +text : String = modifier_prefix(flags) ++ Bool.pick(String, varargs, varargs_type_name(type_name), type_name) ++ " " ++ parameter_name(vm, method, index)
-  intern_or_alloc(vm, units_from_string(text))
+  string_out(vm, units_from_string(text))
 
 def parameter_text_named(found: Result<&2, &2, String, TextAt>, +method: M.LoadedMethod, +index: U32) -> Result<&2, &2, String, O.Outcome>:
   match found:
@@ -8013,7 +8018,7 @@ type TextsAt is Data:
     case Done{TextsAt{+vm, exceptions}}:
       +owner_name : String = executable_owner_name(vm, method)
       +head : String = Bool.pick(String, constructor, owner_name, jvm_type_name(D.result_type(descriptor)) ++ " " ++ owner_name ++ "." ++ Sy.text(S.symbols(vm), M.loaded_method_name(method)))
-      intern_or_alloc(vm, units_from_string(executable_prefix(vm, method, constructor) ++ head ++ "(" ++ joined_type_names(D.parameter_types(descriptor)) ++ ")" ++ throws_text(exceptions)))
+      string_out(vm, units_from_string(executable_prefix(vm, method, constructor) ++ head ++ "(" ++ joined_type_names(D.parameter_types(descriptor)) ++ ")" ++ throws_text(exceptions)))
 
 # Method.toString / Constructor.toString: erased types, as the JDK prints them.
 @unsafe def executable_plain_string(+vm: M.VM, +method: M.LoadedMethod, +constructor: Bool) -> Result<&2, &2, String, O.Outcome>:
@@ -8033,7 +8038,7 @@ type TextsAt is Data:
 @unsafe def field_plain_string(+vm: M.VM, +field: M.LoadedField, +type_name: String) -> Result<&2, &2, String, O.Outcome>:
   +prefix : String = modifier_prefix_text(U32.and(M.loaded_field_flags(field), 223))
   +owner_name : String = internal_to_binary(class_name_text(vm, M.loaded_field_owner(field)))
-  intern_or_alloc(vm, units_from_string(prefix ++ type_name ++ " " ++ owner_name ++ "." ++ Sy.text(S.symbols(vm), M.loaded_field_name(field))))
+  string_out(vm, units_from_string(prefix ++ type_name ++ " " ++ owner_name ++ "." ++ Sy.text(S.symbols(vm), M.loaded_field_name(field))))
 
 @unsafe def field_to_string(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
@@ -8081,7 +8086,7 @@ type TextsAt is Data:
   Bool.pick(String, U32.is_eq(M.length(String, names), 0), "", "<" ++ join_names(names, ",") ++ "> ")
 
 @unsafe def generic_string_finish(+vm: M.VM, +prefix: String, +header: String, +params: +List<String>, +varargs: Bool, +exceptions: +List<String>) -> Result<&2, &2, String, O.Outcome>:
-  intern_or_alloc(vm, units_from_string(prefix ++ header ++ "(" ++ join_names(varargs_names(varargs, params), ",") ++ ")" ++ throws_text(exceptions)))
+  string_out(vm, units_from_string(prefix ++ header ++ "(" ++ join_names(varargs_names(varargs, params), ",") ++ ")" ++ throws_text(exceptions)))
 
 @unsafe def generic_exception_names(result: Result<&2, &2, String, TextsAt>) -> Result<&2, &2, String, TextsAt>:
   result
@@ -8129,7 +8134,7 @@ type TextsAt is Data:
     case Done{TextsAt{+vm, returned}}:
       +owner_name : String = executable_owner_name(vm, method)
       +header : String = Bool.pick(String, constructor, owner_name, join_names(returned, "") ++ " " ++ owner_name ++ "." ++ Sy.text(S.symbols(vm), M.loaded_method_name(method)))
-      intern_or_alloc(vm, units_from_string(prefix ++ header ++ "(" ++ join_names(varargs_names(U32.is_ne(U32.and(M.loaded_method_flags(method), 128), 0), params), ",") ++ ")" ++ throws_text(exceptions)))
+      string_out(vm, units_from_string(prefix ++ header ++ "(" ++ join_names(varargs_names(U32.is_ne(U32.and(M.loaded_method_flags(method), 128), 0), params), ",") ++ ")" ++ throws_text(exceptions)))
 
 @unsafe def generic_return_texts(+vm: M.VM, +method: M.LoadedMethod, +constructor: Bool) -> Result<&2, &2, String, TextsAt>:
   Bool.pick(Result<&2, &2, String, TextsAt>, constructor, Done{TextsAt{vm, Nil{}}}, outcome_reference_names(generic_signature_return(vm, method)))
@@ -8169,7 +8174,7 @@ def modifier_test(+vm: M.VM, +args: +List<M.Slot>, +bit: U32) -> Result<&2, &2, 
 def modifier_string(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
     +flags : M.Slot <- slot0(args)
-    result : O.Outcome <- intern_or_alloc(vm, units_from_string(modifier_text(bits_of(flags))))
+    result : O.Outcome <- string_out(vm, units_from_string(modifier_text(bits_of(flags))))
     return result
 
 # --- Security manager and privileged actions (plan 03, C11) ---
@@ -8371,7 +8376,7 @@ def take_until_semicolon_text(+text: String) -> String:
 
 @unsafe def text_join(+vm: M.VM, +acc: +List<U32>, +items: +List<M.TextItem>) -> Result<&2, &2, String, O.Outcome>:
   match items:
-    case Nil{}: intern_or_alloc(vm, acc)
+    case Nil{}: string_out(vm, acc)
     case Con{M.TextUnits{units}, rest}: text_join(vm, M.append(U32, acc, units), rest)
     case Con{M.TextCall{reference}, rest}: text_join_call(vm, acc, reference, rest)
     case Con{M.TextThrow{reference}, rest}: throw_ref(vm, reference)

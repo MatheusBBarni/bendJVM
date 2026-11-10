@@ -42,7 +42,7 @@ def none() -> U32:
     return text
 
 @unsafe def text_out(+vm: M.VM, +text: String) -> Result<&2, &2, String, O.Outcome>:
-  L.intern_or_alloc(vm, L.units_from_string(text))
+  L.string_out(vm, L.units_from_string(text))
 
 type Allocated is Data:
   Allocated{vm: M.VM, reference: U32}

@@ -195,7 +195,7 @@ def drop_spaces(+chars: +List<U32>) -> +List<U32>:
 @unsafe def trim_result(same: Bool, +vm: M.VM, +receiver: U32, +trimmed: +List<U32>) -> Result<&2, &2, String, O.Outcome>:
   match same:
     case True{}: L.ref_out(vm, receiver)
-    case False{}: L.intern_or_alloc(vm, trimmed)
+    case False{}: L.string_out(vm, trimmed)
 
 def replace_unit(+chars: +List<U32>, +old: U32, +new: U32) -> +List<U32>:
   match chars:
@@ -207,7 +207,7 @@ def string_replace_char(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, Strin
     +chars : +List<U32> <- receiver_chars(vm, args)
     +old : U32 <- int_arg(args, 1)
     +new : U32 <- int_arg(args, 2)
-    +result : O.Outcome <- L.intern_or_alloc(vm, replace_unit(chars, U32.and(old, 65535), U32.and(new, 65535)))
+    +result : O.Outcome <- L.string_out(vm, replace_unit(chars, U32.and(old, 65535), U32.and(new, 65535)))
     return result
 
 # replace(CharSequence, CharSequence): non-overlapping, left to right; an empty
@@ -240,7 +240,7 @@ def string_replace(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.
     +chars : +List<U32> <- receiver_chars(vm, args)
     +target : +List<U32> <- sequence_arg(vm, args, 1)
     +replacement : +List<U32> <- sequence_arg(vm, args, 2)
-    +result : O.Outcome <- L.intern_or_alloc(vm, replace_all_units(Bool.not(L.chars_nonempty(target)), chars, target, replacement))
+    +result : O.Outcome <- L.string_out(vm, replace_all_units(Bool.not(L.chars_nonempty(target)), chars, target, replacement))
     return result
 
 # Character.toUpperCase/toLowerCase for ASCII and Latin-1, compared unit by unit
@@ -284,13 +284,13 @@ def map_units(+chars: +List<U32>, +upper: Bool) -> +List<U32>:
 def string_to_upper(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
     +chars : +List<U32> <- receiver_chars(vm, args)
-    +result : O.Outcome <- L.intern_or_alloc(vm, map_units(chars, True{}))
+    +result : O.Outcome <- L.string_out(vm, map_units(chars, True{}))
     return result
 
 def string_to_lower(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
     +chars : +List<U32> <- receiver_chars(vm, args)
-    +result : O.Outcome <- L.intern_or_alloc(vm, map_units(chars, False{}))
+    +result : O.Outcome <- L.string_out(vm, map_units(chars, False{}))
     return result
 
 def unit_slots(+chars: +List<U32>) -> +List<M.Slot>:
@@ -312,7 +312,7 @@ def string_to_char_array(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, Stri
 def string_value_of_char(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
     +ch : U32 <- int_arg(args, 0)
-    +result : O.Outcome <- L.intern_or_alloc(vm, [U32.and(ch, 65535)])
+    +result : O.Outcome <- L.string_out(vm, [U32.and(ch, 65535)])
     return result
 
 def slot_units(+values: +List<M.Slot>) -> +List<U32>:
@@ -337,7 +337,7 @@ def string_value_of_chars(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, Str
   do Result<&2, &2, String, O.Outcome>:
     +array : U32 <- int_arg(args, 0)
     +units : +List<U32> <- char_array_units(vm, array)
-    +result : O.Outcome <- L.intern_or_alloc(vm, units)
+    +result : O.Outcome <- L.string_out(vm, units)
     return result
 
 def string_value_of_chars_range(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
@@ -347,7 +347,7 @@ def string_value_of_chars_range(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &
     +count : U32 <- int_arg(args, 2)
     +units : +List<U32> <- char_array_units(vm, array)
     +range : +List<U32> <- char_range(units, offset, count)
-    +result : O.Outcome <- L.intern_or_alloc(vm, range)
+    +result : O.Outcome <- L.string_out(vm, range)
     return result
 
 # new String(...) turns the freshly allocated object into a String entry.
@@ -410,11 +410,11 @@ def string_init_chars_range(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, S
 @unsafe def integer_radix(+vm: M.VM, +args: +List<M.Slot>, +shift: Nat, +mask: U32) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
     +value : U32 <- int_arg(args, 0)
-    +result : O.Outcome <- L.intern_or_alloc(vm, unsigned_text(value, shift, mask))
+    +result : O.Outcome <- L.string_out(vm, unsigned_text(value, shift, mask))
     return result
 
 @unsafe def integer_static_text(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
   do Result<&2, &2, String, O.Outcome>:
     +value : U32 <- int_arg(args, 0)
-    +result : O.Outcome <- L.intern_or_alloc(vm, L.units_from_string(V.int_show(value)))
+    +result : O.Outcome <- L.string_out(vm, L.units_from_string(V.int_show(value)))
     return result

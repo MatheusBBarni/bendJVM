@@ -919,7 +919,7 @@ type Member is Data:
 
 @unsafe def write_text(+vm: M.VM, +stream: U32, +text: String) -> Result<&2, &2, String, M.VM>:
   do Result<&2, &2, String, M.VM>:
-    +interned : Ref <- returned_ref(L.intern_or_alloc(vm, L.units_from_string(text)))
+    +interned : Ref <- returned_ref(L.string_out(vm, L.units_from_string(text)))
     return write_string(ref_vm(interned), stream, ref_reference(interned))
 
 # --- Subclass hooks ---

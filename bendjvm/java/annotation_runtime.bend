@@ -272,13 +272,8 @@ def string_error(+vm: M.VM, +name: String, first: String, second: M.Slot) -> Res
     return result
 
 
-def mirror_found(+vm: M.VM, +target: U32, found: Maybe<&2, U32>) -> Result<&2, &2, String, Value>:
-  match found:
-    case Some{reference}: Done{Value{vm, M.Slot{3, reference}}}
-    case None{}: allocated(H.allocate(vm, H.class_mirror_entry(id(vm, "java/lang/Class"), target)))
-
 def mirror(+vm: M.VM, +target: U32) -> Result<&2, &2, String, Value>:
-  mirror_found(vm, target, H.class_mirror(S.heap(vm), target))
+  allocated(H.class_mirror(vm, target))
 
 def enum_field(fields: +List<M.LoadedField>, +owner: U32, +name: String, +symbols: +List<String>) -> Maybe<&2, M.LoadedField>:
   match fields:

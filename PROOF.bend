@@ -60,3 +60,9 @@ def Laws.reacquire_is_blocked(object, depth, interrupted, timed):
 
 def Laws.host_wait_is_runnable(op, timed):
   {==}
+
+def Laws.gc_frees_unreachable_cycle():
+  {==}
+
+def Laws.gc_keeps_live_entries():
+  {==}

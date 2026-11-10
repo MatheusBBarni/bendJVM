@@ -205,6 +205,9 @@ def clock(high: U32, low: U32) -> M.Clock:
 def take_output(vm: M.VM) -> M.VM:
   S.take_output(vm)
 
+def take_closes(vm: M.VM) -> M.VM:
+  S.take_closes(vm)
+
 def resume_ok(+vm: M.VM, handle: U32, extra: U32, bytes: +List<U32>) -> M.VM:
   X.resume_ok(vm, handle, extra, bytes)
 
@@ -272,10 +275,10 @@ def resume_resource(+vm: M.VM, bytes: +List<U32>) -> M.VM:
   Sch.complete(vm, op, ready => resume_resource(ready, bytes))
 
 def make_vm() -> M.VM:
-  M.VM{Nil{}, Nil{}, Nil{}, Nil{}, Nil{}, Nil{}, Nil{}, Nil{}, 0, 0, M.Slot{0, 0}, Nil{}, "", 1, 0n, M.idle_host()}
+  M.VM{Nil{}, Nil{}, Nil{}, Nil{}, Nil{}, Nil{}, Nil{}, Nil{}, 0, 0, M.Slot{0, 0}, Nil{}, "", 1, 0n, M.idle_host(), M.empty_roots()}
 
 @unsafe def keep_host_api(vm: M.VM) -> M.VM:
-  take_output(continue_run(complete_resource(complete_class(complete_ok(complete_fail(vm, 0, ""), 0, 0, 0, Nil{}), 0, Nil{}), 0, Nil{}), 0, 0, 0, 0))
+  take_closes(take_output(continue_run(complete_resource(complete_class(complete_ok(complete_fail(vm, 0, ""), 0, 0, 0, Nil{}), 0, Nil{}), 0, Nil{}), 0, 0, 0, 0)))
 
 def main() -> IO(Unit):
   result = run_loaded_entry(keep_host_api(make_vm()), 1n, "", Nil{}, 1000, 0, 0, 0, 0)

@@ -2,59 +2,59 @@ import Base
 import ../model.bend as M
 
 def classes(vm: M.VM) -> +List<M.LoadedClass>:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host, roots} = vm
   cs
 
 def methods(vm: M.VM) -> +List<M.LoadedMethod>:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host, roots} = vm
   ms
 
 def fields(vm: M.VM) -> +List<M.LoadedField>:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host, roots} = vm
   fs
 
 def symbols(vm: M.VM) -> +List<String>:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host, roots} = vm
   sy
 
 def heap(vm: M.VM) -> +List<M.HeapEntry>:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host, roots} = vm
   hp
 
 def statics(vm: M.VM) -> +List<M.Binding>:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host, roots} = vm
   st
 
 def resources(vm: M.VM) -> +List<M.Resource>:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host, roots} = vm
   rs
 
 def frames(vm: M.VM) -> +List<M.Frame>:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host, roots} = vm
   fr
 
 def status(vm: M.VM) -> U32:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host, roots} = vm
   stt
 
 def exception(vm: M.VM) -> U32:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host, roots} = vm
   ex
 
 def max_heap(vm: M.VM) -> U32:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host, roots} = vm
   max
 
 def output(vm: M.VM) -> +List<String>:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host, roots} = vm
   out
 
 def error(vm: M.VM) -> String:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host, roots} = vm
   err
 
 def host(vm: M.VM) -> M.Host:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host, roots} = vm
   host
 
 def metadata_of(h: M.Host) -> M.Metadata:
@@ -65,40 +65,40 @@ def metadata(vm: M.VM) -> M.Metadata:
   metadata_of(host(vm))
 
 def with_classes(vm: M.VM, value: +List<M.LoadedClass>) -> M.VM:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
-  M.VM{value, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host}
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host, roots} = vm
+  M.VM{value, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host, roots}
 
 def with_symbols(vm: M.VM, value: +List<String>) -> M.VM:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
-  M.VM{cs, ms, fs, value, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host}
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host, roots} = vm
+  M.VM{cs, ms, fs, value, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host, roots}
 
 def with_heap(vm: M.VM, value: +List<M.HeapEntry>) -> M.VM:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
-  M.VM{cs, ms, fs, sy, value, st, rs, fr, stt, ex, result, out, err, max, steps, host}
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host, roots} = vm
+  M.VM{cs, ms, fs, sy, value, st, rs, fr, stt, ex, result, out, err, max, steps, host, roots}
 
 def with_statics(vm: M.VM, value: +List<M.Binding>) -> M.VM:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
-  M.VM{cs, ms, fs, sy, hp, value, rs, fr, stt, ex, result, out, err, max, steps, host}
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host, roots} = vm
+  M.VM{cs, ms, fs, sy, hp, value, rs, fr, stt, ex, result, out, err, max, steps, host, roots}
 
 def with_frames(vm: M.VM, value: +List<M.Frame>) -> M.VM:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
-  M.VM{cs, ms, fs, sy, hp, st, rs, value, stt, ex, result, out, err, max, steps, host}
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host, roots} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, value, stt, ex, result, out, err, max, steps, host, roots}
 
 def with_status(vm: M.VM, value: U32) -> M.VM:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, value, ex, result, out, err, max, steps, host}
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host, roots} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, value, ex, result, out, err, max, steps, host, roots}
 
 def with_result(vm: M.VM, value: M.Slot) -> M.VM:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, value, out, err, max, steps, host}
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host, roots} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, value, out, err, max, steps, host, roots}
 
 def result_slot(vm: M.VM) -> M.Slot:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, value, out, err, max, steps, host} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, value, out, err, max, steps, host, roots} = vm
   value
 
 def with_exception(vm: M.VM, value: U32) -> M.VM:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, value, result, out, err, max, steps, host}
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host, roots} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, value, result, out, err, max, steps, host, roots}
 
 def host_cwd_of(h: M.Host) -> String:
   match h:
@@ -126,8 +126,8 @@ def dynamic_sites(vm: M.VM) -> +List<M.DynamicSite>:
   dynamic_sites_of(host(vm))
 
 def with_host(vm: M.VM, value: M.Host) -> M.VM:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, value}
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host, roots} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, value, roots}
 
 def with_effect_on(vm: M.VM, effect: M.Effect, h: M.Host) -> M.VM:
   match h:
@@ -214,19 +214,19 @@ def with_launch(+vm: M.VM, cwd: String, caps: U32) -> M.VM:
 # Output is a list of chunks, newest first; println-style writers end theirs
 # with a newline, print-style writers do not.
 def emit_raw(vm: M.VM, text: String) -> M.VM:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, Con{text, out}, err, max, steps, host}
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host, roots} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, Con{text, out}, err, max, steps, host, roots}
 
 def emit(vm: M.VM, line: String) -> M.VM:
   emit_raw(vm, line ++ "\n")
 
 def fail(vm: M.VM, message: String) -> M.VM:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, 4, ex, result, out, message, max, steps, host}
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host, roots} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, 4, ex, result, out, message, max, steps, host, roots}
 
 def tick(vm: M.VM) -> M.VM:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, 1n+steps, host}
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host, roots} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, 1n+steps, host, roots}
 
 def method_id(frame: M.Frame) -> U32:
   M.Frame{method, pc0, invoke, ls, stk, init, mon} = frame
@@ -360,15 +360,15 @@ def emit_error(+vm: M.VM, text: String) -> M.VM:
 
 # The host printed every chunk: start both streams afresh.
 def clear_output(vm: M.VM) -> M.VM:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, Nil{}, err, max, steps, host}
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host, roots} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, Nil{}, err, max, steps, host, roots}
 
 def take_output(+vm: M.VM) -> M.VM:
   clear_output(with_errors_on(vm, Nil{}, host(vm)))
 
 def with_error(vm: M.VM, message: String) -> M.VM:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host} = vm
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, message, max, steps, host}
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host, roots} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, message, max, steps, host, roots}
 
 def sched_with_left(s: M.Sched, value: Nat) -> M.Sched:
   match s:
@@ -454,3 +454,119 @@ def with_loaders_on(vm: M.VM, loaders: M.Loaders, h: M.Host) -> M.VM:
 
 def with_loaders(+vm: M.VM, loaders: M.Loaders) -> M.VM:
   with_loaders_on(vm, loaders, host(vm))
+
+# ---- Collector state (plan 07; see heap/gc.bend) ------------------------------
+
+def roots(vm: M.VM) -> M.Roots:
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host, value} = vm
+  value
+
+def with_roots(vm: M.VM, value: M.Roots) -> M.VM:
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host, old} = vm
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, stt, ex, result, out, err, max, steps, host, value}
+
+def roots_free(r: M.Roots) -> +List<U32>:
+  match r:
+    case M.Roots{free, live, spine, gc, stress, countdown, pinned, oom, literals, integers, longs, mirrors, closes}: free
+
+def roots_live(r: M.Roots) -> U32:
+  match r:
+    case M.Roots{free, live, spine, gc, stress, countdown, pinned, oom, literals, integers, longs, mirrors, closes}: live
+
+def roots_spine(r: M.Roots) -> U32:
+  match r:
+    case M.Roots{free, live, spine, gc, stress, countdown, pinned, oom, literals, integers, longs, mirrors, closes}: spine
+
+def roots_gc(r: M.Roots) -> U32:
+  match r:
+    case M.Roots{free, live, spine, gc, stress, countdown, pinned, oom, literals, integers, longs, mirrors, closes}: gc
+
+def roots_stress(r: M.Roots) -> U32:
+  match r:
+    case M.Roots{free, live, spine, gc, stress, countdown, pinned, oom, literals, integers, longs, mirrors, closes}: stress
+
+def roots_countdown(r: M.Roots) -> U32:
+  match r:
+    case M.Roots{free, live, spine, gc, stress, countdown, pinned, oom, literals, integers, longs, mirrors, closes}: countdown
+
+def roots_pinned(r: M.Roots) -> U32:
+  match r:
+    case M.Roots{free, live, spine, gc, stress, countdown, pinned, oom, literals, integers, longs, mirrors, closes}: pinned
+
+def roots_oom(r: M.Roots) -> U32:
+  match r:
+    case M.Roots{free, live, spine, gc, stress, countdown, pinned, oom, literals, integers, longs, mirrors, closes}: oom
+
+def roots_literals(r: M.Roots) -> M.Trie:
+  match r:
+    case M.Roots{free, live, spine, gc, stress, countdown, pinned, oom, literals, integers, longs, mirrors, closes}: literals
+
+def roots_integers(r: M.Roots) -> M.Trie:
+  match r:
+    case M.Roots{free, live, spine, gc, stress, countdown, pinned, oom, literals, integers, longs, mirrors, closes}: integers
+
+def roots_longs(r: M.Roots) -> M.Trie:
+  match r:
+    case M.Roots{free, live, spine, gc, stress, countdown, pinned, oom, literals, integers, longs, mirrors, closes}: longs
+
+def roots_mirrors(r: M.Roots) -> M.Trie:
+  match r:
+    case M.Roots{free, live, spine, gc, stress, countdown, pinned, oom, literals, integers, longs, mirrors, closes}: mirrors
+
+def roots_closes(r: M.Roots) -> +List<U32>:
+  match r:
+    case M.Roots{free, live, spine, gc, stress, countdown, pinned, oom, literals, integers, longs, mirrors, closes}: closes
+
+def roots_with_literals(r: M.Roots, value: M.Trie) -> M.Roots:
+  match r:
+    case M.Roots{free, live, spine, gc, stress, countdown, pinned, oom, literals, integers, longs, mirrors, closes}:
+      M.Roots{free, live, spine, gc, stress, countdown, pinned, oom, value, integers, longs, mirrors, closes}
+
+def roots_with_integers(r: M.Roots, value: M.Trie) -> M.Roots:
+  match r:
+    case M.Roots{free, live, spine, gc, stress, countdown, pinned, oom, literals, integers, longs, mirrors, closes}:
+      M.Roots{free, live, spine, gc, stress, countdown, pinned, oom, literals, value, longs, mirrors, closes}
+
+def roots_with_longs(r: M.Roots, value: M.Trie) -> M.Roots:
+  match r:
+    case M.Roots{free, live, spine, gc, stress, countdown, pinned, oom, literals, integers, longs, mirrors, closes}:
+      M.Roots{free, live, spine, gc, stress, countdown, pinned, oom, literals, integers, value, mirrors, closes}
+
+def roots_with_mirrors(r: M.Roots, value: M.Trie) -> M.Roots:
+  match r:
+    case M.Roots{free, live, spine, gc, stress, countdown, pinned, oom, literals, integers, longs, mirrors, closes}:
+      M.Roots{free, live, spine, gc, stress, countdown, pinned, oom, literals, integers, longs, value, closes}
+
+def roots_with_gc(r: M.Roots, value: U32) -> M.Roots:
+  match r:
+    case M.Roots{free, live, spine, gc, stress, countdown, pinned, oom, literals, integers, longs, mirrors, closes}:
+      M.Roots{free, live, spine, value, stress, countdown, pinned, oom, literals, integers, longs, mirrors, closes}
+
+def roots_with_countdown(r: M.Roots, value: U32) -> M.Roots:
+  match r:
+    case M.Roots{free, live, spine, gc, stress, countdown, pinned, oom, literals, integers, longs, mirrors, closes}:
+      M.Roots{free, live, spine, gc, stress, value, pinned, oom, literals, integers, longs, mirrors, closes}
+
+def roots_with_closes(r: M.Roots, value: +List<U32>) -> M.Roots:
+  match r:
+    case M.Roots{free, live, spine, gc, stress, countdown, pinned, oom, literals, integers, longs, mirrors, closes}:
+      M.Roots{free, live, spine, gc, stress, countdown, pinned, oom, literals, integers, longs, mirrors, value}
+
+def roots_appended(r: M.Roots) -> M.Roots:
+  match r:
+    case M.Roots{free, +live, +spine, gc, stress, countdown, pinned, oom, literals, integers, longs, mirrors, closes}:
+      M.Roots{free, U32.add(live, 1), U32.add(spine, 1), gc, stress, countdown, pinned, oom, literals, integers, longs, mirrors, closes}
+
+def roots_reused(r: M.Roots, rest: +List<U32>) -> M.Roots:
+  match r:
+    case M.Roots{free, +live, spine, gc, stress, countdown, pinned, oom, literals, integers, longs, mirrors, closes}:
+      M.Roots{rest, U32.add(live, 1), spine, gc, stress, countdown, pinned, oom, literals, integers, longs, mirrors, closes}
+
+def roots_swept(r: M.Roots, free: +List<U32>, live: U32, closes: +List<U32>, gc: U32) -> M.Roots:
+  match r:
+    case M.Roots{old_free, old_live, spine, old_gc, stress, countdown, pinned, oom, literals, integers, longs, mirrors, old_closes}:
+      M.Roots{free, live, spine, gc, stress, countdown, pinned, oom, literals, integers, longs, mirrors, closes}
+
+# The runner closed these handles; a later collection starts a new list.
+def take_closes(+vm: M.VM) -> M.VM:
+  with_roots(vm, roots_with_closes(roots(vm), Nil{}))

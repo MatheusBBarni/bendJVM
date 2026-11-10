@@ -2116,9 +2116,10 @@ java/lang/OutOfMemoryError
 
 # 64. Garbage Collection
 
-Do not implement GC in the first milestone.
+The first milestones shipped the monotonic heap described below.
+Mark-and-sweep collection replaced it in [plan 07](.plans/07-garbage-collection.md); `--max-heap` now limits live entries.
 
-Initial heap:
+Pre-GC milestone heap:
 
 ```text
 monotonically growing

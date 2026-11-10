@@ -1626,8 +1626,8 @@ def lambda_publish_metadata(+vm: M.VM, owner: U32) -> M.VM:
   lambda_publish_host(vm, owner, S.host(vm))
 
 def lambda_publish_loaded(vm: M.VM, +owner: U32, plan_ref: U32, +plan: M.HeapEntry, generated_class: M.LoadedClass, appended_methods: +List<M.LoadedMethod>) -> Result<&2, &2, String, M.VM>:
-  M.VM{cs, ms, fs, sy, hp, st, rs, fr, status, exception, result, output, error, maxHeap, steps, host} = vm
-  vm2 : M.VM = M.VM{M.append(M.LoadedClass, cs, [generated_class]), M.append(M.LoadedMethod, ms, appended_methods), fs, sy, hp, st, rs, fr, status, exception, result, output, error, maxHeap, steps, host}
+  M.VM{cs, ms, fs, sy, hp, st, rs, fr, status, exception, result, output, error, maxHeap, steps, host, roots} = vm
+  vm2 : M.VM = M.VM{M.append(M.LoadedClass, cs, [generated_class]), M.append(M.LoadedMethod, ms, appended_methods), fs, sy, hp, st, rs, fr, status, exception, result, output, error, maxHeap, steps, host, roots}
   published : M.VM = lambda_publish_metadata(vm2, owner)
   updated_plan : M.HeapEntry = M.HeapEntry{H.entry_class(plan), L.entry_kind(plan), L.entry_element(plan), H.binding_set(L.entry_fields(plan), 9, M.Slot{1, owner}), L.entry_values(plan), L.entry_chars(plan)}
   Done{H.put(published, plan_ref, updated_plan)}

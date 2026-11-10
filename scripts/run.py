@@ -179,12 +179,13 @@ def build_artifacts() -> Path:
             resume_class_name = generated_function(runtime_source, "complete_class")
             resume_resource_name = generated_function(runtime_source, "complete_resource")
             take_output_name = generated_function(runtime_source, "take_output")
+            take_closes_name = generated_function(runtime_source, "take_closes")
         except LookupError as error:
             raise RuntimeError(f"Bend launch API export not found in generated artifact: {error}") from error
         names_tmp = directory / "bootstrap.json"
         names_tmp.write_text(json.dumps(bootstrap_class_names(loader_source, directory)), encoding="utf-8")
         host_tmp = directory / "host.mjs"
-        host_tmp.write_text(host_source(loader_source, runtime_source, loader_name, runtime_name, inspect_name, continue_name, resume_ok_name, resume_fail_name, resume_class_name, resume_resource_name, take_output_name), encoding="utf-8")
+        host_tmp.write_text(host_source(loader_source, runtime_source, loader_name, runtime_name, inspect_name, continue_name, resume_ok_name, resume_fail_name, resume_class_name, resume_resource_name, take_output_name, take_closes_name), encoding="utf-8")
         os.replace(loader_tmp, loader)
         os.replace(runtime_tmp, runtime)
         os.replace(names_tmp, names)
@@ -223,7 +224,7 @@ process.stdout.write(JSON.stringify(names));
     return names
 
 
-def host_source(loader_source: str, runtime_source: str, loader_name: str, runtime_name: str, inspect_name: str, continue_name: str, resume_ok_name: str, resume_fail_name: str, resume_class_name: str, resume_resource_name: str, take_output_name: str) -> str:
+def host_source(loader_source: str, runtime_source: str, loader_name: str, runtime_name: str, inspect_name: str, continue_name: str, resume_ok_name: str, resume_fail_name: str, resume_class_name: str, resume_resource_name: str, take_output_name: str, take_closes_name: str) -> str:
     fragment = library_fragment
     nat_converter = "BigInt" if "=== 0n" in runtime_source else "Number"
 
@@ -249,7 +250,8 @@ return {{
   completeFail: (vm, op, name) => run_loop({resume_fail_name}(vm, op, name)),
   completeClass: (vm, op, bytes) => run_loop({resume_class_name}(vm, op, bytes)),
   completeResource: (vm, op, bytes) => run_loop({resume_resource_name}(vm, op, bytes)),
-  takeOutput: (vm) => run_loop({take_output_name}(vm))
+  takeOutput: (vm) => run_loop({take_output_name}(vm)),
+  takeCloses: (vm) => run_loop({take_closes_name}(vm))
 }};
 `)();
 
@@ -968,15 +970,31 @@ async function performEffect(vm, op, effect) {{
     return failed("java/io/IOException");
   }}
 }}
+function closeRecord(rec) {{
+  try {{
+    if (rec.type === "file") closeSync(rec.fd);
+    else if (rec.socket) rec.socket.destroy();
+    else if (rec.server) rec.server.close();
+  }} catch (_) {{}}
+}}
 function closeAll() {{
-  for (const rec of handles.values()) {{
-    try {{
-      if (rec.type === "file") closeSync(rec.fd);
-      else if (rec.socket) rec.socket.destroy();
-      else if (rec.server) rec.server.close();
-    }} catch (_) {{}}
-  }}
+  for (const rec of handles.values()) closeRecord(rec);
   handles.clear();
+}}
+// Handles whose Java owners the collector swept (plan 07). The VM records them
+// and the host closes them, because closing is an effect the VM may not perform.
+function drainCloses(vm) {{
+  const pending = listValues(vm.roots.closes);
+  if (pending.length === 0) return vm;
+  for (const value of pending) {{
+    const handle = value >>> 0;
+    const rec = handles.get(handle);
+    if (!rec) continue;
+    closeRecord(rec);
+    handles.delete(handle);
+    if (process.env.BENDJVM_TRACE_CLOSES) console.error(`bendjvm: closed swept handle ${{handle}}`);
+  }}
+  return runtime.takeCloses(vm);
 }}
 process.on("exit", closeAll);
 const requestText = readFileSync(process.env.BENDJVM_REQUEST || "", "utf8");
@@ -1104,6 +1122,14 @@ if (request.mode === 3) for (const method of methods) {{
     console.error("stack: []");
   }}
 }}
+// Test hook: collect every N instructions without reusing slots, so a missing
+// root surfaces as InvalidReference instead of silent aliasing.
+const gcStress = Number(process.env.BENDJVM_GC_STRESS || 0);
+if (gcStress > 0 && loaded.value.roots) {{
+  loaded.value.roots.gc = 3;
+  loaded.value.roots.stress = gcStress;
+  loaded.value.roots.countdown = gcStress;
+}}
 if (loaded.value.host) {{
   loaded.value.host.cwd = request.cwd || process.cwd();
   loaded.value.host.caps = request.caps == null ? 3 : request.caps >>> 0;
@@ -1144,7 +1170,8 @@ function nextDeadline(vm) {{
   const now = process.hrtime.bigint() - startNs;
   return best <= now ? 0 : Number((best - now + 999999n) / 1000000n);
 }}
-function flush(vm) {{
+function flush(next) {{
+  const vm = drainCloses(next);
   const printed = listValues(vm.output).reverse().map(text).join("");
   const errors = listValues(vm.host.errors).reverse().map(text).join("");
   if (!printed && !errors) return vm;

@@ -102,11 +102,6 @@ def explicit_args(isStatic: Bool, +args: +List<M.Slot>) -> +List<M.Slot>:
     case False{} Con{receiver, +rest}: rest
     case False{} Nil{}: Nil{}
 
-def class_lock(+vm: M.VM, +owner: U32, +found: Maybe<&2, U32>) -> Result<&2, &2, String, H.Allocation>:
-  match found:
-    case Some{reference}: Done{H.Allocation{vm, reference}}
-    case None{}: H.allocate(vm, H.class_mirror_entry(L.class_id(vm, "java/lang/Class"), owner))
-
 def receiver_lock(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, H.Allocation>:
   match args:
     case Con{M.Slot{3, reference}, rest}: Done{H.Allocation{vm, reference}}
@@ -114,7 +109,7 @@ def receiver_lock(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, H.A
 
 def lock_of(+vm: M.VM, +method: M.LoadedMethod, +isStatic: Bool, +args: +List<M.Slot>) -> Result<&2, &2, String, H.Allocation>:
   match isStatic:
-    case True{}: class_lock(vm, M.loaded_method_owner(method), H.class_mirror(S.heap(vm), M.loaded_method_owner(method)))
+    case True{}: H.class_mirror(vm, M.loaded_method_owner(method))
     case False{}: receiver_lock(vm, args)
 
 def suspend_call(+vm: M.VM, +effect: M.Effect) -> Result<&2, &2, String, O.Outcome>:

@@ -57,6 +57,7 @@ NAMED = (
     "DoubleFormatting", "HostCallbacks", "InitSemantics", "ParameterReflection", "ComparableValues", "ArraySemantics", "NestedClasses", "GenericDeclarations", "ReflectionStrings", "PrivilegedActions", "AccessRules", "DefaultMethodProxy", "AnnotationFormatting", "AnnotatedTypes", "SubclassProxies", "SerializationStreams", "SerializationEvolution", "SerializationHooks",
     "ThreadLifecycle", "MonitorSemantics", "VolatilePublication", "ConcurrentTcp", "DaemonExit",
     "NetAddresses", "ThreadGroups", "ApiSurface",
+    "GcChurn", "GcCycle", "GcIdentity", "GcStrings",
 )
 EXTENDED = (
     "FloatOperations", "FloatArray", "InheritedFields", "ClassInitialization",
@@ -67,7 +68,7 @@ EXTENDED = (
     "TcpRefused", "TcpTimeout", "SuppressionTWR", "NioSelectorEcho",
 )
 SUPPORT = ("FuelLimit", "HeapLimit", "MutationTarget", "TlsFixture", "MainHandled", "LockOrderDeadlock",
-           "FuelWithBlockedThreads", "ThreadPriorities")
+           "FuelWithBlockedThreads", "ThreadPriorities", "GcFileDrop")
 # Launcher flags for fixtures whose threads spin on purpose (plan 05).
 FIXTURE_FLAGS = {
     "ThreadLifecycle": ("--fuel", "60000000"),
@@ -78,6 +79,11 @@ FIXTURE_FLAGS = {
     "DaemonExit": ("--fuel", "60000000"),
     "ThreadGroups": ("--fuel", "60000000"),
     "ApiSurface": ("--fuel", "60000000"),
+    # Plan 07: more allocations than these heaps can hold at once.
+    "GcChurn": ("--max-heap", "128"),
+    "GcCycle": ("--max-heap", "128"),
+    "GcIdentity": ("--max-heap", "128"),
+    "GcStrings": ("--max-heap", "128"),
 }
 NATIVE = FIXTURES / "native"
 WEB_EXAMPLE = ROOT / "examples" / "webserver"
@@ -1137,6 +1143,22 @@ class Suite:
         require(wide.stdout.startswith("before-wide-array\n"),
                 f"wide allocation failed before reaching the allocation site\n{wide.detail()}")
 
+    def gc_handles(self) -> None:
+        # A dropped file stream is closed when the collector sweeps it, which the
+        # runner reports; the process-exit sweep (closeAll) reports nothing.
+        path = WORKDIR / "gc-file-drop.txt"
+        path.write_bytes(b"A")
+        os.environ["BENDJVM_TRACE_CLOSES"] = "1"
+        try:
+            run = execute([self.args.bend, MAIN, "--", "--max-heap", "128", str(self.classes / "GcFileDrop.class"), str(path)],
+                          self.args.timeout, bend=True)
+        finally:
+            del os.environ["BENDJVM_TRACE_CLOSES"]
+        require(run.code == 0, run.detail())
+        same_output("65\ndone\n", run.stdout, run.detail())
+        require("closed swept handle" in run.stderr,
+                f"expected the swept FileInputStream to be closed by the runner\n{run.detail()}")
+
     def capabilities(self) -> None:
         files = self.bend(self.classes / "FileRoundtrip.class", "--no-files")
         require(files.code > 0, f"--no-files must deny file effects\n{files.detail()}")
@@ -2082,6 +2104,7 @@ def main() -> int:
                     suite.check(f"malformed/{name}", lambda path=path, category=category: suite.reject(path, category))
                 suite.check("cli/fuel", suite.fuel)
                 suite.check("cli/max-heap", suite.heap)
+                suite.check("cli/gc-handles", suite.gc_handles)
                 if args.full:
                     suite.check("cli/capabilities", suite.capabilities)
                 for mode in ("--dump-class", "--disassemble", "--trace"):

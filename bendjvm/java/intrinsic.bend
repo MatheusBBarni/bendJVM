@@ -649,12 +649,12 @@ def acc_empty(acc: +List<U32>) -> Bool:
         case _:
           match one:
             case O.Returned{+next_vm, Some{M.Slot{tag, +bits}}}:
-              Bool.pick(Result<&2, &2, String, O.Outcome>, U32.is_eq(bits, 10) || U32.is_eq(bits, 13), L.intern_or_alloc(next_vm, M.reverse(U32, acc)),
+              Bool.pick(Result<&2, &2, String, O.Outcome>, U32.is_eq(bits, 10) || U32.is_eq(bits, 13), L.string_out(next_vm, M.reverse(U32, acc)),
                 Bool.pick(Result<&2, &2, String, O.Outcome>, U32.is_eq(bits, 4294967295),
-                  Bool.pick(Result<&2, &2, String, O.Outcome>, acc_empty(acc), L.ref_out(next_vm, 0), L.intern_or_alloc(next_vm, M.reverse(U32, acc))),
+                  Bool.pick(Result<&2, &2, String, O.Outcome>, acc_empty(acc), L.ref_out(next_vm, 0), L.string_out(next_vm, M.reverse(U32, acc))),
                   read_line_walk(p, 0, next_vm, stream, Con{bits, acc}, one)))
             case O.Returned{+next_vm, None{}}:
-              Bool.pick(Result<&2, &2, String, O.Outcome>, acc_empty(acc), L.ref_out(next_vm, 0), L.intern_or_alloc(next_vm, M.reverse(U32, acc)))
+              Bool.pick(Result<&2, &2, String, O.Outcome>, acc_empty(acc), L.ref_out(next_vm, 0), L.string_out(next_vm, M.reverse(U32, acc)))
             case other: Done{other}
 
 def read_line(+vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, String, O.Outcome>:
@@ -763,6 +763,7 @@ def execute_ready(+id: U32, +vm: M.VM, +args: +List<M.Slot>) -> Result<&2, &2, S
     case 826: Cs.execute(826, vm, args)
     case 827: Cs.execute(827, vm, args)
     case 828: Cs.execute(828, vm, args)
+    case 831: L.string_intern(vm, args)
     case 822: Nb.load(vm, args, False{})
     case 819: St.print_stack_trace(vm, args, True{})
     case 552: L.security_manager(vm, args)

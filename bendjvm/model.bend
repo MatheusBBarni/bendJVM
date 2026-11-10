@@ -232,13 +232,35 @@ def loaded_class_state(value: LoadedClass) -> U32:
 
 
 # kind: 0 object, 1 primitive array, 2 reference array, 3 UTF-16 string, 4 byte stream,
-# 5 ArrayList, 6 HashMap, 7 StringBuilder.
+# 5 ArrayList, 6 HashMap, 7 StringBuilder, 255 free slot (see heap/gc.bend and the
+# registry in heap/heap.bend). A free entry's lists are empty so Bend can drop them.
 # element is a primitive tag, component class, stream position, or collection size.
 type HeapEntry is Data:
   HeapEntry{class: U32, kind: U32, element: U32, fields: +List<Binding>, values: +List<Slot>, chars: +List<U32>}
 
 type Resource is Data:
   Resource{name: String, origin: String}
+
+# A map from U32 keys to non-zero U32 values (0 reads as absent); see heap/trie.bend.
+type Trie is Data:
+  TrieEmpty{}
+  TrieLeaf{key: U32, value: U32}
+  TrieNode{zero: Trie, one: Trie}
+
+# Everything the collector owns (plan 07). `free` holds free references, lowest
+# first; `live` counts occupied slots and `spine` the slots in the heap list.
+# `gc`: 0 quiet, 1 an allocation went over --max-heap, 2 this instruction is being
+# redone with allocation failures on, 3 stress mode (collect every `stress`
+# instructions, never reuse a slot). `pinned` is the bootstrap prefix of the heap.
+# `oom` is the reserved OutOfMemoryError. `literals` maps a UTF-16 hash to a string
+# reference, `integers`/`longs` map a boxed value to its cached box, `mirrors` maps
+# a class id to its Class object. `closes` lists host handles of swept owners
+# that the runner has not closed yet.
+type Roots is Data:
+  Roots{free: +List<U32>, live: U32, spine: U32, gc: U32, stress: U32, countdown: U32, pinned: U32, oom: U32, literals: Trie, integers: Trie, longs: Trie, mirrors: Trie, closes: +List<U32>}
+
+def empty_roots() -> Roots:
+  Roots{Nil{}, 0, 0, 0, 0, 0, 0, 0, TrieEmpty{}, TrieEmpty{}, TrieEmpty{}, TrieEmpty{}, Nil{}}
 
 # Host effects are opaque OS requests. Bend keeps Java-visible state only.
 type Effect is Data:
@@ -498,7 +520,7 @@ type Frame is Data:
   Frame{method: U32, pc: U32, invokePc: U32, locals: +List<Slot>, stack: +List<Slot>, initializing: U32, monitor: U32}
 # resources are ordered host-provided classpath records; lookup uses the first match.
 type VM is Data:
-  VM{classes: +List<LoadedClass>, methods: +List<LoadedMethod>, fields: +List<LoadedField>, symbols: +List<String>, heap: +List<HeapEntry>, statics: +List<Binding>, resources: +List<Resource>, frames: +List<Frame>, status: U32, exception: U32, result: Slot, output: +List<String>, error: String, maxHeap: U32, steps: Nat, host: Host}
+  VM{classes: +List<LoadedClass>, methods: +List<LoadedMethod>, fields: +List<LoadedField>, symbols: +List<String>, heap: +List<HeapEntry>, statics: +List<Binding>, resources: +List<Resource>, frames: +List<Frame>, status: U32, exception: U32, result: Slot, output: +List<String>, error: String, maxHeap: U32, steps: Nat, host: Host, roots: Roots}
 
 
 # Result uses messages carrying the stable VmError category plus location detail.

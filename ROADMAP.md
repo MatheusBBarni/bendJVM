@@ -125,6 +125,13 @@ missing runtime classes or reaches unsupported bytecode.
 - Load application resources and configuration files.
 - Run a small Spring Boot compatibility example.
 
+### 8. Parallel Java threads - in progress
+
+- Build BendJVM as a native Bend program, since the JavaScript target always runs sequentially, and move the host layer (files, sockets, selectors, DNS, TLS through OpenSSL, the native helper) to native effects.
+- Run runnable threads at the same time in rounds: parallel slices over a shared heap snapshot, then a merge, then the synchronization actions one at a time.
+- Replace the positional heap with a persistent map and per-thread allocation arenas.
+- See [plan 08](.plans/08-parallel-threads.md).
+
 ## Near-term target
 
 A small Spring-like Java application is a reasonable intermediate target.

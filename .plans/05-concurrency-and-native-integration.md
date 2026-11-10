@@ -55,6 +55,8 @@ All five rows require end-to-end Java-visible demonstrations.
 
 ### Memory model: sequentially consistent baseline
 
+Superseded by [plan 08](08-parallel-threads.md), which runs threads in parallel under a justified Java Memory Model refinement.
+
 - Use one serialized shared-memory transition order, preserving each thread's program order. Every ordinary/volatile read and write observes this coherent state; this deliberately implements stronger ordering than Java requires for data races.
 - This is not permission to make compound operations atomic. `counter++` remains a read/compute/write sequence unless synchronized; schedules must be able to expose lost updates.
 - Volatile long/double accesses publish/read a complete two-word value atomically. Never yield between halves. Atomic plain long/double access is a permitted stronger behavior and is the chosen baseline.
